@@ -1,0 +1,4 @@
+textual>=0.61.0
+biopython>=1.83
+pyhmmer>=0.10.0
+rich>=13.7.0
