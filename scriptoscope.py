@@ -49,7 +49,7 @@ _log = logging.getLogger("scriptoscope")
 from rich.console import Group
 from rich.table import Table
 from rich.text import Text
-from textual import on, work
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical, VerticalScroll
@@ -294,20 +294,37 @@ class ORFCoord:
 
 
 def _six_frame_proteins(nucleotide: str, seq_id: str) -> list[tuple[str, str]]:
+    """Return (id, protein_seq) for all ORFs that start with M and end at a
+    stop codon, with length >= 30 aa."""
     from Bio.Seq import Seq
     seq = Seq(nucleotide.upper())
     results = []
     for strand, nuc in (("+", seq), ("-", seq.reverse_complement())):
         for frame in range(3):
             trans = str(nuc[frame:].translate(to_stop=False))
-            for i, orf in enumerate(trans.split("*")):
-                if len(orf) >= 30:
-                    results.append((f"{seq_id}_{strand}f{frame+1}_orf{i}", orf))
+            segments = trans.split("*")
+            aa_offset = 0
+            for i, seg in enumerate(segments):
+                has_stop = i < len(segments) - 1
+                if has_stop:
+                    # Find all M positions; each starts a candidate ORF ending at the stop
+                    orf_idx = 0
+                    for m_pos in range(len(seg)):
+                        if seg[m_pos] == "M":
+                            candidate = seg[m_pos:]
+                            if len(candidate) >= 30:
+                                results.append((
+                                    f"{seq_id}_{strand}f{frame+1}_orf{i}m{orf_idx}",
+                                    candidate,
+                                ))
+                                orf_idx += 1
+                aa_offset += len(seg) + 1
     return results
 
 
 def _six_frame_orf_coords(nucleotide: str, seq_id: str, min_aa: int = 30) -> list[ORFCoord]:
-    """Return ORFs with their nucleotide-space coordinates on the original sequence."""
+    """Return ORFs that start with ATG (M) and end at a stop codon,
+    with their nucleotide-space coordinates on the original sequence."""
     from Bio.Seq import Seq
     seq = Seq(nucleotide.upper())
     seq_len = len(seq)
@@ -315,27 +332,38 @@ def _six_frame_orf_coords(nucleotide: str, seq_id: str, min_aa: int = 30) -> lis
     for strand, nuc in (("+", seq), ("-", seq.reverse_complement())):
         for frame_idx in range(3):
             trans = str(nuc[frame_idx:].translate(to_stop=False))
+            segments = trans.split("*")
             aa_offset = 0
-            for i, orf in enumerate(trans.split("*")):
-                if len(orf) >= min_aa:
-                    orf_id = f"{seq_id}_{strand}f{frame_idx+1}_orf{i}"
-                    strand_nt_start = frame_idx + aa_offset * 3
-                    strand_nt_end = strand_nt_start + len(orf) * 3
-                    if strand == "+":
-                        nt_start = strand_nt_start
-                        nt_end = strand_nt_end
-                    else:
-                        nt_start = seq_len - strand_nt_end
-                        nt_end = seq_len - strand_nt_start
-                    coords.append(ORFCoord(
-                        orf_id=orf_id, strand=strand, frame=frame_idx + 1,
-                        nt_start=nt_start, nt_end=nt_end,
-                        aa_length=len(orf), sequence=orf,
-                    ))
-                aa_offset += len(orf) + 1
+            for i, seg in enumerate(segments):
+                has_stop = i < len(segments) - 1
+                if has_stop:
+                    orf_idx = 0
+                    for m_pos in range(len(seg)):
+                        if seg[m_pos] == "M":
+                            candidate = seg[m_pos:]
+                            if len(candidate) >= min_aa:
+                                cand_aa_offset = aa_offset + m_pos
+                                strand_nt_start = frame_idx + cand_aa_offset * 3
+                                # +3 to include the stop codon in the span
+                                strand_nt_end = strand_nt_start + len(candidate) * 3 + 3
+                                if strand == "+":
+                                    nt_start = strand_nt_start
+                                    nt_end = strand_nt_end
+                                else:
+                                    nt_start = seq_len - strand_nt_end
+                                    nt_end = seq_len - strand_nt_start
+                                orf_id = f"{seq_id}_{strand}f{frame_idx+1}_orf{i}m{orf_idx}"
+                                coords.append(ORFCoord(
+                                    orf_id=orf_id, strand=strand, frame=frame_idx + 1,
+                                    nt_start=nt_start, nt_end=nt_end,
+                                    aa_length=len(candidate), sequence=candidate,
+                                ))
+                                orf_idx += 1
+                aa_offset += len(seg) + 1
     return coords
 
 
+@lru_cache(maxsize=256)
 def _find_longest_orf(nucleotide: str, seq_id: str) -> ORFCoord | None:
     """Find the single longest ORF across all 6 frames (the putative CDS)."""
     orfs = _six_frame_orf_coords(nucleotide, seq_id, min_aa=30)
@@ -989,43 +1017,113 @@ def colorize_sequence_annotated(
     pfam_label: list[str | None] = [None] * n
     pfam_color: list[str] = [""] * n
 
-    if orf and orf.strand == "+":
+    # Per-position arrays for feature arrow track
+    feat_ch: list[str | None] = [None] * n   # character for the feature arrow
+    feat_color: list[str] = [""] * n
+    # Per-position override for DNA base highlighting (start/stop codons)
+    base_override: list[str | None] = [None] * n
+
+    if orf:
         cds_color = _FRAME_COLORS.get((orf.strand, orf.frame), "bright_cyan")
+
+        def _aa_codon_start(aa_idx: int) -> int:
+            if orf.strand == "+":
+                return orf.nt_start + aa_idx * 3
+            else:
+                return orf.nt_end - (aa_idx + 1) * 3
+
+        # Amino acid translation — letter on center base only, no boundary dots
         for aa_idx in range(orf.aa_length):
-            codon_start = orf.nt_start + aa_idx * 3
-            if codon_start + 2 >= n:
-                break
+            codon_start = _aa_codon_start(aa_idx)
+            if codon_start < 0 or codon_start + 2 >= n:
+                continue
             aa_char = orf.sequence[aa_idx]
-            # Place the amino acid letter at the middle base of each codon
             mid = codon_start + 1
             aa_at[mid] = aa_char
             aa_color[mid] = cds_color
-            # Mark flanking bases with dots to show codon boundaries
-            aa_at[codon_start] = "·"
-            aa_color[codon_start] = "dim"
-            if codon_start + 2 < n:
-                aa_at[codon_start + 2] = "·"
-                aa_color[codon_start + 2] = "dim"
+
+        # Highlight start codon (ATG on + strand, CAT on - strand displayed)
+        start_codon_pos = _aa_codon_start(0)
+        if 0 <= start_codon_pos and start_codon_pos + 2 < n:
+            for k in range(3):
+                base_override[start_codon_pos + k] = "bold bright_white on green"
+
+        # Stop codon: last 3 nt of the ORF span (now included in nt_start–nt_end)
+        if orf.strand == "+":
+            stop_pos = orf.nt_end - 3
+        else:
+            stop_pos = orf.nt_start
+        if 0 <= stop_pos and stop_pos + 2 < n:
+            for k in range(3):
+                base_override[stop_pos + k] = "bold bright_white on red"
+
+        # ── Feature arrow track (SnapGene-style) ──
+        # CDS spans nt_start to nt_end; arrow shows direction
+        cds_lo = orf.nt_start
+        cds_hi = orf.nt_end
+        arrow_tip = "▶" if orf.strand == "+" else "◀"
+        cds_label = "CDS"
+        cds_nt_len = cds_hi - cds_lo
+
+        # Fill the arrow body
+        for pos in range(max(0, cds_lo), min(n, cds_hi)):
+            feat_ch[pos] = "═"
+            feat_color[pos] = cds_color
+
+        # Place CDS label in the middle
+        if cds_nt_len >= len(cds_label) + 4:
+            label_start = cds_lo + (cds_nt_len - len(cds_label)) // 2
+            for ci, ch in enumerate(cds_label):
+                lp = label_start + ci
+                if 0 <= lp < n:
+                    feat_ch[lp] = ch
+                    feat_color[lp] = f"bold {cds_color}"
+
+        # Arrow tip at the end
+        if orf.strand == "+":
+            tip_pos = min(cds_hi - 1, n - 1)
+            if 0 <= tip_pos:
+                feat_ch[tip_pos] = arrow_tip
+                feat_color[tip_pos] = f"bold {cds_color}"
+        else:
+            tip_pos = max(cds_lo, 0)
+            if tip_pos < n:
+                feat_ch[tip_pos] = arrow_tip
+                feat_color[tip_pos] = f"bold {cds_color}"
 
         # Build Pfam domain annotations in nucleotide space
+        # Sort by e-value so the best hit wins overlapping positions
         if hits:
+            sorted_hits = sorted(hits, key=lambda h: h.evalue)
+
             domain_colors: dict[str, str] = {}
             cidx = 0
-            for h in hits:
+            for h in sorted_hits:
                 if h.target_name not in domain_colors:
                     domain_colors[h.target_name] = _DOMAIN_PALETTE[cidx % len(_DOMAIN_PALETTE)]
                     cidx += 1
 
-            for h in hits:
+            # Track which positions are already claimed by a better-scoring hit
+            pfam_claimed: list[bool] = [False] * n
+
+            for h in sorted_hits:
                 dcolor = domain_colors[h.target_name]
-                # ali_from/ali_to are 1-based amino acid positions
-                aa_start = h.ali_from - 1  # 0-based
-                aa_end = h.ali_to          # exclusive
-                nt_dom_start = orf.nt_start + aa_start * 3
-                nt_dom_end = orf.nt_start + aa_end * 3
+                aa_start = h.ali_from - 1
+                aa_end = h.ali_to
+                nt_dom_start = _aa_codon_start(aa_start)
+                nt_dom_end = _aa_codon_start(aa_end - 1) + 3
+                if nt_dom_start > nt_dom_end:
+                    nt_dom_start, nt_dom_end = nt_dom_end, nt_dom_start
+                nt_dom_start = max(0, nt_dom_start)
+                nt_dom_end = min(n, nt_dom_end)
+
+                # Skip if entirely overlapped by a better hit
+                unclaimed = sum(1 for p in range(nt_dom_start, nt_dom_end) if p < n and not pfam_claimed[p])
+                if unclaimed == 0:
+                    continue
+
                 name = h.target_name
                 dom_nt_len = nt_dom_end - nt_dom_start
-                # Center the domain name within the span
                 if dom_nt_len >= len(name) + 2:
                     pad = dom_nt_len - len(name)
                     pad_l = pad // 2
@@ -1033,6 +1131,9 @@ def colorize_sequence_annotated(
                         pos = nt_dom_start + j
                         if pos >= n:
                             break
+                        if pfam_claimed[pos]:
+                            continue
+                        pfam_claimed[pos] = True
                         if j < pad_l or j >= pad_l + len(name):
                             pfam_label[pos] = "━"
                             pfam_color[pos] = dcolor
@@ -1044,6 +1145,9 @@ def colorize_sequence_annotated(
                         pos = nt_dom_start + j
                         if pos >= n:
                             break
+                        if pfam_claimed[pos]:
+                            continue
+                        pfam_claimed[pos] = True
                         pfam_label[pos] = "━"
                         pfam_color[pos] = dcolor
 
@@ -1055,11 +1159,16 @@ def colorize_sequence_annotated(
         result.append(f"  CDS: ", style="dim")
         result.append(f"{orf.nt_start+1}–{orf.nt_end}", style=f"bold {cds_color}")
         result.append(f" ({orf.aa_length} aa, {orf.strand}f{orf.frame})", style=f"dim {cds_color}")
+        result.append("  ", style="dim")
+        # Start/stop legend
+        result.append(" ATG ", style="bold bright_white on green")
+        result.append(" ", style="dim")
+        result.append(" STOP ", style="bold bright_white on red")
         if hits:
             result.append("  Pfam: ", style="dim")
             domain_colors_hdr: dict[str, str] = {}
             cidx = 0
-            for h in hits:
+            for h in sorted(hits, key=lambda h: h.evalue):
                 if h.target_name not in domain_colors_hdr:
                     domain_colors_hdr[h.target_name] = _DOMAIN_PALETTE[cidx % len(_DOMAIN_PALETTE)]
                     cidx += 1
@@ -1067,54 +1176,94 @@ def colorize_sequence_annotated(
                 result.append(f"━━ {fam} ", style=f"bold {dcol}")
         result.append("\n\n")
 
+    # Helper: flush a run-length-encoded line into result
+    def _flush_line(chars: list[str], styles: list[str]) -> None:
+        if not chars:
+            return
+        run_ch = [chars[0]]
+        run_style = styles[0]
+        for k in range(1, len(chars)):
+            if styles[k] == run_style:
+                run_ch.append(chars[k])
+            else:
+                result.append("".join(run_ch), style=run_style)
+                run_ch = [chars[k]]
+                run_style = styles[k]
+        result.append("".join(run_ch), style=run_style)
+        result.append("\n")
+
     for i in range(0, len(display_seq), width):
         chunk = display_seq[i : i + width]
         chunk_len = len(chunk)
 
-        # ── DNA line ──
-        result.append(f"{i+1:>8}  ", style="dim")
-        run_base = chunk[0].upper()
-        run_text = chunk[0]
-        for base in chunk[1:]:
-            upper = base.upper()
-            if upper == run_base:
-                run_text += base
-            else:
-                result.append(run_text, style=_BASE_COLORS.get(run_base, "white"))
-                run_base = upper
-                run_text = base
-        result.append(run_text, style=_BASE_COLORS.get(run_base, "white"))
-        result.append("\n")
-
-        # ── Amino acid translation line (only if CDS overlaps this chunk) ──
-        if orf and orf.strand == "+":
-            has_aa = any(aa_at[i + j] is not None for j in range(chunk_len) if i + j < n)
-            if has_aa:
-                result.append(" " * prefix_w)
+        # ── CDS feature arrow (single line) ──
+        if orf:
+            has_feat = any(feat_ch[i + j] is not None for j in range(chunk_len) if i + j < n)
+            if has_feat:
+                line_ch: list[str] = []
+                line_st: list[str] = []
                 for j in range(chunk_len):
                     pos = i + j
-                    if pos < n and aa_at[pos] is not None:
-                        ch = aa_at[pos]
-                        if ch == "·":
-                            result.append(ch, style="dim")
+                    if pos < n and feat_ch[pos] is not None:
+                        ch = feat_ch[pos]
+                        if ch in ("═", "━"):
+                            line_ch.append(ch); line_st.append(feat_color[pos])
                         else:
-                            result.append(ch, style=f"bold {aa_color[pos]}")
+                            line_ch.append(ch); line_st.append(f"bold {feat_color[pos]}")
                     else:
-                        result.append(" ")
-                result.append("\n")
+                        line_ch.append(" "); line_st.append("")
+                result.append(" " * prefix_w)
+                _flush_line(line_ch, line_st)
 
-        # ── Pfam domain line (only if domains overlap this chunk) ──
-        if hits and orf and orf.strand == "+":
+        # ── Pfam domain track (half-height, best e-value closest to CDS) ──
+        if hits and orf:
             has_pfam = any(pfam_label[i + j] is not None for j in range(chunk_len) if i + j < n)
             if has_pfam:
-                result.append(" " * prefix_w)
+                line_ch = []
+                line_st = []
                 for j in range(chunk_len):
                     pos = i + j
                     if pos < n and pfam_label[pos] is not None:
-                        result.append(pfam_label[pos], style=pfam_color[pos])
+                        ch = pfam_label[pos]
+                        if ch == "━":
+                            line_ch.append("▄"); line_st.append(pfam_color[pos])
+                        else:
+                            line_ch.append(ch); line_st.append(f"bold {pfam_color[pos]}")
                     else:
-                        result.append(" ")
-                result.append("\n")
+                        line_ch.append(" "); line_st.append("")
+                result.append(" " * prefix_w)
+                _flush_line(line_ch, line_st)
+
+        # ── DNA line (with start/stop codon highlighting) ──
+        line_ch = []
+        line_st = []
+        for j in range(chunk_len):
+            pos = i + j
+            base = chunk[j]
+            if pos < n and base_override[pos] is not None:
+                line_ch.append(base); line_st.append(base_override[pos])
+            else:
+                line_ch.append(base); line_st.append(_BASE_COLORS.get(base.upper(), "white"))
+        result.append(f"{i+1:>8}  ", style="dim")
+        _flush_line(line_ch, line_st)
+
+        # ── Amino acid translation line ──
+        if orf:
+            has_aa = any(aa_at[i + j] is not None for j in range(chunk_len) if i + j < n)
+            if has_aa:
+                line_ch = []
+                line_st = []
+                for j in range(chunk_len):
+                    pos = i + j
+                    if pos < n and aa_at[pos] is not None:
+                        line_ch.append(aa_at[pos]); line_st.append(aa_color[pos])
+                    else:
+                        line_ch.append(" "); line_st.append("")
+                result.append(" " * prefix_w)
+                _flush_line(line_ch, line_st)
+
+        # Blank line between chunks for readability
+        result.append("\n")
 
     if truncated:
         result.append(
@@ -1128,10 +1277,15 @@ class SequenceViewer(ScrollableContainer):
     DEFAULT_CSS = """
     SequenceViewer { height: 1fr; }
     SequenceViewer #seq-info { background: $surface; padding: 0 1; height: auto; }
+    SequenceViewer #seq-cds-btn { height: auto; padding: 0 1; }
+    SequenceViewer #seq-cds-btn.hidden { display: none; }
+    SequenceViewer #seq-cds-area { display: none; height: auto; max-height: 12; padding: 0 1; }
+    SequenceViewer #seq-cds-area.visible { display: block; }
     SequenceViewer #seq-body { padding: 0 1; height: auto; }
     """
 
     transcript: reactive[Transcript | None] = reactive(None)
+    _cds_dna: str = ""  # raw CDS DNA for clipboard copy
 
     def watch_transcript(self, t: Transcript | None) -> None:
         if t:
@@ -1139,9 +1293,14 @@ class SequenceViewer(ScrollableContainer):
         else:
             self.query_one("#seq-info", Static).update("Select a transcript from the list.")
             self.query_one("#seq-body", Static).update("")
+            self._cds_dna = ""
+            self.query_one("#seq-cds-btn", Static).add_class("hidden")
+            self.query_one("#seq-cds-area", TextArea).remove_class("visible")
 
     def compose(self) -> ComposeResult:
         yield Static("Select a transcript from the list.", id="seq-info")
+        yield Static("", id="seq-cds-btn", classes="hidden")
+        yield TextArea("", id="seq-cds-area", read_only=True)
         yield Static("", id="seq-body")
 
     def refresh_annotations(self) -> None:
@@ -1179,23 +1338,70 @@ class SequenceViewer(ScrollableContainer):
             hits: list[HmmerHit] = []
             try:
                 hmmer = self.app.query_one("#hmmer-panel")
-                scan_cache = getattr(hmmer, "_scan_cache", {})
-                hits = scan_cache.get(t.id, [])
-                if hits or t.id in scan_cache:
+                scan_cache = getattr(hmmer, "_scan_cache", None)
+                if scan_cache is not None and t.id in scan_cache:
+                    all_hits = scan_cache[t.id]
+                    # Show only top 5 Pfam hits by e-value on the sequence view
+                    hits = sorted(all_hits, key=lambda h: h.evalue)[:5]
                     orf = _find_longest_orf(t.sequence, t.id)
-            except Exception:
-                pass
+                    _log.info(
+                        "SeqViewer: %s has %d cached hits, orf=%s",
+                        t.id, len(hits), orf.orf_id if orf else "None",
+                    )
+            except Exception as exc:
+                _log.exception("SeqViewer: scan cache lookup failed: %s", exc)
 
-            if orf or hits:
+            cds_btn = self.query_one("#seq-cds-btn", Static)
+            cds_area = self.query_one("#seq-cds-area", TextArea)
+            cds_area.remove_class("visible")
+            if orf:
+                # Store CDS DNA for clipboard copy
+                if orf.strand == "+":
+                    self._cds_dna = t.sequence[orf.nt_start:orf.nt_end]
+                else:
+                    from Bio.Seq import Seq
+                    self._cds_dna = str(Seq(t.sequence[orf.nt_start:orf.nt_end]).reverse_complement())
+                cds_btn.update(
+                    "[bold dim]Click here or press Ctrl+C to copy CDS DNA to clipboard[/]"
+                )
+                cds_btn.remove_class("hidden")
                 body.update(colorize_sequence_annotated(
                     t.sequence, orf=orf, hits=hits,
                 ))
             else:
+                self._cds_dna = ""
+                cds_btn.add_class("hidden")
                 body.update(colorize_sequence(t.sequence))
         except Exception as exc:
             _log.exception("SequenceViewer.show_transcript failed: %s", exc)
             info.update(f"[red]Error: {exc}[/]")
             body.update("")
+
+    def copy_cds_to_clipboard(self) -> None:
+        """Copy the CDS DNA sequence to the system clipboard."""
+        if self._cds_dna:
+            self.app.copy_to_clipboard(self._cds_dna)
+            self.app.notify(f"CDS DNA copied ({len(self._cds_dna)} bp)", severity="information")
+        else:
+            self.app.notify("No CDS detected for this transcript", severity="warning")
+
+    @on(events.Click, "#seq-cds-btn")
+    def _on_cds_click(self, event: events.Click) -> None:
+        event.stop()
+        if not self._cds_dna:
+            return
+        cds_area = self.query_one("#seq-cds-area", TextArea)
+        if cds_area.has_class("visible"):
+            # Toggle off
+            cds_area.remove_class("visible")
+        else:
+            # Show CDS DNA in selectable TextArea and copy to clipboard
+            cds_area.load_text(self._cds_dna)
+            cds_area.add_class("visible")
+            cds_area.select_all()
+            cds_area.focus()
+            self.app.copy_to_clipboard(self._cds_dna)
+            self.app.notify(f"CDS DNA copied ({len(self._cds_dna)} bp)", severity="information")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1597,6 +1803,7 @@ class BlastPanel(Vertical):
     """
 
     transcript: reactive[Transcript | None] = reactive(None)
+    _row_to_subject: dict[str, str] = {}  # row_key -> original subject_id
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="blast-form"):
@@ -1737,22 +1944,26 @@ class BlastPanel(Vertical):
         self._set_status(f"Running {program}…")
         table = self.query_one("#blast-table", DataTable)
         table.clear()
+        self._row_to_subject = {}
         try:
             hits, _ = await local_blast(
                 query_seq=query_seq, query_id=query_id, db_path=db,
                 program=program, evalue=evalue, max_hits=maxhits,
             )
             for i, h in enumerate(hits):
+                row_key = f"{h.subject_id}_{i}"
+                self._row_to_subject[row_key] = h.subject_id
                 table.add_row(
                     h.subject_id[:40], f"{h.pct_identity:.1f}",
                     str(h.alignment_length), f"{h.evalue:.2e}", f"{h.bit_score:.1f}",
                     str(h.query_start), str(h.query_end),
                     str(h.subject_start), str(h.subject_end),
-                    key=h.subject_id,
+                    key=row_key,
                 )
             self._set_status(f"[green]{len(hits)} hits found.[/]")
-        except RuntimeError as exc:
+        except Exception as exc:
             self._set_status(f"[red]Error: {exc}[/]")
+            _log.exception("BLAST worker failed: %s", exc)
         finally:
             loading.remove_class("running")
 
@@ -1804,7 +2015,7 @@ class HmmerPanel(Vertical):
 
             if t.id in self._scan_cache:
                 hits = self._scan_cache[t.id]
-                self._display_hits(t, hits)
+                self._display_hits(t, hits, refresh_seq=False)
                 conf = self._confirm_cache.get(t.id)
                 if conf:
                     tag = "CONFIRMED" if conf.confirmed else "UNCONFIRMED"
@@ -1818,8 +2029,16 @@ class HmmerPanel(Vertical):
         except Exception:
             pass
 
-    def _display_hits(self, t: Transcript, hits: list[HmmerHit]) -> None:
-        """Populate table and diagram from a list of hits."""
+    def _display_hits(
+        self, t: Transcript, hits: list[HmmerHit], *, refresh_seq: bool = True,
+    ) -> None:
+        """Populate table and diagram from a list of hits.
+
+        Args:
+            refresh_seq: If True, also refresh the Sequence tab annotations.
+                Set to False when called from watch_transcript (the
+                SequenceViewer already handles its own refresh).
+        """
         table = self.query_one("#hmmer-table", DataTable)
         table.clear()
         for h in hits:
@@ -1839,12 +2058,14 @@ class HmmerPanel(Vertical):
         except Exception as exc:
             _log.exception("Diagram render failed: %s", exc)
         # Refresh Sequence tab so annotations appear on the DNA view
-        try:
-            sv = self.app.query_one("#seq-viewer")
-            if hasattr(sv, "refresh_annotations"):
-                sv.refresh_annotations()
-        except Exception:
-            pass
+        if refresh_seq:
+            try:
+                sv = self.app.query_one("#seq-viewer")
+                if hasattr(sv, "refresh_annotations"):
+                    _log.info("_display_hits: calling refresh_annotations for %s", t.id)
+                    sv.refresh_annotations()
+            except Exception as exc:
+                _log.exception("_display_hits: refresh_annotations failed: %s", exc)
 
     def set_db_path(self, db_path: str) -> None:
         self.query_one("#hmmer-db-input", Input).value = db_path
@@ -2013,6 +2234,8 @@ class HmmerPanel(Vertical):
             self._scan_cache[t.id] = hits
             self._display_hits(t, hits)
             self._set_status(f"[green]{len(hits)} Pfam domain hits found.[/]")
+            # Update Sequence tab with annotations
+            self._update_sequence_tab(t, hits)
         except HMMCancelled:
             self._set_status("[dim]Scan cancelled.[/]")
         except Exception as exc:
@@ -2102,6 +2325,7 @@ class HmmerPanel(Vertical):
             def _final():
                 hits = self._scan_cache.get(t.id, [])
                 self._display_hits(t, hits)
+                self._update_sequence_tab(t, hits)
                 tag = "CONFIRMED" if conf.confirmed else "UNCONFIRMED"
                 color = "green" if conf.confirmed else "yellow"
                 msg = f"[{color}]CDS {tag}[/{color}]"
@@ -2193,6 +2417,20 @@ class HmmerPanel(Vertical):
         finally:
             progress.remove_class("running")
 
+    def _update_sequence_tab(self, t: Transcript, hits: list[HmmerHit]) -> None:
+        """Directly update the Sequence tab body with CDS/Pfam annotations."""
+        try:
+            body = self.app.query_one("#seq-body", Static)
+            orf = _find_longest_orf(t.sequence, t.id)
+            top_hits = sorted(hits, key=lambda h: h.evalue)[:5]
+            if orf:
+                body.update(colorize_sequence_annotated(t.sequence, orf=orf, hits=top_hits))
+                _log.info("Updated Sequence tab with annotations for %s", t.id)
+            else:
+                _log.info("No ORF found for %s, skipping sequence annotation", t.id)
+        except Exception as exc:
+            _log.exception("_update_sequence_tab failed: %s", exc)
+
     def _set_status(self, msg: str) -> None:
         self.query_one("#hmmer-status", Static).update(msg)
 
@@ -2279,6 +2517,7 @@ class ScriptoScopeApp(App):
         Binding("ctrl+p", "focus_pfam", "Pfam Scan"),
         Binding("ctrl+f", "focus_filter", "Filter"),
         Binding("ctrl+d", "build_blast_db", "Build BLAST DB"),
+        Binding("ctrl+c", "copy_cds", "Copy CDS", show=False),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -2286,6 +2525,14 @@ class ScriptoScopeApp(App):
         _hmm_cancel.set()
         _restore_terminal()
         os._exit(0)
+
+    def action_copy_cds(self) -> None:
+        """Copy CDS DNA to clipboard (Ctrl+C)."""
+        try:
+            viewer = self.query_one("#seq-viewer", SequenceViewer)
+            viewer.copy_cds_to_clipboard()
+        except Exception:
+            pass
 
     def __init__(self, startup_fasta: str = "", **kwargs) -> None:
         super().__init__(**kwargs)
@@ -2481,7 +2728,10 @@ class ScriptoScopeApp(App):
     def _focus_transcript_from_blast(self, row_key) -> None:
         if row_key is None:
             return
-        subject_id = str(row_key.value)
+        # Look up the original subject_id via the BlastPanel mapping
+        blast_panel = self.query_one("#blast-panel", BlastPanel)
+        raw = str(row_key.value)
+        subject_id = blast_panel._row_to_subject.get(raw, raw)
         t = self._by_id.get(subject_id)
         if t is None:
             self._set_status(f"[yellow]'{subject_id}' not found in loaded transcriptome[/]")
