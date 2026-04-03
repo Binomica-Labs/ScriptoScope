@@ -514,6 +514,146 @@ async def local_blast(
         Path(query_file).unlink(missing_ok=True)
 
 
+_ncbi_blast_cancel = __import__("threading").Event()
+
+
+class NCBIBlastCancelled(Exception):
+    """Raised when user cancels an NCBI BLAST search."""
+
+
+def ncbi_blastp(
+    query_seq: str,
+    evalue: float = 1e-5,
+    max_hits: int = 10,
+    database: str = "nr",
+    progress_cb: Callable[[str], None] | None = None,
+) -> list[BlastHit]:
+    """Run NCBI remote BlastP using the BLAST URL API directly.
+
+    Submits the job, then polls with short intervals for faster response.
+    """
+    import xml.etree.ElementTree as ET
+    from urllib.parse import urlencode
+
+    _BLAST_URL = "https://blast.ncbi.nlm.nih.gov/Blast.cgi"
+
+    # ── Submit ────────────────────────────────────────────────────────────
+    if progress_cb:
+        progress_cb("Submitting BlastP to NCBI…")
+
+    params = urlencode({
+        "CMD": "Put",
+        "PROGRAM": "blastp",
+        "DATABASE": database,
+        "QUERY": query_seq,
+        "EXPECT": str(evalue),
+        "HITLIST_SIZE": str(max_hits),
+        "FORMAT_TYPE": "XML",
+    }).encode()
+
+    req = urllib.request.Request(_BLAST_URL, data=params)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        put_text = resp.read().decode()
+
+    # Extract RID
+    rid = ""
+    for line in put_text.splitlines():
+        if line.strip().startswith("RID = "):
+            rid = line.strip().split("=", 1)[1].strip()
+            break
+    if not rid:
+        raise RuntimeError("NCBI BLAST did not return a RID")
+
+    # ── Poll for results ──────────────────────────────────────────────────
+    poll_interval = 5  # seconds — much faster than qblast's 60s default
+    elapsed = 0
+    max_wait = 300  # 5 min timeout
+
+    while elapsed < max_wait:
+        for _ in range(poll_interval):
+            if _ncbi_blast_cancel.is_set():
+                raise NCBIBlastCancelled()
+            time.sleep(1)
+        elapsed += poll_interval
+        if _ncbi_blast_cancel.is_set():
+            raise NCBIBlastCancelled()
+        if progress_cb:
+            progress_cb(f"Waiting for NCBI BlastP results… ({elapsed}s)")
+
+        check_params = urlencode({
+            "CMD": "Get",
+            "FORMAT_OBJECT": "SearchInfo",
+            "RID": rid,
+        }).encode()
+        req = urllib.request.Request(_BLAST_URL, data=check_params)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            status_text = resp.read().decode()
+
+        if "Status=WAITING" in status_text:
+            continue
+        if "Status=FAILED" in status_text:
+            raise RuntimeError("NCBI BLAST job failed")
+        if "Status=READY" in status_text:
+            break
+    else:
+        raise RuntimeError(f"NCBI BLAST timed out after {max_wait}s")
+
+    # ── Fetch results ─────────────────────────────────────────────────────
+    if progress_cb:
+        progress_cb("Downloading NCBI BlastP results…")
+
+    get_params = urlencode({
+        "CMD": "Get",
+        "FORMAT_TYPE": "XML",
+        "RID": rid,
+    }).encode()
+    req = urllib.request.Request(_BLAST_URL, data=get_params)
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        xml_data = resp.read().decode()
+
+    # ── Parse XML ─────────────────────────────────────────────────────────
+    if progress_cb:
+        progress_cb("Parsing NCBI BlastP results…")
+
+    hits: list[BlastHit] = []
+    root = ET.fromstring(xml_data)
+    for iteration in root.findall(".//Iteration"):
+        query_id = iteration.findtext("Iteration_query-def", "query")
+        for hit in iteration.findall(".//Hit"):
+            hit_def = hit.findtext("Hit_def", "")
+            hit_acc = hit.findtext("Hit_accession", "")
+            subject_label = hit_acc
+            if hit_def:
+                subject_label = f"{hit_acc} {hit_def[:80]}"
+            for hsp in hit.findall(".//Hsp"):
+                try:
+                    identity = int(hsp.findtext("Hsp_identity", "0"))
+                    align_len = int(hsp.findtext("Hsp_align-len", "1"))
+                    pct_id = (identity / align_len * 100) if align_len else 0.0
+                    hits.append(BlastHit(
+                        query_id=query_id,
+                        subject_id=subject_label,
+                        pct_identity=pct_id,
+                        alignment_length=align_len,
+                        mismatches=int(hsp.findtext("Hsp_gaps", "0")),
+                        gap_opens=0,
+                        query_start=int(hsp.findtext("Hsp_query-from", "0")),
+                        query_end=int(hsp.findtext("Hsp_query-to", "0")),
+                        subject_start=int(hsp.findtext("Hsp_hit-from", "0")),
+                        subject_end=int(hsp.findtext("Hsp_hit-to", "0")),
+                        evalue=float(hsp.findtext("Hsp_evalue", "999")),
+                        bit_score=float(hsp.findtext("Hsp_bit-score", "0")),
+                        subject_description=hit_def,
+                    ))
+                except (ValueError, TypeError):
+                    continue
+                break  # only first HSP per hit
+
+    if progress_cb:
+        progress_cb(f"[green]{len(hits)} NCBI BlastP hits found.[/]")
+    return hits
+
+
 async def make_blast_db(fasta_path: str, db_type: str = "nucl") -> str:
     db_prefix = fasta_path + ".blastdb"
     cmd = ["makeblastdb", "-in", fasta_path, "-dbtype", db_type,
@@ -2094,6 +2234,43 @@ def _list_dir(path: Path) -> tuple[list[Path], list[Path]]:
     return dirs, files
 
 
+class ConfirmModal(ModalScreen[bool]):
+    """Simple yes/no confirmation dialog."""
+    DEFAULT_CSS = """
+    ConfirmModal { align: center middle; }
+    ConfirmModal #confirm-dialog {
+        width: 50; height: 7;
+        border: thick $primary 80%; background: $surface; padding: 1 2;
+    }
+    ConfirmModal #confirm-msg { height: 1; text-align: center; }
+    ConfirmModal #confirm-buttons { height: 3; align: center middle; }
+    ConfirmModal Button { margin: 0 1; }
+    """
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, message: str = "Are you sure?") -> None:
+        super().__init__()
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Label(self._message, id="confirm-msg")
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Yes", id="confirm-yes", variant="error")
+                yield Button("No", id="confirm-no", variant="primary")
+
+    @on(Button.Pressed, "#confirm-yes")
+    def _yes(self, event: Button.Pressed) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#confirm-no")
+    def _no(self, event: Button.Pressed) -> None:
+        self.dismiss(False)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class SaveProjectModal(ModalScreen[str | None]):
     """Simple modal to confirm save path."""
     DEFAULT_CSS = """
@@ -2550,6 +2727,7 @@ class BlastPanel(Vertical):
                 yield Input(value="50", id="blast-maxhits")
             with Horizontal(classes="blast-row"):
                 yield Button("Run BLAST", id="blast-run", variant="primary")
+                yield Button("NCBI BlastP", id="blast-ncbi", variant="default")
                 yield Button("Build BLAST DB", id="blast-build-db", variant="warning")
                 yield Static(id="blast-status")
         yield LoadingIndicator(id="blast-loading")
@@ -2612,6 +2790,93 @@ class BlastPanel(Vertical):
         btn.label = "Building…"
         btn.variant = "success"
         self.app.action_build_blast_db(interactive=False)
+
+    @on(Button.Pressed, "#blast-ncbi")
+    def _run_ncbi_blastp(self) -> None:
+        btn = self.query_one("#blast-ncbi", Button)
+
+        # If already running, prompt to cancel
+        if btn.has_class("running-ncbi"):
+            self.app.push_screen(
+                ConfirmModal("Stop NCBI BlastP search?"),
+                self._on_ncbi_cancel_confirm,
+            )
+            return
+
+        query = self._get_query()
+        if query is None:
+            return
+        query_id, query_seq = query
+
+        # Get protein sequence: translate if DNA, or use directly if protein
+        seq_type = _detect_seq_type(query_seq)
+        if seq_type == "dna":
+            orf = _find_longest_orf(query_seq, query_id)
+            if orf and orf.sequence:
+                protein_seq = orf.sequence
+            else:
+                self._set_status("[yellow]No ORF found — paste a protein sequence or use a transcript with an ORF.[/]")
+                return
+        else:
+            protein_seq = query_seq
+
+        _ncbi_blast_cancel.clear()
+        btn.add_class("running-ncbi")
+        btn.label = "Cancel Search"
+        btn.variant = "error"
+        self._ncbi_blastp_worker(protein_seq)
+
+    def _on_ncbi_cancel_confirm(self, confirmed: bool) -> None:
+        if confirmed:
+            _ncbi_blast_cancel.set()
+            self._set_status("[yellow]Cancelling NCBI BlastP…[/]")
+
+    @work(exclusive=True, thread=True, group="ncbi-blast")
+    def _ncbi_blastp_worker(self, protein_seq: str) -> None:
+        try:
+            def _progress(msg: str) -> None:
+                self.app.call_from_thread(self._set_status, msg)
+
+            hits = ncbi_blastp(protein_seq, max_hits=10, progress_cb=_progress)
+
+            def _apply() -> None:
+                table = self.query_one("#blast-table", DataTable)
+                table.clear()
+                self._row_to_subject = {}
+                for i, h in enumerate(hits):
+                    row_key = f"ncbi_{h.subject_id}_{i}"
+                    self._row_to_subject[row_key] = h.subject_id
+                    table.add_row(
+                        h.subject_id[:60], f"{h.pct_identity:.1f}",
+                        str(h.alignment_length), f"{h.evalue:.2e}", f"{h.bit_score:.1f}",
+                        str(h.query_start), str(h.query_end),
+                        str(h.subject_start), str(h.subject_end),
+                        key=row_key,
+                    )
+                self._set_status(f"[green]{len(hits)} NCBI BlastP hits found.[/]")
+                btn = self.query_one("#blast-ncbi", Button)
+                btn.remove_class("running-ncbi")
+                btn.label = "NCBI BlastP"
+                btn.variant = "default"
+
+            self.app.call_from_thread(_apply)
+        except NCBIBlastCancelled:
+            def _cancelled() -> None:
+                self._set_status("[yellow]NCBI BlastP search cancelled.[/]")
+                btn = self.query_one("#blast-ncbi", Button)
+                btn.remove_class("running-ncbi")
+                btn.label = "NCBI BlastP"
+                btn.variant = "default"
+            self.app.call_from_thread(_cancelled)
+        except Exception as exc:
+            def _err() -> None:
+                self._set_status(f"[red]NCBI BlastP error: {exc}[/]")
+                btn = self.query_one("#blast-ncbi", Button)
+                btn.remove_class("running-ncbi")
+                btn.label = "NCBI BlastP"
+                btn.variant = "default"
+            self.app.call_from_thread(_err)
+            _log.exception("NCBI BlastP failed: %s", exc)
 
     def _get_query(self) -> tuple[str, str] | None:
         """Return (query_id, query_seq) or None on error."""
