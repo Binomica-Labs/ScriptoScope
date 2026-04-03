@@ -1688,7 +1688,7 @@ class SequenceViewer(ScrollableContainer):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self._render_cache: dict[tuple, SeqRenderResult] = {}
+        self._seq_render_cache: dict[tuple, SeqRenderResult] = {}
 
     def compose(self) -> ComposeResult:
         yield Static("Select a transcript from the list.", id="seq-info")
@@ -1714,6 +1714,8 @@ class SequenceViewer(ScrollableContainer):
         if t:
             self.show_transcript(t)
 
+    _render_seq_id: str = ""  # track which transcript render is in flight
+
     def show_transcript(self, t: Transcript) -> None:
         info = self.query_one("#seq-info", Static)
         body = self.query_one("#seq-body", Static)
@@ -1738,80 +1740,98 @@ class SequenceViewer(ScrollableContainer):
             )
             info.update(grid)
 
-            # Check if HMMER scan data is available for this transcript
-            orf = None
-            hits: list[HmmerHit] = []
-            try:
-                hmmer = self.app.query_one("#hmmer-panel")
-                scan_cache = getattr(hmmer, "_scan_cache", None)
-                if scan_cache is not None and t.id in scan_cache:
-                    all_hits = scan_cache[t.id]
-                    # Show only top 5 Pfam hits by e-value on the sequence view
-                    hits = sorted(all_hits, key=lambda h: h.evalue)[:5]
-                    orf = _find_longest_orf(t.sequence, t.id)
-                    _log.info(
-                        "SeqViewer: %s has %d cached hits, orf=%s",
-                        t.id, len(hits), orf.orf_id if orf else "None",
-                    )
-            except Exception as exc:
-                _log.exception("SeqViewer: scan cache lookup failed: %s", exc)
+            cds_btn = self.query_one("#seq-cds-btn", Static)
+            cds_area = self.query_one("#seq-cds-area", TextArea)
+            cds_area.remove_class("visible")
+            cds_btn.add_class("hidden")
 
-            # Compute sequence width to fill available terminal width.
-            # #seq-body has CSS padding: 0 1 (1 char each side = 2).
-            # ScrollableContainer has a 2-char vertical scrollbar.
+            # Capture values that need main-thread context
             body_padding = 2
             scrollbar_w = 2
             container_w = self.size.width or 0
             overhead = body_padding + scrollbar_w
-            if container_w > overhead:
-                seq_width = container_w - overhead
-            else:
-                seq_width = 60  # fallback before layout is ready
+            seq_width = (container_w - overhead) if container_w > overhead else 60
 
-            cds_btn = self.query_one("#seq-cds-btn", Static)
-            cds_area = self.query_one("#seq-cds-area", TextArea)
-            cds_area.remove_class("visible")
-            if orf:
-                # Store CDS DNA for clipboard copy
-                if orf.strand == "+":
-                    self._cds_dna = t.sequence[orf.nt_start:orf.nt_end]
-                else:
-                    from Bio.Seq import Seq
-                    self._cds_dna = str(Seq(t.sequence[orf.nt_start:orf.nt_end]).reverse_complement())
-                cds_btn.add_class("hidden")
-                self._last_orf = orf
-                self._last_hits = hits
-                self._last_width = seq_width
-                # Cache key: transcript id, width, highlights, hit count
-                hit_key = tuple((h.target_name, h.ali_from, h.ali_to) for h in hits)
-                cache_key = (t.id, seq_width, self._highlight, self._aa_highlight, hit_key)
-                render = self._render_cache.get(cache_key)
-                if render is None:
-                    render = colorize_sequence_annotated(
-                        t.sequence, orf=orf, hits=hits, width=seq_width,
-                        highlight_range=self._highlight,
-                        aa_highlight_range=self._aa_highlight,
-                    )
-                    if len(self._render_cache) >= self._RENDER_CACHE_MAX:
-                        # Evict oldest entry
-                        oldest = next(iter(self._render_cache))
-                        del self._render_cache[oldest]
-                    self._render_cache[cache_key] = render
-                self._line_map = render.line_map
-                self._features = render.features
-                body.update(render.text)
-            else:
-                self._cds_dna = ""
-                self._last_orf = None
-                self._last_hits = []
-                self._line_map = []
-                self._features = []
-                cds_btn.add_class("hidden")
-                body.update(colorize_sequence(t.sequence, width=seq_width))
+            scan_cache: dict | None = None
+            try:
+                hmmer = self.app.query_one("#hmmer-panel")
+                scan_cache = getattr(hmmer, "_scan_cache", None)
+            except Exception:
+                pass
+
+            # Clear body immediately so Textual doesn't render stale large content
+            body.update(Text("Loading…", style="dim"))
+            self._render_seq_id = t.id
+            self._render_sequence_bg(t, seq_width, scan_cache)
         except Exception as exc:
             _log.exception("SequenceViewer.show_transcript failed: %s", exc)
             info.update(f"[red]Error: {exc}[/]")
             body.update("")
+
+    @work(exclusive=True, thread=True, group="seq-render")
+    def _render_sequence_bg(self, t: Transcript, seq_width: int, scan_cache: dict | None) -> None:
+        """Heavy sequence rendering on a background thread."""
+        # Gather inputs
+        orf = None
+        hits: list[HmmerHit] = []
+        try:
+            if scan_cache is not None and t.id in scan_cache:
+                all_hits = scan_cache[t.id]
+                hits = sorted(all_hits, key=lambda h: h.evalue)[:5]
+                orf = _find_longest_orf(t.sequence, t.id)
+        except Exception:
+            pass
+
+        # Build CDS DNA
+        cds_dna = ""
+        if orf:
+            if orf.strand == "+":
+                cds_dna = t.sequence[orf.nt_start:orf.nt_end]
+            else:
+                from Bio.Seq import Seq
+                cds_dna = str(Seq(t.sequence[orf.nt_start:orf.nt_end]).reverse_complement())
+
+        # Render (expensive)
+        if orf:
+            hit_key = tuple((h.target_name, h.ali_from, h.ali_to) for h in hits)
+            cache_key = (t.id, seq_width, self._highlight, self._aa_highlight, hit_key)
+            render = self._seq_render_cache.get(cache_key)
+            if render is None:
+                render = colorize_sequence_annotated(
+                    t.sequence, orf=orf, hits=hits, width=seq_width,
+                    highlight_range=self._highlight,
+                    aa_highlight_range=self._aa_highlight,
+                )
+                if len(self._seq_render_cache) >= self._RENDER_CACHE_MAX:
+                    oldest = next(iter(self._seq_render_cache))
+                    del self._seq_render_cache[oldest]
+                self._seq_render_cache[cache_key] = render
+        else:
+            render = None
+
+        plain_text = None
+        if not orf:
+            plain_text = colorize_sequence(t.sequence, width=seq_width)
+
+        # Apply results on main thread — bail if user already switched transcripts
+        def _apply() -> None:
+            if self._render_seq_id != t.id:
+                return  # user clicked another transcript, discard
+            self._cds_dna = cds_dna
+            self._last_orf = orf
+            self._last_hits = hits
+            self._last_width = seq_width
+            body = self.query_one("#seq-body", Static)
+            if render is not None:
+                self._line_map = render.line_map
+                self._features = render.features
+                body.update(render.text)
+            else:
+                self._line_map = []
+                self._features = []
+                body.update(plain_text)
+
+        self.app.call_from_thread(_apply)
 
     def copy_cds_to_clipboard(self) -> None:
         """Copy the CDS DNA sequence to the system clipboard."""
@@ -2239,6 +2259,13 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
             fasta_path = asyncio.run(
                 genbank_download_fasta(result.accession, dl_dir, progress_cb=_progress)
             )
+            # Save metadata for dropdown label
+            meta_path = Path(fasta_path).with_suffix(".meta.json")
+            meta_path.write_text(json.dumps({
+                "accession": result.accession,
+                "organism": result.organism,
+                "title": result.title,
+            }), encoding="utf-8")
             def _done() -> None:
                 self.dismiss((result.accession, fasta_path))
             self.app.call_from_thread(_done)
@@ -3490,7 +3517,19 @@ class ScriptoScopeApp(App):
                     if not f.is_file():
                         continue
                     if f.suffix in (".fasta", ".fa", ".fna"):
-                        label = f"\u2913 {f.stem}"
+                        # Check for metadata file with organism name
+                        meta_path = f.with_suffix(".meta.json")
+                        label = None
+                        if meta_path.is_file():
+                            try:
+                                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                                organism = meta.get("organism", "")
+                                if organism:
+                                    label = f"\u2913 {organism}"
+                            except Exception:
+                                pass
+                        if not label:
+                            label = f"\u2913 {f.stem}"
                         entries.append((f.stat().st_mtime, label, str(f)))
                     elif f.name.endswith(".scriptoscope.json"):
                         label = f"\u2606 {f.stem.replace('.scriptoscope', '')}"
