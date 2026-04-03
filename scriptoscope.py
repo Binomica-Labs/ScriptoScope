@@ -31,9 +31,10 @@ import signal
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field, asdict
 from functools import lru_cache
 from pathlib import Path
@@ -269,6 +270,8 @@ def genbank_search_transcriptomes(query: str, max_results: int = 10) -> list[Gen
                                 sort="relevance", usehistory="n")
         search_results = Entrez.read(handle)
         handle.close()
+        if "ErrorList" in search_results:
+            _log.warning("NCBI search error: %s", search_results["ErrorList"])
         id_list = search_results.get("IdList", [])
         if id_list:
             break
@@ -280,6 +283,8 @@ def genbank_search_transcriptomes(query: str, max_results: int = 10) -> list[Gen
     handle = Entrez.esummary(db="nuccore", id=",".join(id_list), retmax=max_results)
     summaries = Entrez.read(handle)
     handle.close()
+    if isinstance(summaries, dict) and "ERROR" in summaries:
+        raise RuntimeError(f"NCBI summary fetch failed: {summaries['ERROR']}")
 
     results: list[GenBankResult] = []
     for doc in summaries:
@@ -514,7 +519,7 @@ async def local_blast(
         Path(query_file).unlink(missing_ok=True)
 
 
-_ncbi_blast_cancel = __import__("threading").Event()
+_ncbi_blast_cancel = threading.Event()
 
 
 class NCBIBlastCancelled(Exception):
@@ -532,10 +537,22 @@ def ncbi_blastp(
 
     Submits the job, then polls with short intervals for faster response.
     """
+    import socket
     import xml.etree.ElementTree as ET
     from urllib.parse import urlencode
 
     _BLAST_URL = "https://blast.ncbi.nlm.nih.gov/Blast.cgi"
+
+    def _ncbi_urlopen(req, timeout=30):
+        """Open URL with user-friendly error messages for network failures."""
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, socket.timeout):
+                raise RuntimeError("Connection to NCBI timed out — check your internet connection") from exc
+            raise RuntimeError(f"Cannot reach NCBI: {exc.reason}") from exc
+        except socket.timeout:
+            raise RuntimeError("Connection to NCBI timed out — check your internet connection")
 
     # ── Submit ────────────────────────────────────────────────────────────
     if progress_cb:
@@ -552,7 +569,7 @@ def ncbi_blastp(
     }).encode()
 
     req = urllib.request.Request(_BLAST_URL, data=params)
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with _ncbi_urlopen(req, timeout=30) as resp:
         put_text = resp.read().decode()
 
     # Extract RID
@@ -586,7 +603,7 @@ def ncbi_blastp(
             "RID": rid,
         }).encode()
         req = urllib.request.Request(_BLAST_URL, data=check_params)
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _ncbi_urlopen(req, timeout=30) as resp:
             status_text = resp.read().decode()
 
         if "Status=WAITING" in status_text:
@@ -608,7 +625,7 @@ def ncbi_blastp(
         "RID": rid,
     }).encode()
     req = urllib.request.Request(_BLAST_URL, data=get_params)
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with _ncbi_urlopen(req, timeout=60) as resp:
         xml_data = resp.read().decode()
 
     # ── Parse XML ─────────────────────────────────────────────────────────
@@ -1099,7 +1116,7 @@ def render_orf_diagram(
 _hmm_cpus = min(os.cpu_count() or 4, 8)
 
 # Threading event used to abort long-running HMM scans (e.g. on app quit).
-_hmm_cancel = __import__("threading").Event()
+_hmm_cancel = threading.Event()
 
 
 class HMMCancelled(Exception):
@@ -1115,22 +1132,25 @@ class _HMMCache:
     def __init__(self) -> None:
         self._path: str = ""
         self._hmms: list | None = None
-        self._lock = __import__("threading").Lock()
+        self._lock = threading.Lock()
 
     def get(self, db_path: str) -> list:
         with self._lock:
             if self._path == db_path and self._hmms is not None:
                 return self._hmms
-            # Load inside the lock so concurrent callers wait instead of
-            # both loading the file independently.
-            _log.info("Loading HMM database %s …", db_path)
-            import pyhmmer
-            with pyhmmer.plan7.HMMFile(db_path) as hmm_file:
-                hmms = list(hmm_file)
+        # Load outside the lock to avoid blocking concurrent callers
+        _log.info("Loading HMM database %s …", db_path)
+        import pyhmmer
+        with pyhmmer.plan7.HMMFile(db_path) as hmm_file:
+            hmms = list(hmm_file)
+        with self._lock:
+            # Re-check in case another thread loaded while we were reading
+            if self._path == db_path and self._hmms is not None:
+                return self._hmms
             self._path = db_path
             self._hmms = hmms
-            _log.info("Cached %d HMM profiles from %s", len(hmms), db_path)
-            return hmms
+        _log.info("Cached %d HMM profiles from %s", len(hmms), db_path)
+        return hmms
 
     def clear(self) -> None:
         with self._lock:
@@ -1393,9 +1413,13 @@ async def download_pfam(
 
 
 def pfam_db_exists(dest_dir: Path = _PFAM_DEFAULT_DIR) -> str | None:
-    """Return the path to the local Pfam HMM if it exists, else None."""
+    """Return the path to the local Pfam HMM if it exists and looks valid, else None."""
     hmm_path = dest_dir / "Pfam-A.hmm"
     if hmm_path.exists():
+        # Pfam-A.hmm is typically >1 GB; a tiny file means interrupted download
+        if hmm_path.stat().st_size < 1_000_000:
+            _log.warning("Pfam HMM file appears truncated (%d bytes), ignoring", hmm_path.stat().st_size)
+            return None
         return str(hmm_path)
     return None
 
@@ -1468,6 +1492,142 @@ class SeqRenderResult:
     features: list[SeqFeatureRegion]
 
 
+def _aa_codon_start(orf: ORFCoord, aa_idx: int) -> int:
+    """Return the nucleotide position of the first base in codon aa_idx."""
+    if orf.strand == "+":
+        return orf.nt_start + aa_idx * 3
+    return orf.nt_end - (aa_idx + 1) * 3
+
+
+def _build_aa_track(
+    orf: ORFCoord, n: int,
+    aa_at: list[str | None], aa_color: list[str],
+    base_override: list[str | None],
+) -> None:
+    """Fill amino acid and start/stop codon arrays for the CDS."""
+    cds_color = _FRAME_COLORS.get((orf.strand, orf.frame), "bright_cyan")
+
+    for aa_idx in range(orf.aa_length):
+        codon_start = _aa_codon_start(orf, aa_idx)
+        if codon_start < 0 or codon_start + 2 >= n:
+            continue
+        mid = codon_start + 1
+        aa_at[mid] = orf.sequence[aa_idx]
+        aa_color[mid] = cds_color
+
+    # Highlight start codon
+    start_codon_pos = _aa_codon_start(orf, 0)
+    if 0 <= start_codon_pos and start_codon_pos + 2 < n:
+        for k in range(3):
+            base_override[start_codon_pos + k] = "bold bright_white on green"
+
+    # Stop codons
+    for si in range(orf.stop_count):
+        stop_pos = (orf.nt_end - (orf.stop_count - si) * 3) if orf.strand == "+" else (orf.nt_start + si * 3)
+        if 0 <= stop_pos and stop_pos + 2 < n:
+            for k in range(3):
+                base_override[stop_pos + k] = "bold bright_white on red"
+            mid = stop_pos + 1
+            aa_at[mid] = "*"
+            aa_color[mid] = "bold bright_red"
+
+
+def _build_feature_track(
+    orf: ORFCoord, n: int,
+    feat_ch: list[str | None], feat_color: list[str],
+) -> None:
+    """Fill CDS arrow track arrays (SnapGene-style)."""
+    cds_color = _FRAME_COLORS.get((orf.strand, orf.frame), "bright_cyan")
+    cds_lo, cds_hi = orf.nt_start, orf.nt_end
+    cds_nt_len = cds_hi - cds_lo
+
+    for pos in range(max(0, cds_lo), min(n, cds_hi)):
+        feat_ch[pos] = "▓"
+        feat_color[pos] = cds_color
+
+    cds_label = "CDS"
+    if cds_nt_len >= len(cds_label) + 4:
+        label_start = cds_lo + (cds_nt_len - len(cds_label)) // 2
+        for ci, ch in enumerate(cds_label):
+            lp = label_start + ci
+            if 0 <= lp < n:
+                feat_ch[lp] = ch
+                feat_color[lp] = f"bold {cds_color}"
+
+    arrow_tip = "▶" if orf.strand == "+" else "◀"
+    if orf.strand == "+":
+        tip_pos = min(cds_hi - 1, n - 1)
+        if 0 <= tip_pos:
+            feat_ch[tip_pos] = arrow_tip
+            feat_color[tip_pos] = f"bold reverse {cds_color}"
+    else:
+        tip_pos = max(cds_lo, 0)
+        if tip_pos < n:
+            feat_ch[tip_pos] = arrow_tip
+            feat_color[tip_pos] = f"bold reverse {cds_color}"
+
+
+def _build_pfam_track(
+    orf: ORFCoord, hits: list[HmmerHit], n: int,
+    pfam_label: list[str | None], pfam_color: list[str],
+) -> tuple[list[HmmerHit], dict[str, str]]:
+    """Fill Pfam domain annotation arrays. Returns (sorted_hits, domain_colors)."""
+    sorted_hits = sorted(hits, key=lambda h: h.evalue)
+    domain_colors: dict[str, str] = {}
+    cidx = 0
+    for h in sorted_hits:
+        if h.target_name not in domain_colors:
+            domain_colors[h.target_name] = _DOMAIN_PALETTE[cidx % len(_DOMAIN_PALETTE)]
+            cidx += 1
+
+    pfam_claimed: list[bool] = [False] * n
+    for h in sorted_hits:
+        dcolor = domain_colors[h.target_name]
+        aa_start = h.ali_from - 1
+        aa_end = h.ali_to
+        nt_dom_start = _aa_codon_start(orf, aa_start)
+        nt_dom_end = _aa_codon_start(orf, aa_end - 1) + 3
+        if nt_dom_start > nt_dom_end:
+            nt_dom_start, nt_dom_end = nt_dom_end, nt_dom_start
+        nt_dom_start = max(0, nt_dom_start)
+        nt_dom_end = min(n, nt_dom_end)
+
+        unclaimed = sum(1 for p in range(nt_dom_start, nt_dom_end) if p < n and not pfam_claimed[p])
+        if unclaimed == 0:
+            continue
+
+        name = h.target_name
+        dom_nt_len = nt_dom_end - nt_dom_start
+        if dom_nt_len >= len(name) + 2:
+            pad = dom_nt_len - len(name)
+            pad_l = pad // 2
+            for j in range(dom_nt_len):
+                pos = nt_dom_start + j
+                if pos >= n:
+                    break
+                if pfam_claimed[pos]:
+                    continue
+                pfam_claimed[pos] = True
+                if j < pad_l or j >= pad_l + len(name):
+                    pfam_label[pos] = "━"
+                    pfam_color[pos] = dcolor
+                else:
+                    pfam_label[pos] = name[j - pad_l]
+                    pfam_color[pos] = f"bold {dcolor}"
+        else:
+            for j in range(dom_nt_len):
+                pos = nt_dom_start + j
+                if pos >= n:
+                    break
+                if pfam_claimed[pos]:
+                    continue
+                pfam_claimed[pos] = True
+                pfam_label[pos] = "━"
+                pfam_color[pos] = dcolor
+
+    return sorted_hits, domain_colors
+
+
 def colorize_sequence_annotated(
     seq: str,
     orf: ORFCoord | None = None,
@@ -1480,170 +1640,39 @@ def colorize_sequence_annotated(
     truncated = len(seq) > _MAX_DISPLAY_BASES
     display_seq = seq[:_MAX_DISPLAY_BASES] if truncated else seq
     prefix_w = 0
-
-    # Pre-compute CDS and Pfam annotation arrays over the full display range
-    # aa_at[i] = amino acid character at nucleotide position i (or None)
-    # aa_color[i] = style for that amino acid
-    # pfam_label[i] = character to show on the Pfam track (or None)
-    # pfam_color[i] = style for that Pfam character
     n = len(display_seq)
+
+    # Per-position annotation arrays
     aa_at: list[str | None] = [None] * n
     aa_color: list[str] = [""] * n
     pfam_label: list[str | None] = [None] * n
     pfam_color: list[str] = [""] * n
-
-    # Per-position arrays for feature arrow track
-    feat_ch: list[str | None] = [None] * n   # character for the feature arrow
+    feat_ch: list[str | None] = [None] * n
     feat_color: list[str] = [""] * n
-    # Per-position override for DNA base highlighting (start/stop codons)
     base_override: list[str | None] = [None] * n
 
+    sorted_hits: list[HmmerHit] = []
+    domain_colors: dict[str, str] = {}
+
     if orf:
-        cds_color = _FRAME_COLORS.get((orf.strand, orf.frame), "bright_cyan")
-
-        def _aa_codon_start(aa_idx: int) -> int:
-            if orf.strand == "+":
-                return orf.nt_start + aa_idx * 3
-            else:
-                return orf.nt_end - (aa_idx + 1) * 3
-
-        # Amino acid translation — letter on center base only, no boundary dots
-        for aa_idx in range(orf.aa_length):
-            codon_start = _aa_codon_start(aa_idx)
-            if codon_start < 0 or codon_start + 2 >= n:
-                continue
-            aa_char = orf.sequence[aa_idx]
-            mid = codon_start + 1
-            aa_at[mid] = aa_char
-            aa_color[mid] = cds_color
-
-        # Highlight start codon (ATG on + strand, CAT on - strand displayed)
-        start_codon_pos = _aa_codon_start(0)
-        if 0 <= start_codon_pos and start_codon_pos + 2 < n:
-            for k in range(3):
-                base_override[start_codon_pos + k] = "bold bright_white on green"
-
-        # Stop codons: highlight all consecutive in-frame stops and show * on AA track
-        for si in range(orf.stop_count):
-            if orf.strand == "+":
-                stop_pos = orf.nt_end - (orf.stop_count - si) * 3
-            else:
-                stop_pos = orf.nt_start + si * 3
-            if 0 <= stop_pos and stop_pos + 2 < n:
-                for k in range(3):
-                    base_override[stop_pos + k] = "bold bright_white on red"
-                # Place * on the center base of each stop codon
-                mid = stop_pos + 1
-                aa_at[mid] = "*"
-                aa_color[mid] = "bold bright_red"
-
-        # ── Feature arrow track (SnapGene-style) ──
-        # CDS spans nt_start to nt_end; arrow shows direction
-        cds_lo = orf.nt_start
-        cds_hi = orf.nt_end
-        arrow_tip = "▶" if orf.strand == "+" else "◀"
-        cds_label = "CDS"
-        cds_nt_len = cds_hi - cds_lo
-
-        # Fill the arrow body
-        for pos in range(max(0, cds_lo), min(n, cds_hi)):
-            feat_ch[pos] = "▓"
-            feat_color[pos] = cds_color
-
-        # Place CDS label in the middle
-        if cds_nt_len >= len(cds_label) + 4:
-            label_start = cds_lo + (cds_nt_len - len(cds_label)) // 2
-            for ci, ch in enumerate(cds_label):
-                lp = label_start + ci
-                if 0 <= lp < n:
-                    feat_ch[lp] = ch
-                    feat_color[lp] = f"bold {cds_color}"
-
-        # Arrow tip at the end (reverse style gives colored background)
-        if orf.strand == "+":
-            tip_pos = min(cds_hi - 1, n - 1)
-            if 0 <= tip_pos:
-                feat_ch[tip_pos] = arrow_tip
-                feat_color[tip_pos] = f"bold reverse {cds_color}"
-        else:
-            tip_pos = max(cds_lo, 0)
-            if tip_pos < n:
-                feat_ch[tip_pos] = arrow_tip
-                feat_color[tip_pos] = f"bold reverse {cds_color}"
-
-        # Build Pfam domain annotations in nucleotide space
-        # Sort by e-value so the best hit wins overlapping positions
+        _build_aa_track(orf, n, aa_at, aa_color, base_override)
+        _build_feature_track(orf, n, feat_ch, feat_color)
         if hits:
-            sorted_hits = sorted(hits, key=lambda h: h.evalue)
+            sorted_hits, domain_colors = _build_pfam_track(orf, hits, n, pfam_label, pfam_color)
 
-            domain_colors: dict[str, str] = {}
-            cidx = 0
-            for h in sorted_hits:
-                if h.target_name not in domain_colors:
-                    domain_colors[h.target_name] = _DOMAIN_PALETTE[cidx % len(_DOMAIN_PALETTE)]
-                    cidx += 1
-
-            # Track which positions are already claimed by a better-scoring hit
-            pfam_claimed: list[bool] = [False] * n
-
-            for h in sorted_hits:
-                dcolor = domain_colors[h.target_name]
-                aa_start = h.ali_from - 1
-                aa_end = h.ali_to
-                nt_dom_start = _aa_codon_start(aa_start)
-                nt_dom_end = _aa_codon_start(aa_end - 1) + 3
-                if nt_dom_start > nt_dom_end:
-                    nt_dom_start, nt_dom_end = nt_dom_end, nt_dom_start
-                nt_dom_start = max(0, nt_dom_start)
-                nt_dom_end = min(n, nt_dom_end)
-
-                # Skip if entirely overlapped by a better hit
-                unclaimed = sum(1 for p in range(nt_dom_start, nt_dom_end) if p < n and not pfam_claimed[p])
-                if unclaimed == 0:
-                    continue
-
-                name = h.target_name
-                dom_nt_len = nt_dom_end - nt_dom_start
-                if dom_nt_len >= len(name) + 2:
-                    pad = dom_nt_len - len(name)
-                    pad_l = pad // 2
-                    for j in range(dom_nt_len):
-                        pos = nt_dom_start + j
-                        if pos >= n:
-                            break
-                        if pfam_claimed[pos]:
-                            continue
-                        pfam_claimed[pos] = True
-                        if j < pad_l or j >= pad_l + len(name):
-                            pfam_label[pos] = "━"
-                            pfam_color[pos] = dcolor
-                        else:
-                            pfam_label[pos] = name[j - pad_l]
-                            pfam_color[pos] = f"bold {dcolor}"
-                else:
-                    for j in range(dom_nt_len):
-                        pos = nt_dom_start + j
-                        if pos >= n:
-                            break
-                        if pfam_claimed[pos]:
-                            continue
-                        pfam_claimed[pos] = True
-                        pfam_label[pos] = "━"
-                        pfam_color[pos] = dcolor
-
+    # ── Assemble output ──────────────────────────────────────────────────
     result = Text(no_wrap=False)
     line_map: list[SeqLineInfo] = []
     features: list[SeqFeatureRegion] = []
     cur_line = 0
 
-    # Header: CDS and Pfam summary
+    # Header
     if orf:
         cds_color = _FRAME_COLORS.get((orf.strand, orf.frame), "bright_cyan")
         result.append(f"  CDS: ", style="dim")
         result.append(f"{orf.nt_start+1}–{orf.nt_end}", style=f"bold {cds_color}")
         result.append(f" ({orf.aa_length} aa, {orf.strand}f{orf.frame})", style=f"dim {cds_color}")
         result.append("  ", style="dim")
-        # Start/stop legend
         result.append(" ATG ", style="bold bright_white on green")
         result.append(" ", style="dim")
         result.append(" STOP ", style="bold bright_white on red")
@@ -1652,13 +1681,9 @@ def colorize_sequence_annotated(
             for fam, dcol in domain_colors.items():
                 result.append(f"━━ {fam} ", style=f"bold {dcol}")
         result.append("\n\n")
-        # Header is 2 lines (content + blank)
         line_map.append(SeqLineInfo("header", 0, 0))
         line_map.append(SeqLineInfo("header", 0, 0))
         cur_line += 2
-
-        # Build feature regions for click detection
-        # CDS: full ORF amino acid sequence (always N-term to C-term)
         features.append(SeqFeatureRegion("CDS", orf.nt_start, orf.nt_end, aa_seq=orf.sequence))
 
     if orf and hits:
@@ -1669,11 +1694,9 @@ def colorize_sequence_annotated(
             nt_dom_end = orf.nt_start + aa_end * 3 if orf.strand == "+" else orf.nt_end - aa_start * 3
             if nt_dom_start > nt_dom_end:
                 nt_dom_start, nt_dom_end = nt_dom_end, nt_dom_start
-            # Extract domain AA subsequence (always N-term to C-term)
             dom_aa = orf.sequence[aa_start:aa_end]
             features.append(SeqFeatureRegion(h.target_name, max(0, nt_dom_start), min(n, nt_dom_end), aa_seq=dom_aa))
 
-    # Helper: flush a run-length-encoded line into result
     def _flush_line(chars: list[str], styles: list[str]) -> None:
         if not chars:
             return
@@ -1693,7 +1716,7 @@ def colorize_sequence_annotated(
         chunk = display_seq[i : i + width]
         chunk_len = len(chunk)
 
-        # ── CDS feature arrow (single line) ──
+        # CDS feature arrow
         if orf:
             has_feat = any(feat_ch[i + j] is not None for j in range(chunk_len) if i + j < n)
             if has_feat:
@@ -1714,7 +1737,7 @@ def colorize_sequence_annotated(
                 line_map.append(SeqLineInfo("feat", i, chunk_len))
                 cur_line += 1
 
-        # ── Pfam domain track (half-height, best e-value closest to CDS) ──
+        # Pfam domain track
         if hits and orf:
             has_pfam = any(pfam_label[i + j] is not None for j in range(chunk_len) if i + j < n)
             if has_pfam:
@@ -1735,17 +1758,15 @@ def colorize_sequence_annotated(
                 line_map.append(SeqLineInfo("pfam", i, chunk_len))
                 cur_line += 1
 
-        # ── DNA line (with start/stop codon highlighting) ──
+        # DNA line
         line_ch = []
         line_st = []
         for j in range(chunk_len):
             pos = i + j
             base = chunk[j]
             if highlight_range and highlight_range[0] <= pos < highlight_range[1]:
-                # Highlighted feature DNA
                 line_ch.append(base); line_st.append("bold bright_white on dark_blue")
             elif highlight_range:
-                # Dimmed DNA outside highlight
                 line_ch.append(base); line_st.append("dim")
             elif pos < n and base_override[pos] is not None:
                 line_ch.append(base); line_st.append(base_override[pos])
@@ -1755,7 +1776,7 @@ def colorize_sequence_annotated(
         line_map.append(SeqLineInfo("dna", i, chunk_len))
         cur_line += 1
 
-        # ── Amino acid translation line ──
+        # Amino acid translation line
         if orf:
             has_aa = any(aa_at[i + j] is not None for j in range(chunk_len) if i + j < n)
             if has_aa:
@@ -1777,7 +1798,6 @@ def colorize_sequence_annotated(
                 line_map.append(SeqLineInfo("aa", i, chunk_len))
                 cur_line += 1
 
-        # Blank line between chunks for readability
         result.append("\n")
         line_map.append(SeqLineInfo("blank", i, chunk_len))
         cur_line += 1
@@ -1828,7 +1848,7 @@ class SequenceViewer(ScrollableContainer):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self._seq_render_cache: dict[tuple, SeqRenderResult] = {}
+        self._seq_render_cache: OrderedDict[tuple, SeqRenderResult] = OrderedDict()
 
     def compose(self) -> ComposeResult:
         yield Static("Select a transcript from the list.", id="seq-info")
@@ -1936,15 +1956,16 @@ class SequenceViewer(ScrollableContainer):
             hit_key = tuple((h.target_name, h.ali_from, h.ali_to) for h in hits)
             cache_key = (t.id, seq_width, self._highlight, self._aa_highlight, hit_key)
             render = self._seq_render_cache.get(cache_key)
-            if render is None:
+            if render is not None:
+                self._seq_render_cache.move_to_end(cache_key)
+            else:
                 render = colorize_sequence_annotated(
                     t.sequence, orf=orf, hits=hits, width=seq_width,
                     highlight_range=self._highlight,
                     aa_highlight_range=self._aa_highlight,
                 )
                 if len(self._seq_render_cache) >= self._RENDER_CACHE_MAX:
-                    oldest = next(iter(self._seq_render_cache))
-                    del self._seq_render_cache[oldest]
+                    self._seq_render_cache.popitem(last=False)
                 self._seq_render_cache[cache_key] = render
         else:
             render = None
