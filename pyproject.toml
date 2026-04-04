@@ -19,3 +19,6 @@ scriptoscope = "scriptoscope:main"
 
 [tool.setuptools]
 py-modules = ["scriptoscope"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

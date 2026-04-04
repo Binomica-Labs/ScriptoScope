@@ -1885,7 +1885,7 @@ class SequenceViewer(ScrollableContainer):
         # Find the line in line_map that contains this position
         target_line = 0
         for idx, info in enumerate(self._line_map):
-            if info.kind == "dna" and info.seq_offset <= pos < info.seq_offset + info.chunk_len:
+            if info.line_type == "dna" and info.chunk_start <= pos < info.chunk_start + info.chunk_len:
                 target_line = idx
                 break
         # Each line is roughly 1 row in the Static; scroll the parent container
