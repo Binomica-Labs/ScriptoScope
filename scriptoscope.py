@@ -1,31 +1,30 @@
 """
 ScriptoScope — TUI Transcriptome Browser
-Version 0.3.0
 
 Changelog:
   0.1.0 — initial release: FASTA loading, sequence viewer, BLAST, HMMER, statistics
   0.2.0 — file-browser dialog, scrollable widgets, thread-safe UI updates,
            run-length encoded sequence coloring, single-pass stats
-  0.3.0 — consolidated into single-file script, fixed transcript selection
-           (RowHighlighted + RowSelected, auto-select first row on load),
-           removed VerticalScroll wrapper blocking click events,
+  0.3.0 — consolidated into single-file script, fixed transcript selection,
            moved _compute_stats off the main thread
-  0.4.0 — replaced @on CSS-selector handlers with on_data_table_row_highlighted/
-           on_data_table_row_selected method-name convention (reliable in 8.1.1),
-           fixed _colorize thread passing body widget to avoid DOM query in thread,
-           removed batch_update wrapper that suppressed RowHighlighted during load,
+  0.4.0 — switched to method-name event handlers, fixed threaded render races,
            added error surfacing + debug log at /tmp/scriptoscope.log
+  0.5.0 — export, filtering, sorting, bookmarks, help, ORF stats,
+           HMM scan performance + UI responsiveness
+  0.6.0 — gzip FASTA support, atomic project saves, duplicate-ID dedup,
+           in-dialog save feedback, project version validation,
+           NCBI RID cleanup on cancel, cache correctness fixes,
+           translate() partial-codon warnings silenced
 """
 from __future__ import annotations
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
 import argparse
 import asyncio
 import csv
 import gzip
-import io
 import json
 import logging
 import os
@@ -62,7 +61,6 @@ from textual.containers import Horizontal, ScrollableContainer, Vertical, Vertic
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.timer import Timer
-from textual.widget import Widget
 from textual.widgets import (
     Button,
     DataTable,
@@ -124,16 +122,38 @@ class Transcript:
 # FASTA loader
 # ══════════════════════════════════════════════════════════════════════════════
 
+class FastaFormatError(ValueError):
+    """Raised when a file does not look like a FASTA."""
+
+
+def _open_fasta(path: Path):
+    """Open a FASTA file, transparently handling gzip-compressed files.
+
+    Detects gzip by magic bytes rather than extension so mislabeled files
+    still work.
+    """
+    with open(path, "rb") as probe:
+        magic = probe.read(2)
+    if magic == b"\x1f\x8b":
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, "rt", encoding="utf-8", errors="replace")
+
+
 def _parse_fasta(path: str | Path) -> Generator[Transcript, None, None]:
     path = Path(path)
     seq_id = None
     description = ""
     seq_parts: list[str] = []
+    saw_header = False
+    saw_content = False
 
-    with open(path, encoding="utf-8", errors="replace") as fh:
+    with _open_fasta(path) as fh:
         for line in fh:
             line = line.rstrip("\n")
+            if line.strip():
+                saw_content = True
             if line.startswith(">"):
+                saw_header = True
                 if seq_id is not None:
                     yield Transcript(id=seq_id, description=description,
                                      sequence="".join(seq_parts))
@@ -145,13 +165,43 @@ def _parse_fasta(path: str | Path) -> Generator[Transcript, None, None]:
             elif seq_id is not None:
                 seq_parts.append(line.rstrip())
 
+    if saw_content and not saw_header:
+        raise FastaFormatError(
+            f"{path.name} does not look like a FASTA file (no '>' header found)"
+        )
+
     if seq_id is not None:
         yield Transcript(id=seq_id, description=description,
                          sequence="".join(seq_parts))
 
 
 def load_all(path: str | Path) -> list[Transcript]:
-    return list(_parse_fasta(path))
+    """Load all transcripts from a FASTA file, deduplicating IDs.
+
+    Duplicate IDs are renamed with a numeric suffix (e.g. "foo", "foo__2",
+    "foo__3") and the total number of duplicates is logged.
+    """
+    transcripts: list[Transcript] = []
+    seen_ids: dict[str, int] = {}
+    duplicate_count = 0
+    for t in _parse_fasta(path):
+        prev = seen_ids.get(t.id)
+        if prev is None:
+            seen_ids[t.id] = 1
+        else:
+            duplicate_count += 1
+            prev += 1
+            seen_ids[t.id] = prev
+            new_id = f"{t.id}__{prev}"
+            # Rebuild Transcript with a unique ID so _by_id is lossless
+            t = Transcript(id=new_id, description=t.description, sequence=t.sequence)
+        transcripts.append(t)
+    if duplicate_count:
+        _log.warning(
+            "Loaded %s: %d duplicate transcript ID(s) renamed with __N suffix",
+            path, duplicate_count,
+        )
+    return transcripts
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -164,7 +214,7 @@ _PROJECT_VERSION = 1
 def save_project(
     path: str | Path,
     transcripts: list[Transcript],
-    fasta_path: str,
+    fasta_path: str | None,
     scan_cache: dict[str, list] | None = None,
     confirm_cache: dict | None = None,
     pfam_hits: dict[str, set[str]] | None = None,
@@ -172,7 +222,7 @@ def save_project(
     """Save transcriptome + analysis results to a JSON project file."""
     data: dict = {
         "version": _PROJECT_VERSION,
-        "fasta_path": fasta_path,
+        "fasta_path": fasta_path or "",
         "transcripts": [
             {"id": t.id, "description": t.description, "sequence": t.sequence}
             for t in transcripts
@@ -193,7 +243,41 @@ def save_project(
             tid: sorted(families)
             for tid, families in pfam_hits.items()
         }
-    Path(path).write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+    # Atomic write: serialize to a sibling temp file, then rename.
+    # Avoids leaving a half-written project file if the process dies mid-write.
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{dest.name}.", suffix=".tmp", dir=str(dest.parent),
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, separators=(",", ":"))
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_name, dest)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+class ProjectFormatError(ValueError):
+    """Raised when a project file is malformed or from an unsupported version."""
+
+
+def _coerce_dataclass(cls, raw: dict):
+    """Build a dataclass from a dict, ignoring unknown keys and filling
+    defaults for missing ones. Tolerates forward/backward-compat drift."""
+    import dataclasses
+    fields = {f.name for f in dataclasses.fields(cls)}
+    kwargs = {k: v for k, v in raw.items() if k in fields}
+    return cls(**kwargs)
 
 
 def load_project(path: str | Path) -> dict:
@@ -202,27 +286,71 @@ def load_project(path: str | Path) -> dict:
     Returns dict with keys: transcripts, fasta_path, scan_cache,
     confirm_cache, pfam_hits.
     """
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    result: dict = {"fasta_path": raw.get("fasta_path", "")}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise ProjectFormatError(f"Invalid JSON in {Path(path).name}: {exc}") from exc
 
-    result["transcripts"] = [
-        Transcript(id=t["id"], description=t["description"], sequence=t["sequence"])
-        for t in raw.get("transcripts", [])
-    ]
+    if not isinstance(raw, dict):
+        raise ProjectFormatError(
+            f"{Path(path).name} is not a ScriptoScope project (expected JSON object)"
+        )
+
+    version = raw.get("version")
+    if version is None:
+        raise ProjectFormatError(
+            f"{Path(path).name} is missing a 'version' field — not a project file?"
+        )
+    if not isinstance(version, int) or version > _PROJECT_VERSION:
+        raise ProjectFormatError(
+            f"{Path(path).name} uses project version {version}; "
+            f"this build understands up to version {_PROJECT_VERSION}"
+        )
+
+    raw_transcripts = raw.get("transcripts", [])
+    if not isinstance(raw_transcripts, list):
+        raise ProjectFormatError("'transcripts' must be a list")
+
+    result: dict = {"fasta_path": raw.get("fasta_path", "") or ""}
+    transcripts: list[Transcript] = []
+    for i, t in enumerate(raw_transcripts):
+        if not isinstance(t, dict) or "id" not in t or "sequence" not in t:
+            raise ProjectFormatError(f"Transcript #{i} is missing id or sequence")
+        transcripts.append(Transcript(
+            id=str(t["id"]),
+            description=str(t.get("description", "")),
+            sequence=str(t["sequence"]),
+        ))
+    result["transcripts"] = transcripts
 
     scan_cache: dict[str, list] = {}
-    for tid, hit_list in raw.get("scan_cache", {}).items():
-        scan_cache[tid] = [HmmerHit(**h) for h in hit_list]
+    for tid, hit_list in (raw.get("scan_cache") or {}).items():
+        if not isinstance(hit_list, list):
+            continue
+        parsed: list[HmmerHit] = []
+        for h in hit_list:
+            if isinstance(h, dict):
+                try:
+                    parsed.append(_coerce_dataclass(HmmerHit, h))
+                except (TypeError, ValueError) as exc:
+                    _log.warning("Skipping malformed HmmerHit for %s: %s", tid, exc)
+        scan_cache[str(tid)] = parsed
     result["scan_cache"] = scan_cache
 
     confirm_cache: dict = {}
-    for tid, conf in raw.get("confirm_cache", {}).items():
-        confirm_cache[tid] = BlastConfirmation(**conf)
+    for tid, conf in (raw.get("confirm_cache") or {}).items():
+        if isinstance(conf, dict):
+            try:
+                confirm_cache[str(tid)] = _coerce_dataclass(BlastConfirmation, conf)
+            except (TypeError, ValueError) as exc:
+                _log.warning("Skipping malformed BlastConfirmation for %s: %s", tid, exc)
     result["confirm_cache"] = confirm_cache
 
     pfam_hits: dict[str, set[str]] = {}
-    for tid, families in raw.get("pfam_hits", {}).items():
-        pfam_hits[tid] = set(families)
+    for tid, families in (raw.get("pfam_hits") or {}).items():
+        if isinstance(families, (list, tuple, set)):
+            pfam_hits[str(tid)] = {str(f) for f in families}
     result["pfam_hits"] = pfam_hits
 
     return result
@@ -584,39 +712,51 @@ def ncbi_blastp(
     if not rid:
         raise RuntimeError("NCBI BLAST did not return a RID")
 
+    def _delete_rid() -> None:
+        """Tell NCBI to release the RID (best-effort; ignore failures)."""
+        try:
+            del_params = urlencode({"CMD": "Delete", "RID": rid}).encode()
+            del_req = urllib.request.Request(_BLAST_URL, data=del_params)
+            with urllib.request.urlopen(del_req, timeout=10):
+                pass
+        except Exception:
+            pass
+
     # ── Poll for results ──────────────────────────────────────────────────
     poll_interval = 5  # seconds — much faster than qblast's 60s default
     elapsed = 0
     max_wait = 300  # 5 min timeout
 
-    while elapsed < max_wait:
-        for _ in range(poll_interval):
-            if _ncbi_blast_cancel.is_set():
+    try:
+        while elapsed < max_wait:
+            # Wait up to poll_interval seconds, returning immediately on cancel.
+            if _ncbi_blast_cancel.wait(timeout=poll_interval):
                 raise NCBIBlastCancelled()
-            time.sleep(1)
-        elapsed += poll_interval
-        if _ncbi_blast_cancel.is_set():
-            raise NCBIBlastCancelled()
-        if progress_cb:
-            progress_cb(f"Waiting for NCBI BlastP results… ({elapsed}s)")
+            elapsed += poll_interval
+            if progress_cb:
+                progress_cb(f"Waiting for NCBI BlastP results… ({elapsed}s)")
 
-        check_params = urlencode({
-            "CMD": "Get",
-            "FORMAT_OBJECT": "SearchInfo",
-            "RID": rid,
-        }).encode()
-        req = urllib.request.Request(_BLAST_URL, data=check_params)
-        with _ncbi_urlopen(req, timeout=30) as resp:
-            status_text = resp.read().decode()
+            check_params = urlencode({
+                "CMD": "Get",
+                "FORMAT_OBJECT": "SearchInfo",
+                "RID": rid,
+            }).encode()
+            req = urllib.request.Request(_BLAST_URL, data=check_params)
+            with _ncbi_urlopen(req, timeout=30) as resp:
+                status_text = resp.read().decode()
 
-        if "Status=WAITING" in status_text:
-            continue
-        if "Status=FAILED" in status_text:
-            raise RuntimeError("NCBI BLAST job failed")
-        if "Status=READY" in status_text:
-            break
-    else:
-        raise RuntimeError(f"NCBI BLAST timed out after {max_wait}s")
+            if "Status=WAITING" in status_text:
+                continue
+            if "Status=FAILED" in status_text:
+                raise RuntimeError("NCBI BLAST job failed")
+            if "Status=READY" in status_text:
+                break
+        else:
+            raise RuntimeError(f"NCBI BLAST timed out after {max_wait}s")
+    except NCBIBlastCancelled:
+        # Release the server-side job so it doesn't keep running unattended.
+        _delete_rid()
+        raise
 
     # ── Fetch results ─────────────────────────────────────────────────────
     if progress_cb:
@@ -748,7 +888,10 @@ def _six_frame_proteins(nucleotide: str, seq_id: str) -> list[tuple[str, str]]:
     results = []
     for strand, nuc in (("+", seq), ("-", seq.reverse_complement())):
         for frame in range(3):
-            trans = str(nuc[frame:].translate(to_stop=False))
+            # Trim to a codon boundary so translate() doesn't warn about
+            # partial codons.
+            frame_len = (len(nuc) - frame) // 3 * 3
+            trans = str(nuc[frame:frame + frame_len].translate(to_stop=False))
             segments = trans.split("*")
             aa_offset = 0
             for i, seg in enumerate(segments):
@@ -756,15 +899,17 @@ def _six_frame_proteins(nucleotide: str, seq_id: str) -> list[tuple[str, str]]:
                 if has_stop:
                     # Find all M positions; each starts a candidate ORF ending at the stop
                     orf_idx = 0
-                    for m_pos in range(len(seg)):
-                        if seg[m_pos] == "M":
-                            candidate = seg[m_pos:]
-                            if len(candidate) >= 30:
-                                results.append((
-                                    f"{seq_id}_{strand}f{frame+1}_orf{i}m{orf_idx}",
-                                    candidate,
-                                ))
-                                orf_idx += 1
+                    seg_len = len(seg)
+                    m_pos = seg.find("M")
+                    while m_pos != -1:
+                        cand_len = seg_len - m_pos
+                        if cand_len >= 30:
+                            results.append((
+                                f"{seq_id}_{strand}f{frame+1}_orf{i}m{orf_idx}",
+                                seg[m_pos:],
+                            ))
+                            orf_idx += 1
+                        m_pos = seg.find("M", m_pos + 1)
                 aa_offset += len(seg) + 1
     return results
 
@@ -778,7 +923,8 @@ def _six_frame_orf_coords(nucleotide: str, seq_id: str, min_aa: int = 30) -> lis
     coords: list[ORFCoord] = []
     for strand, nuc in (("+", seq), ("-", seq.reverse_complement())):
         for frame_idx in range(3):
-            trans = str(nuc[frame_idx:].translate(to_stop=False))
+            frame_len = (len(nuc) - frame_idx) // 3 * 3
+            trans = str(nuc[frame_idx:frame_idx + frame_len].translate(to_stop=False))
             segments = trans.split("*")
             aa_offset = 0
             for i, seg in enumerate(segments):
@@ -792,40 +938,63 @@ def _six_frame_orf_coords(nucleotide: str, seq_id: str, min_aa: int = 30) -> lis
                         else:
                             break
                     orf_idx = 0
-                    for m_pos in range(len(seg)):
-                        if seg[m_pos] == "M":
-                            candidate = seg[m_pos:]
-                            if len(candidate) >= min_aa:
-                                cand_aa_offset = aa_offset + m_pos
-                                strand_nt_start = frame_idx + cand_aa_offset * 3
-                                # +3 per stop codon to include consecutive stops
-                                strand_nt_end = strand_nt_start + len(candidate) * 3 + 3 * n_stops
-                                strand_nt_end = min(strand_nt_end, len(nuc))
-                                if strand == "+":
-                                    nt_start = strand_nt_start
-                                    nt_end = strand_nt_end
-                                else:
-                                    nt_start = seq_len - strand_nt_end
-                                    nt_end = seq_len - strand_nt_start
-                                orf_id = f"{seq_id}_{strand}f{frame_idx+1}_orf{i}m{orf_idx}"
-                                coords.append(ORFCoord(
-                                    orf_id=orf_id, strand=strand, frame=frame_idx + 1,
-                                    nt_start=nt_start, nt_end=nt_end,
-                                    aa_length=len(candidate), sequence=candidate,
-                                    stop_count=n_stops,
-                                ))
-                                orf_idx += 1
+                    seg_len = len(seg)
+                    m_pos = seg.find("M")
+                    while m_pos != -1:
+                        candidate = seg[m_pos:]
+                        if len(candidate) >= min_aa:
+                            cand_aa_offset = aa_offset + m_pos
+                            strand_nt_start = frame_idx + cand_aa_offset * 3
+                            # +3 per stop codon to include consecutive stops
+                            strand_nt_end = strand_nt_start + len(candidate) * 3 + 3 * n_stops
+                            strand_nt_end = min(strand_nt_end, len(nuc))
+                            if strand == "+":
+                                nt_start = strand_nt_start
+                                nt_end = strand_nt_end
+                            else:
+                                nt_start = seq_len - strand_nt_end
+                                nt_end = seq_len - strand_nt_start
+                            orf_id = f"{seq_id}_{strand}f{frame_idx+1}_orf{i}m{orf_idx}"
+                            coords.append(ORFCoord(
+                                orf_id=orf_id, strand=strand, frame=frame_idx + 1,
+                                nt_start=nt_start, nt_end=nt_end,
+                                aa_length=len(candidate), sequence=candidate,
+                                stop_count=n_stops,
+                            ))
+                            orf_idx += 1
+                        m_pos = seg.find("M", m_pos + 1)
                 aa_offset += len(seg) + 1
     return coords
 
 
-@lru_cache(maxsize=2048)
+# Cache keyed by (seq_id, length, short content fingerprint).
+# The fingerprint is a cheap hash of the first/middle/last 64 bases, which
+# is effectively collision-free for distinct transcripts while still much
+# cheaper than hashing a multi-kb sequence on every call.
+_longest_orf_cache: OrderedDict[tuple[str, int, int], ORFCoord | None] = OrderedDict()
+_LONGEST_ORF_CACHE_MAX = 4096
+
+
+def _seq_fingerprint(seq: str) -> int:
+    n = len(seq)
+    if n <= 192:
+        return hash(seq)
+    mid = n // 2
+    return hash((seq[:64], seq[mid:mid + 64], seq[-64:]))
+
+
 def _find_longest_orf(nucleotide: str, seq_id: str) -> ORFCoord | None:
     """Find the single longest ORF across all 6 frames (the putative CDS)."""
+    key = (seq_id, len(nucleotide), _seq_fingerprint(nucleotide))
+    if key in _longest_orf_cache:
+        _longest_orf_cache.move_to_end(key)
+        return _longest_orf_cache[key]
     orfs = _six_frame_orf_coords(nucleotide, seq_id, min_aa=30)
-    if not orfs:
-        return None
-    return max(orfs, key=lambda o: o.aa_length)
+    result = max(orfs, key=lambda o: o.aa_length) if orfs else None
+    _longest_orf_cache[key] = result
+    if len(_longest_orf_cache) > _LONGEST_ORF_CACHE_MAX:
+        _longest_orf_cache.popitem(last=False)
+    return result
 
 
 # ── Colors for ORF / domain visualization ────────────────────────────────────
@@ -1450,16 +1619,16 @@ def colorize_sequence(seq: str, width: int = 60) -> Text:
     for i in range(0, len(display_seq), width):
         chunk = display_seq[i : i + width]
         run_base = chunk[0].upper()
-        run_text = chunk[0]
+        run_chars: list[str] = [chunk[0]]
         for base in chunk[1:]:
             upper = base.upper()
             if upper == run_base:
-                run_text += base
+                run_chars.append(base)
             else:
-                result.append(run_text, style=_BASE_COLORS.get(run_base, "white"))
+                result.append("".join(run_chars), style=_BASE_COLORS.get(run_base, "white"))
                 run_base = upper
-                run_text = base
-        result.append(run_text, style=_BASE_COLORS.get(run_base, "white"))
+                run_chars = [base]
+        result.append("".join(run_chars), style=_BASE_COLORS.get(run_base, "white"))
         result.append("\n")
 
     if truncated:
@@ -1595,8 +1764,8 @@ def _build_pfam_track(
         nt_dom_start = max(0, nt_dom_start)
         nt_dom_end = min(n, nt_dom_end)
 
-        unclaimed = sum(1 for p in range(nt_dom_start, nt_dom_end) if p < n and not pfam_claimed[p])
-        if unclaimed == 0:
+        has_unclaimed = any(not pfam_claimed[p] for p in range(nt_dom_start, nt_dom_end))
+        if not has_unclaimed:
             continue
 
         name = h.target_name
@@ -2135,7 +2304,11 @@ def _filter_transcripts(
             continue
         m = _FILTER_RE.fullmatch(token)
         if m:
-            predicates.append((m.group(1).lower(), m.group(2), float(m.group(3))))
+            try:
+                predicates.append((m.group(1).lower(), m.group(2), float(m.group(3))))
+            except ValueError:
+                # Malformed number like "1.2.3" — treat as plain text instead
+                text_parts.append(token.lower())
         else:
             text_parts.append(token.lower())
     text_query = " ".join(text_parts)
@@ -2206,8 +2379,9 @@ def _compute_stats(transcripts: list[Transcript]) -> dict:
     orf_lengths: list[int] = []
     has_start_codon = 0
     for t in transcripts:
-        orf = _find_longest_orf(t.sequence, t.id)
-        if orf and orf.aa_length >= 30:
+        orfs = _six_frame_orf_coords(t.sequence, t.id, min_aa=30)
+        orf = max(orfs, key=lambda o: o.aa_length) if orfs else None
+        if orf:
             orf_count += 1
             orf_lengths.append(orf.aa_length)
             if orf.sequence.startswith("M"):
@@ -2497,13 +2671,14 @@ class SaveProjectModal(ModalScreen[str | None]):
     DEFAULT_CSS = """
     SaveProjectModal { align: center middle; }
     SaveProjectModal #save-dialog {
-        width: 80; height: 10;
+        width: 80; height: auto;
         border: thick $primary 80%; background: $surface; padding: 1 2;
     }
     SaveProjectModal #save-title {
         height: 1; text-style: bold; text-align: center;
     }
     SaveProjectModal #save-path { margin: 1 0; }
+    SaveProjectModal #save-status { height: 1; text-align: center; margin: 0 0; }
     SaveProjectModal #save-buttons { height: 3; align: right middle; }
     """
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
@@ -2511,27 +2686,79 @@ class SaveProjectModal(ModalScreen[str | None]):
     def __init__(self, default_path: str = "") -> None:
         super().__init__()
         self._default = default_path
+        self._saving = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="save-dialog"):
             yield Label("Save Project", id="save-title")
             yield Input(self._default, id="save-path", placeholder="Path to save project…")
+            yield Static("", id="save-status")
             with Horizontal(id="save-buttons"):
                 yield Button("Save", id="save-ok", variant="primary")
                 yield Button("Cancel", id="save-cancel")
 
     @on(Button.Pressed, "#save-ok")
     def _save(self, event: Button.Pressed) -> None:
+        if self._saving:
+            return
         path = self.query_one("#save-path", Input).value.strip()
-        if path:
-            self.dismiss(path)
+        if not path:
+            return
+        self._saving = True
+        self.query_one("#save-ok", Button).disabled = True
+        self.query_one("#save-path", Input).disabled = True
+        self.query_one("#save-status", Static).update("[dim]Saving…[/]")
+        self._run_save(path)
+
+    @work(exclusive=True, thread=True, group="modal-save")
+    def _run_save(self, path: str) -> None:
+        try:
+            app = self.app
+            scan_cache = {}
+            confirm_cache = {}
+            try:
+                hmmer = app.query_one("#hmmer-panel")
+                scan_cache = getattr(hmmer, "_scan_cache", {})
+                confirm_cache = getattr(hmmer, "_confirm_cache", {})
+            except Exception:
+                pass
+            save_project(
+                path, app._transcripts, app._fasta_path,
+                scan_cache=scan_cache,
+                confirm_cache=confirm_cache,
+                pfam_hits=app._pfam_hits,
+            )
+
+            def _on_saved() -> None:
+                self.query_one("#save-status", Static).update(
+                    f"[bold green]Saved to {Path(path).name}[/]"
+                )
+                app._set_status(f"[green]Project saved: {path}[/]")
+                app._refresh_transcriptome_select()
+                self.set_timer(1.2, lambda: self.dismiss(path))
+
+            self.app.call_from_thread(_on_saved)
+        except Exception as exc:
+            _log.exception("Save project failed: %s", exc)
+
+            def _on_error() -> None:
+                self.query_one("#save-status", Static).update(
+                    f"[bold red]Save failed: {exc}[/]"
+                )
+                self._saving = False
+                self.query_one("#save-ok", Button).disabled = False
+                self.query_one("#save-path", Input).disabled = False
+
+            self.app.call_from_thread(_on_error)
 
     @on(Button.Pressed, "#save-cancel")
     def _cancel_btn(self, event: Button.Pressed) -> None:
-        self.dismiss(None)
+        if not self._saving:
+            self.dismiss(None)
 
     def action_cancel(self) -> None:
-        self.dismiss(None)
+        if not self._saving:
+            self.dismiss(None)
 
 
 class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
@@ -2767,7 +2994,11 @@ class FileBrowserModal(ModalScreen[str | None]):
 
         fasta_count = 0
         for f in files:
-            is_fasta = f.suffix.lower() in _FASTA_EXTENSIONS
+            # Recognize FASTA with optional .gz suffix (e.g. foo.fasta.gz).
+            lname = f.name.lower()
+            if lname.endswith(".gz"):
+                lname = lname[:-3]
+            is_fasta = Path(lname).suffix in _FASTA_EXTENSIONS
             if is_fasta:
                 fasta_count += 1
             style = "bold green" if is_fasta else "white"
@@ -2857,26 +3088,41 @@ class FileBrowserModal(ModalScreen[str | None]):
 _BLAST_PROGRAMS = ["blastn", "tblastn", "blastx", "blastp", "tblastx"]
 
 
+_DNA_BASE_CHARS = frozenset("ACGTUNRYSWKMBDHVacgtunryswkmbdhv")
+_IGNORED_SEQ_CHARS = frozenset(" \t\n\r0123456789>")
+
+
 def _detect_seq_type(seq: str) -> str:
-    """Return 'dna' if the sequence looks like nucleotides, else 'protein'."""
-    upper = set(seq.upper()) - set(" \t\n\r0123456789>")
-    dna_bases = {"A", "C", "G", "T", "U", "N", "R", "Y", "S", "W", "K", "M",
-                 "B", "D", "H", "V"}
-    if upper and upper <= dna_bases:
-        return "dna"
-    return "protein"
+    """Return 'dna' if the sequence looks like nucleotides, else 'protein'.
+
+    Samples the first 1,000 alphabetic characters — sufficient to distinguish
+    DNA from protein without scanning multi-megabase inputs.
+    """
+    seen_alpha = False
+    count = 0
+    for ch in seq:
+        if ch in _IGNORED_SEQ_CHARS:
+            continue
+        if ch not in _DNA_BASE_CHARS:
+            return "protein"
+        seen_alpha = True
+        count += 1
+        if count >= 1000:
+            break
+    return "dna" if seen_alpha else "protein"
+
+
+_CLEAN_SEQ_RE = re.compile(r"[^A-Za-z*]+")
 
 
 def _clean_seq(raw: str) -> str:
     """Strip FASTA headers, whitespace, and digits from pasted sequence text."""
-    lines = raw.splitlines()
     parts: list[str] = []
-    for line in lines:
+    for line in raw.splitlines():
         stripped = line.strip()
         if stripped.startswith(">"):
             continue
-        # Remove spaces, digits, line numbers
-        cleaned = "".join(ch for ch in stripped if ch.isalpha() or ch == "*")
+        cleaned = _CLEAN_SEQ_RE.sub("", stripped)
         if cleaned:
             parts.append(cleaned)
     return "".join(parts)
@@ -3146,6 +3392,11 @@ class BlastPanel(Vertical):
         db = self.query_one("#blast-db-input", Input).value.strip()
         if not db:
             self._set_status("[yellow]Enter a BLAST database path.[/]")
+            return
+        # BLAST DBs are multi-file prefixes — check for any index file.
+        db_base = Path(db).expanduser()
+        if not any(db_base.parent.glob(db_base.name + ".*")):
+            self._set_status(f"[red]BLAST database not found: {db}[/]")
             return
         program_val = self.query_one("#blast-program", Select).value
         if program_val is Select.BLANK:
@@ -3479,6 +3730,9 @@ class HmmerPanel(Vertical):
         if not db:
             self._set_status("[yellow]Enter an HMM database path.[/]")
             return
+        if not Path(db).expanduser().is_file():
+            self._set_status(f"[red]HMM database not found: {db}[/]")
+            return
         evalue_str = self.query_one("#hmmer-evalue", Input).value.strip()
         translate = self.query_one("#hmmer-translate", Switch).value
         try:
@@ -3634,6 +3888,9 @@ class HmmerPanel(Vertical):
         db = self.query_one("#hmmer-db-input", Input).value.strip()
         if not db:
             self._set_status("[yellow]Enter an HMM database path.[/]")
+            return
+        if not Path(db).expanduser().is_file():
+            self._set_status(f"[red]HMM database not found: {db}[/]")
             return
         evalue_str = self.query_one("#hmmer-evalue", Input).value.strip()
         translate = self.query_one("#hmmer-translate", Switch).value
@@ -3872,29 +4129,35 @@ class ScriptoScopeApp(App):
         """Toggle bookmark on the currently selected transcript (Ctrl+D)."""
         try:
             table = self.query_one("#transcript-table", DataTable)
-            row_key = table.cursor_row
-            if row_key is None:
+            cursor_row = table.cursor_row
+            if cursor_row is None:
                 return
-            # Get the actual row key object
             keys = list(table.rows.keys())
-            if row_key >= len(keys):
+            if cursor_row >= len(keys):
                 return
-            rk = keys[row_key]
+            rk = keys[cursor_row]
             tid = str(rk.value)
+            t = self._by_id.get(tid)
+            if t is None:
+                return
             if tid in self._bookmarks:
                 self._bookmarks.discard(tid)
                 self._set_status(f"Removed bookmark: {tid}")
             else:
                 self._bookmarks.add(tid)
                 self._set_status(f"[green]Bookmarked: {tid}[/]")
-            # Refresh table to show/hide star
-            self._populate_table(self._filtered, auto_select=False)
-            # Restore cursor
+            # Update just the ID cell in place — no full rebuild needed.
+            new_label = f"* {t.short_id}" if tid in self._bookmarks else t.short_id
             try:
-                new_idx = next(i for i, k in enumerate(table.rows) if k.value == tid)
-                table.move_cursor(row=new_idx, animate=False)
-            except StopIteration:
-                pass
+                table.update_cell(rk, table.ordered_columns[0].key, new_label)
+            except Exception:
+                # Fall back to full rebuild if the cell API mismatches
+                self._populate_table(self._filtered, auto_select=False)
+                try:
+                    new_idx = next(i for i, k in enumerate(table.rows) if k.value == tid)
+                    table.move_cursor(row=new_idx, animate=False)
+                except StopIteration:
+                    pass
         except Exception:
             pass
 
@@ -3903,16 +4166,28 @@ class ScriptoScopeApp(App):
         if not self._bookmarks:
             self.notify("No bookmarked transcripts. Use Ctrl+D to bookmark.", severity="warning")
             return
-        path = str(Path.home() / "bookmarked_transcripts.fasta")
+        base = Path.home() / "bookmarked_transcripts.fasta"
+        # Avoid silently overwriting: add numeric suffix if file exists.
+        path_obj = base
+        suffix_i = 2
+        while path_obj.exists():
+            path_obj = base.with_name(f"{base.stem}_{suffix_i}{base.suffix}")
+            suffix_i += 1
+        path = str(path_obj)
         count = 0
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
+            chunks: list[str] = []
             for tid in self._bookmarks:
                 t = self._by_id.get(tid)
-                if t:
-                    f.write(f">{t.id} {t.description}\n")
-                    for i in range(0, len(t.sequence), 80):
-                        f.write(t.sequence[i:i+80] + "\n")
-                    count += 1
+                if t is None:
+                    continue
+                chunks.append(f">{t.id} {t.description}\n")
+                seq = t.sequence
+                for i in range(0, len(seq), 80):
+                    chunks.append(seq[i:i+80])
+                    chunks.append("\n")
+                count += 1
+            f.write("".join(chunks))
         self._set_status(f"[green]Exported {count} bookmarked transcripts to {path}[/]")
 
     def action_save_project(self) -> None:
@@ -3925,47 +4200,9 @@ class ScriptoScopeApp(App):
             default_path = str(Path(self._fasta_path).with_suffix(".scriptoscope.json"))
         else:
             default_path = str(Path.home() / "transcriptome.scriptoscope.json")
-        self.push_screen(SaveProjectModal(default_path=default_path), self._on_save_path)
-
-    def _on_save_path(self, path: str | None) -> None:
-        if not path:
-            return
-        self._do_save_project(path)
-
-    @work(exclusive=True, thread=True, group="save-project")
-    def _do_save_project(self, path: str) -> None:
-        try:
-            scan_cache = {}
-            confirm_cache = {}
-            try:
-                hmmer = self.query_one("#hmmer-panel")
-                scan_cache = getattr(hmmer, "_scan_cache", {})
-                confirm_cache = getattr(hmmer, "_confirm_cache", {})
-            except Exception:
-                pass
-            save_project(
-                path, self._transcripts, self._fasta_path,
-                scan_cache=scan_cache,
-                confirm_cache=confirm_cache,
-                pfam_hits=self._pfam_hits,
-            )
-            self.call_from_thread(
-                self.notify,
-                f"Project saved to {Path(path).name}",
-                title="Saved", severity="information", timeout=3,
-            )
-            self.call_from_thread(
-                self._set_status,
-                f"[green]Project saved: {path}[/]",
-            )
-            self.call_from_thread(self._refresh_transcriptome_select)
-        except Exception as exc:
-            _log.exception("Save project failed: %s", exc)
-            self.call_from_thread(
-                self.notify,
-                f"Save failed: {exc}",
-                severity="error",
-            )
+        # SaveProjectModal handles the actual save internally and dismisses
+        # itself when done — no callback needed on this side.
+        self.push_screen(SaveProjectModal(default_path=default_path))
 
     def _load_project_file(self, path: str) -> None:
         """Load a .scriptoscope.json project file."""
@@ -3973,44 +4210,67 @@ class ScriptoScopeApp(App):
 
     @work(exclusive=True, thread=True, group="load-project")
     def _do_load_project(self, path: str) -> None:
+        # Cancel any in-flight work tied to the previous dataset.
+        _hmm_cancel.set()
+        _ncbi_blast_cancel.set()
         self.call_from_thread(self._set_status, f"Loading project {path}…")
         try:
             proj = load_project(path)
-            transcripts = proj["transcripts"]
-            by_id = {t.id: t for t in transcripts}
-            visible = transcripts[:_MAX_TABLE_ROWS]
-            row_data = [
-                (t.short_id, f"{t.length:,}", f"{t.gc_content:.1f}", t.id)
-                for t in visible
-            ]
-
-            def _apply() -> None:
-                self._transcripts = transcripts
-                self._filtered = transcripts
-                self._by_id = by_id
-                self._fasta_path = proj["fasta_path"] or path
-                self._pfam_hits = proj.get("pfam_hits", {})
-                self._populate_table_fast(row_data, len(transcripts), visible)
-                self._refresh_transcriptome_select()
-                # Restore scan/confirm caches into HmmerPanel
-                try:
-                    hmmer = self.query_one("#hmmer-panel")
-                    hmmer._scan_cache = proj.get("scan_cache", {})
-                    hmmer._confirm_cache = proj.get("confirm_cache", {})
-                except Exception:
-                    pass
-                self._set_status(
-                    f"[green]{len(transcripts):,} transcripts loaded from project[/]"
-                )
-                self.notify(
-                    f"Project loaded: {len(transcripts):,} transcripts",
-                    title="Project", severity="information", timeout=3,
-                )
-                self._compute_stats_bg(transcripts, path)
-            self.call_from_thread(_apply)
+        except ProjectFormatError as exc:
+            self.call_from_thread(self._set_status, f"[red]Invalid project: {exc}[/]")
+            self.call_from_thread(
+                self.notify, str(exc), title="Invalid project", severity="error",
+            )
+            return
+        except OSError as exc:
+            self.call_from_thread(self._set_status, f"[red]Cannot read project: {exc}[/]")
+            return
         except Exception as exc:
             _log.exception("Load project failed: %s", exc)
             self.call_from_thread(self._set_status, f"[red]Error: {exc}[/]")
+            return
+
+        transcripts = proj["transcripts"]
+        if not transcripts:
+            self.call_from_thread(
+                self._set_status, "[yellow]Project contains no transcripts.[/]",
+            )
+            return
+        by_id = {t.id: t for t in transcripts}
+        visible = transcripts[:_MAX_TABLE_ROWS]
+        row_data = [
+            (t.short_id, f"{t.length:,}", f"{t.gc_content:.1f}", t.id)
+            for t in visible
+        ]
+
+        def _apply() -> None:
+            self._transcripts = transcripts
+            self._filtered = transcripts
+            self._by_id = by_id
+            self._fasta_path = proj["fasta_path"] or path
+            self._pfam_hits = proj.get("pfam_hits", {})
+            _longest_orf_cache.clear()
+            _hmm_cancel.clear()
+            _ncbi_blast_cancel.clear()
+            self._populate_table_fast(row_data, len(transcripts), visible)
+            self._refresh_transcriptome_select()
+            # Restore scan/confirm caches into HmmerPanel, clearing stale diagrams.
+            try:
+                hmmer = self.query_one("#hmmer-panel")
+                hmmer._scan_cache = proj.get("scan_cache", {})
+                hmmer._confirm_cache = proj.get("confirm_cache", {})
+                hmmer._diagram_cache.clear()
+            except Exception:
+                pass
+            self._set_status(
+                f"[green]{len(transcripts):,} transcripts loaded from project[/]"
+            )
+            self.notify(
+                f"Project loaded: {len(transcripts):,} transcripts",
+                title="Project", severity="information", timeout=3,
+            )
+            self._compute_stats_bg(transcripts, path)
+        self.call_from_thread(_apply)
 
     def action_genbank_search(self) -> None:
         """Open GenBank transcriptome search dialog (Ctrl+G)."""
@@ -4176,7 +4436,7 @@ class ScriptoScopeApp(App):
         if path.endswith(".scriptoscope.json"):
             self._load_project_file(path)
         else:
-            self._load_fasta(path)
+            self._load_fasta(path)  # _parse_fasta auto-detects gzip
 
     # ── File loading ──────────────────────────────────────────────────────────
 
@@ -4193,6 +4453,11 @@ class ScriptoScopeApp(App):
 
     @work(exclusive=True, thread=True)
     def _load_fasta(self, path: str) -> None:
+        # Cancel any in-flight HMM scans from a previous transcriptome so they
+        # don't write stale results into the freshly loaded state.
+        _hmm_cancel.set()
+        _ncbi_blast_cancel.set()
+
         self.call_from_thread(self._set_status, f"Loading {path}…")
         self.call_from_thread(
             self.notify, f"Loading {Path(path).name}…",
@@ -4200,12 +4465,35 @@ class ScriptoScopeApp(App):
         )
         try:
             transcripts = load_all(path)
+        except FastaFormatError as exc:
+            self.call_from_thread(self.clear_notifications)
+            self.call_from_thread(
+                self._set_status, f"[red]Invalid FASTA: {exc}[/]",
+            )
+            self.call_from_thread(
+                self.notify, str(exc), title="Invalid FASTA", severity="error",
+            )
+            return
         except Exception as exc:
             self.call_from_thread(self.clear_notifications)
             self.call_from_thread(self._set_status, f"[red]Error loading file: {exc}[/]")
+            self.call_from_thread(
+                self.notify, f"Failed to load: {exc}",
+                title="Load error", severity="error",
+            )
+            return
+
+        if not transcripts:
+            self.call_from_thread(self.clear_notifications)
+            self.call_from_thread(
+                self._set_status, "[yellow]No transcripts found in file.[/]",
+            )
             return
 
         by_id = {t.id: t for t in transcripts}
+        # load_all renames duplicates; if by_id is still short, something
+        # pathological happened (shouldn't occur, but guard anyway).
+        dup_shortfall = len(transcripts) - len(by_id)
         # Pre-compute table row data on background thread
         visible = transcripts[:_MAX_TABLE_ROWS]
         row_data = [
@@ -4219,11 +4507,27 @@ class ScriptoScopeApp(App):
             self._filtered = transcripts
             self._by_id = by_id
             self._fasta_path = path
+            self._pfam_hits = {}
+            # Clear stale per-transcript caches from the previous dataset.
+            try:
+                hmmer = self.query_one("#hmmer-panel")
+                hmmer._scan_cache.clear()
+                hmmer._confirm_cache.clear()
+                hmmer._diagram_cache.clear()
+            except Exception:
+                pass
+            # Re-arm cancellation events so fresh scans can run again.
+            _hmm_cancel.clear()
+            _ncbi_blast_cancel.clear()
+            # Invalidate per-transcript ORF cache — cheap and prevents cross-
+            # session collisions on the (id, length, fingerprint) key.
+            _longest_orf_cache.clear()
             self._populate_table_fast(row_data, len(transcripts), visible)
             self._refresh_transcriptome_select()
-            self._set_status(
-                f"[green]{len(transcripts):,} transcripts loaded from {path}[/]"
-            )
+            status_msg = f"[green]{len(transcripts):,} transcripts loaded from {path}[/]"
+            if dup_shortfall:
+                status_msg += f" [yellow](dedup anomaly: {dup_shortfall})[/]"
+            self._set_status(status_msg)
             self.notify(
                 f"{len(transcripts):,} transcripts loaded",
                 title="Transcriptome", severity="information", timeout=3,
