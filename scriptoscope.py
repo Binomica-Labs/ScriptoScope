@@ -819,7 +819,7 @@ def _six_frame_orf_coords(nucleotide: str, seq_id: str, min_aa: int = 30) -> lis
     return coords
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=2048)
 def _find_longest_orf(nucleotide: str, seq_id: str) -> ORFCoord | None:
     """Find the single longest ORF across all 6 frames (the putative CDS)."""
     orfs = _six_frame_orf_coords(nucleotide, seq_id, min_aa=30)
@@ -1116,7 +1116,7 @@ def render_orf_diagram(
     return result
 
 
-_hmm_cpus = min(os.cpu_count() or 4, 8)
+_hmm_cpus = os.cpu_count() or 4
 
 # Threading event used to abort long-running HMM scans (e.g. on app quit).
 _hmm_cancel = threading.Event()
@@ -3228,6 +3228,7 @@ class HmmerPanel(Vertical):
         self._pfam_desc: dict[str, tuple[str, str]] = {}
         self._scan_cache: dict[str, list[HmmerHit]] = {}
         self._confirm_cache: dict[str, BlastConfirmation] = {}
+        self._diagram_cache: dict[tuple, Text] = {}
 
     def _reset_scan_button(self) -> None:
         """Reset the scan button to its default ready state."""
@@ -3300,7 +3301,12 @@ class HmmerPanel(Vertical):
         try:
             w = self.query_one("#hmmer-results-area").size.width - 2
             conf = self._confirm_cache.get(t.id)
-            diagram = render_orf_diagram(t, hits, width=max(w, 60), confirmation=conf)
+            diag_w = max(w, 60)
+            cache_key = (t.id, diag_w, id(conf) if conf else None, len(hits))
+            diagram = self._diagram_cache.get(cache_key)
+            if diagram is None:
+                diagram = render_orf_diagram(t, hits, width=diag_w, confirmation=conf)
+                self._diagram_cache[cache_key] = diagram
             self.query_one("#hmmer-diagram", Static).update(diagram)
         except Exception as exc:
             _log.exception("Diagram render failed: %s", exc)
@@ -3667,12 +3673,16 @@ class HmmerPanel(Vertical):
                 eta_str = f"{int(eta_s // 60)}m {int(eta_s % 60)}s"
             else:
                 eta_str = "calculating…"
-            self.app.call_from_thread(self._show_progress, current, total)
-            self.app.call_from_thread(
-                self._set_status,
+            status = (
                 f"Scanning collection… {current:,}/{total:,} HMMs ({pct}%) "
-                f"— elapsed {int(elapsed // 60)}m {int(elapsed % 60)}s, ETA {eta_str}",
+                f"— elapsed {int(elapsed // 60)}m {int(elapsed % 60)}s, ETA {eta_str}"
             )
+
+            def _update_ui() -> None:
+                self._show_progress(current, total)
+                self._set_status(status)
+
+            self.app.call_from_thread(_update_ui)
 
         try:
             _hmm_cancel.clear()
