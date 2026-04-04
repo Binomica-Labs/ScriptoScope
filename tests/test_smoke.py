@@ -131,8 +131,8 @@ class TestComputeStats:
         stats = _compute_stats(transcripts)
         assert "orf_count" in stats
         assert "orf_lengths" in stats
-        assert "has_start_codon" in stats
         assert stats["orf_count"] >= 0
+        assert stats["orf_count"] == len(stats["orf_lengths"])
 
     def test_empty_stats(self):
         stats = _compute_stats([])

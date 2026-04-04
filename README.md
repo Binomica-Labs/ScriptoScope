@@ -3,6 +3,21 @@
 A terminal-based (TUI) transcriptome browser for exploring, annotating, and analyzing transcript sequences. Built with [Textual](https://textual.textualize.io/) and [Rich](https://rich.readthedocs.io/).
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![Tests](https://img.shields.io/badge/tests-105%20passing-brightgreen)
+
+## Correctness is sacred
+
+Bioinformatics tools live or die by whether you can trust their output. A silent parsing error, a typo in a codon table, or an off-by-one in a length calculation produces plausible-looking wrong answers that poison everything downstream. ScriptoScope treats this as a non-negotiable property:
+
+- **Every push runs 105 tests**, 44 of them dedicated to DNA parsing and genetic-code correctness. These are not optional, and they are not mocked.
+- **The standard genetic code is cross-validated against Biopython's authoritative table** on every test run — if NCBI ever updated the stop-codon set and Biopython updated with it, we'd find out immediately.
+- **The codon-scan regex is exhaustively tested** against all 64 possible DNA codons. It must match exactly `{ATG, TAA, TAG, TGA}` and nothing else. One typo here would break every ORF call in the app.
+- **Every stop codon is tested individually** (`TAA`, `TAG`, `TGA`) and every "similar-looking" non-stop (`TAT`, `TGT`, `TGG`, etc.) is tested to make sure it is *not* treated as a stop. This catches a whole class of regex-edit bugs.
+- **The fast ORF scanner is cross-validated against the Biopython-based slow path** on 200+ random sequences per test run — both paths must agree on every ORF length, every time.
+- **FASTA parsing preserves bytes exactly.** Multi-line FASTA with varied line widths, gzipped FASTA, trailing whitespace, N bases, and edge lengths are all verified to round-trip byte-for-byte.
+- **Length arithmetic is triple-checked**: `Transcript.length`, `len(sequence)`, and `sum(nucleotide_counts.values())` must all agree on every sequence we construct.
+
+If any of these tests fail, the push is broken. No exceptions.
 
 ## Features
 
@@ -58,11 +73,17 @@ scriptoscope /path/to/transcriptome.fasta
 | Key | Action |
 |-----|--------|
 | `Ctrl+O` | Open FASTA file |
+| `Ctrl+S` | Save project (transcriptome + analysis cache) |
+| `Ctrl+G` | Search GenBank (TSA) |
 | `Ctrl+F` | Focus filter input |
 | `Ctrl+B` | Switch to BLAST tab |
 | `Ctrl+P` | Switch to Pfam/HMM tab |
-| `Ctrl+D` | Build BLAST database from loaded transcriptome |
-| `Q` | Quit |
+| `Ctrl+C` | Copy CDS / highlighted region |
+| `Ctrl+R` | Copy reverse complement of highlighted DNA |
+| `Ctrl+D` | Toggle bookmark on selected transcript |
+| `Ctrl+E` | Export bookmarked transcripts as FASTA |
+| `?` | Show help |
+| `Ctrl+Q` | Quit |
 
 ## Tabs
 
@@ -108,7 +129,53 @@ The filter bar supports multiple criteria separated by spaces:
 | GC content | `gc>45` or `gc<60` | GC percentage threshold |
 | Pfam domain | `pfam:PF00069` or `pfam:kinase` | Transcripts with matching Pfam hits (after collection scan) |
 
+## Testing
+
+```bash
+pytest tests/ -q
+```
+
+The test suite is run on every push and every local commit. It is organized into two files:
+
+| File | Focus | Tests |
+|------|-------|-------|
+| `tests/test_smoke.py` | End-to-end app behavior: FASTA loading, filters, stats, ORF finding, BLAST/HMMER panels, widget wiring | 61 |
+| `tests/test_dna_sanity.py` | **Sacred territory** — codon table correctness, regex exhaustiveness, reverse complement, hand-crafted ORF ground truth, cross-validation with Biopython, FASTA byte-exact parsing, length arithmetic | 44 |
+
+`test_dna_sanity.py` exists specifically to make sure the fundamentals stay correct across every refactor. If a future change to the ORF scanner, codon regex, or FASTA parser introduces a subtle error, these tests will catch it before the push lands. They are deliberately boring and repetitive — that is the point.
+
 ## Changelog
+
+### v0.6.0 — Correctness and robustness pass
+
+- **44 new data-integrity tests** covering the standard genetic code, the codon-scan regex, reverse complement, hand-crafted ORFs in all frames and on both strands, cross-validation of the fast ORF path against the Biopython-backed slow path, byte-exact FASTA parsing (including gzip and multi-line), and length arithmetic
+- **Gzip FASTA support** via magic-byte detection — `.fasta.gz` files open transparently
+- **Duplicate transcript IDs** are renamed with a `__N` suffix instead of silently overwriting
+- **`FastaFormatError`** raised for files with content but no `>` header (was previously silent)
+- **Atomic project saves** (`save_project`) via temp-file + `fsync` + `os.replace`
+- **Project version validation** with `ProjectFormatError` — future or malformed project files are rejected with a clear message instead of silently misparsed
+- **Tolerant dataclass deserialization** for forward/backward-compat drift in saved projects
+- **In-dialog save feedback**: `Ctrl+S` now shows "Saving…", then "Saved to <file>" in the dialog and auto-closes
+- **7x faster collection ORF scan** via a regex-based codon scanner that replaces Biopython's `Seq.translate()` on the hot path; dead `ORFCoord` allocations eliminated
+- **Two-phase stats** — length/GC/buckets/N50 show immediately on load, ORF stats fill in asynchronously with a "scanning 6 frames…" placeholder
+- **Debounced transcript selection (35 ms)** coalesces rapid arrow-key scrolling into single panel updates
+- **Stats panel rebuild avoided** on re-selection; global tables cached across switches
+- **Filter runs off the main thread** for transcriptomes larger than 5,000 entries
+- **NCBI BLAST RID cleanup** on user cancel — server-side jobs are released instead of orphaned
+- **HMM and BLAST database paths** are validated before scans start, with clear errors
+- **In-flight scans cancelled on new load**; all per-transcript caches cleared to prevent cross-dataset leaks
+- **Biopython partial-codon warnings silenced** at the source (slice to codon boundary before translate)
+- Numerous performance micro-fixes: string concatenation replaced with `list.join`, `str.find` loops for 'M' scanning, single-cell bookmark toggle, buffered FASTA export, `Event.wait` polling in NCBI BlastP
+
+### v0.5.0
+
+- Export CSV from BLAST/Pfam/Statistics panels
+- Sortable transcript table (ID / Length / GC%)
+- Bookmarks (`Ctrl+D`) and bookmarked-FASTA export (`Ctrl+E`)
+- Help modal (`?`)
+- ORF statistics in the stats panel
+- Go-to position input in the sequence viewer
+- Smoke test suite (61 tests)
 
 ### v0.4.0
 

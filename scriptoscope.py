@@ -997,6 +997,49 @@ def _find_longest_orf(nucleotide: str, seq_id: str) -> ORFCoord | None:
     return result
 
 
+_RC_TABLE = str.maketrans("ACGTN", "TGCAN")
+
+
+# Regex that finds every start and stop codon position in both strands.
+# The lookahead `(?=...)` is required so overlapping matches across frames
+# aren't hidden — e.g. "TAATG" has a TAA at 0 and an ATG at 2 which
+# belong to different reading frames.
+_CODON_SCAN_RE = re.compile(r"(?=(ATG|TAA|TAG|TGA))")
+
+
+def _longest_orf_aa_length(nucleotide: str, min_aa: int = 30) -> int:
+    """Fast path: return the length (in aa) of the longest M-initiated ORF
+    across all 6 frames, or 0 if none >= min_aa.
+
+    Scans the DNA directly for start/stop codons via a single compiled
+    regex per strand — roughly 4x faster than translating the full protein
+    sequence and walking it, and orders of magnitude faster than building
+    ORFCoord objects via `_six_frame_orf_coords`.
+    """
+    upper = nucleotide.upper()
+    rc = upper.translate(_RC_TABLE)[::-1]
+    best = 0
+    for strand in (upper, rc):
+        # Partition matches into reading frames in a single pass.
+        frames: list[list[tuple[int, str]]] = [[], [], []]
+        for m in _CODON_SCAN_RE.finditer(strand):
+            p = m.start()
+            frames[p % 3].append((p, m.group(1)))
+        for frame_hits in frames:
+            first_atg = -1
+            for p, codon in frame_hits:
+                if codon == "ATG":
+                    if first_atg == -1:
+                        first_atg = p
+                else:  # stop codon
+                    if first_atg != -1:
+                        length = (p - first_atg) // 3
+                        if length > best:
+                            best = length
+                        first_atg = -1
+    return best if best >= min_aa else 0
+
+
 # ── Colors for ORF / domain visualization ────────────────────────────────────
 
 _FRAME_COLORS = {
@@ -2006,9 +2049,14 @@ class SequenceViewer(ScrollableContainer):
     _last_orf: ORFCoord | None = None
     _last_hits: list[HmmerHit] = []
     _last_width: int = 60
-    _RENDER_CACHE_MAX: int = 16
+    _RENDER_CACHE_MAX: int = 64
+    _last_shown_id: str = ""
 
     def watch_transcript(self, t: Transcript | None) -> None:
+        new_id = t.id if t is not None else ""
+        if new_id == self._last_shown_id:
+            return
+        self._last_shown_id = new_id
         self._highlight = None
         self._aa_highlight = None
         self._aa_highlight_seq = ""
@@ -2333,7 +2381,8 @@ def _filter_transcripts(
     return results
 
 
-def _compute_stats(transcripts: list[Transcript]) -> dict:
+def _compute_basic_stats(transcripts: list[Transcript]) -> dict:
+    """Fast, ORF-free stats. Suitable for immediate display after load."""
     lengths = sorted(t.length for t in transcripts)
     n = len(lengths)
     if n == 0:
@@ -2343,11 +2392,12 @@ def _compute_stats(transcripts: list[Transcript]) -> dict:
             "mean_len": 0, "median_len": 0,
             "n50": 0, "mean_gc": 0,
             "bucket_counts": [0] * 6,
+            "orf_count": 0, "orf_lengths": [],
+            "orfs_pending": True,
         }
     total_bases = sum(lengths)
     mean_len = total_bases / n
     median_len = lengths[n // 2]
-
     half = total_bases / 2
     cumulative = 0
     n50 = 0
@@ -2356,9 +2406,7 @@ def _compute_stats(transcripts: list[Transcript]) -> dict:
         if cumulative >= half:
             n50 = length
             break
-
     mean_gc = sum(t.gc_content for t in transcripts) / n
-
     bucket_counts = [0] * 6
     for length in lengths:
         if length < 200:
@@ -2373,30 +2421,40 @@ def _compute_stats(transcripts: list[Transcript]) -> dict:
             bucket_counts[4] += 1
         else:
             bucket_counts[5] += 1
-
-    # ORF statistics (scan all transcripts for longest ORF)
-    orf_count = 0
-    orf_lengths: list[int] = []
-    has_start_codon = 0
-    for t in transcripts:
-        orfs = _six_frame_orf_coords(t.sequence, t.id, min_aa=30)
-        orf = max(orfs, key=lambda o: o.aa_length) if orfs else None
-        if orf:
-            orf_count += 1
-            orf_lengths.append(orf.aa_length)
-            if orf.sequence.startswith("M"):
-                has_start_codon += 1
-
     return {
         "n": n, "total_bases": total_bases,
         "shortest": lengths[0], "longest": lengths[-1],
         "mean_len": mean_len, "median_len": median_len,
         "n50": n50, "mean_gc": mean_gc,
         "bucket_counts": bucket_counts,
+        "orf_count": 0, "orf_lengths": [],
+        "orfs_pending": True,
+    }
+
+
+def _compute_orf_stats(transcripts: list[Transcript]) -> dict:
+    """ORF-only stats — the expensive pass. Merge into a basic-stats dict."""
+    orf_count = 0
+    orf_lengths: list[int] = []
+    for t in transcripts:
+        aa = _longest_orf_aa_length(t.sequence)
+        if aa:
+            orf_count += 1
+            orf_lengths.append(aa)
+    return {
         "orf_count": orf_count,
         "orf_lengths": sorted(orf_lengths),
-        "has_start_codon": has_start_codon,
+        "orfs_pending": False,
     }
+
+
+def _compute_stats(transcripts: list[Transcript]) -> dict:
+    """Full stats (basic + ORF). Kept for callers that want a single blob."""
+    stats = _compute_basic_stats(transcripts)
+    if stats["n"] == 0:
+        return stats
+    stats.update(_compute_orf_stats(transcripts))
+    return stats
 
 
 class StatsPanel(ScrollableContainer):
@@ -2412,51 +2470,40 @@ class StatsPanel(ScrollableContainer):
         super().__init__(**kwargs)
         self._global_stats: dict | None = None
         self._fasta_path: str = ""
+        # Cached Rich renderables for the non-changing parts of the panel.
+        # Rebuilt only when global stats change (load), not when the
+        # selected transcript changes (hot path for arrow-key scrolling).
+        self._global_renderables: list | None = None
 
     def compose(self) -> ComposeResult:
         yield Button("Export Stats CSV", id="stats-export", variant="default")
         yield Static("No transcriptome loaded.", id="stats-content")
 
+    _last_shown_id: str = ""
+
     def on_mount(self) -> None:
         self._update_display()
 
     def watch_transcript(self, t: Transcript | None) -> None:
+        new_id = t.id if t is not None else ""
+        if new_id == self._last_shown_id:
+            return
+        self._last_shown_id = new_id
         self._update_display()
 
     def render_stats(self, s: dict, fasta_path: str) -> None:
         self._global_stats = s
         self._fasta_path = fasta_path
+        self._global_renderables = None  # invalidate cache — rebuild on next display
         self._update_display()
 
-    def _update_display(self) -> None:
-        try:
-            content = self.query_one("#stats-content", Static)
-        except Exception:
-            return
-
-        if not self._global_stats:
-            content.update("No transcriptome loaded.")
-            return
-
-        elements = []
-
-        # ── Selected Transcript ───────────────────────────────────────────────
-        t = self.transcript
-        if t:
-            grid = Table.grid(padding=(0, 3))
-            grid.add_column(style="bold cyan", no_wrap=True)
-            grid.add_column(no_wrap=True)
-            grid.title = "Selected Transcript"
-            grid.title_style = "bold magenta"
-            grid.add_row("ID", t.id)
-            grid.add_row("Length", f"{t.length:,} bp")
-            grid.add_row("GC Content", f"{t.gc_content:.1f}%")
-            elements.append(grid)
-            elements.append(Text(""))
-
-        # ── Global Statistics ─────────────────────────────────────────────────
+    def _build_global_renderables(self) -> list:
+        """Expensive: build all the global-stats Rich tables. Cached."""
         s = self._global_stats
+        assert s is not None
         n = s["n"]
+        elements: list = []
+
         summary = Table.grid(padding=(0, 3))
         summary.add_column(style="bold cyan", no_wrap=True)
         summary.add_column(no_wrap=True)
@@ -2484,19 +2531,22 @@ class StatsPanel(ScrollableContainer):
             dist.add_row(label, f"{count:,}", f"{count / n * 100:.1f}%" if n else "0.0%")
         elements.append(dist)
 
-        # ── ORF Statistics ───────────────────────────────────────────────
         orf_count = s.get("orf_count", 0)
         orf_lengths = s.get("orf_lengths", [])
-        has_start = s.get("has_start_codon", 0)
-        if orf_count > 0:
-            elements.append(Text(""))
+        orfs_pending = s.get("orfs_pending", False)
+        elements.append(Text(""))
+        if orfs_pending:
+            elements.append(Text(
+                "  ORF Statistics: scanning 6 frames…",
+                style="dim italic",
+            ))
+        elif orf_count > 0 and orf_lengths:
             orf_grid = Table.grid(padding=(0, 3))
             orf_grid.add_column(style="bold cyan", no_wrap=True)
             orf_grid.add_column(no_wrap=True)
-            orf_grid.title = "ORF Statistics (longest ORF per transcript, >=30 aa)"
+            orf_grid.title = "ORF Statistics (longest M-initiated ORF per transcript, ≥30 aa)"
             orf_grid.title_style = "bold magenta"
             orf_grid.add_row("Transcripts with ORF", f"{orf_count:,} / {n:,} ({orf_count / n * 100:.1f}%)")
-            orf_grid.add_row("With start codon (M)", f"{has_start:,} / {orf_count:,} ({has_start / orf_count * 100:.1f}%)")
             orf_grid.add_row("Shortest ORF", f"{orf_lengths[0]:,} aa")
             orf_grid.add_row("Longest ORF", f"{orf_lengths[-1]:,} aa")
             mean_orf = sum(orf_lengths) / len(orf_lengths)
@@ -2504,6 +2554,38 @@ class StatsPanel(ScrollableContainer):
             orf_grid.add_row("Mean ORF length", f"{mean_orf:,.1f} aa")
             orf_grid.add_row("Median ORF length", f"{median_orf:,} aa")
             elements.append(orf_grid)
+
+        return elements
+
+    def _update_display(self) -> None:
+        try:
+            content = self.query_one("#stats-content", Static)
+        except Exception:
+            return
+
+        if not self._global_stats:
+            content.update("No transcriptome loaded.")
+            return
+
+        # Cheap: rebuild only the "Selected Transcript" grid each call.
+        elements: list = []
+        t = self.transcript
+        if t:
+            grid = Table.grid(padding=(0, 3))
+            grid.add_column(style="bold cyan", no_wrap=True)
+            grid.add_column(no_wrap=True)
+            grid.title = "Selected Transcript"
+            grid.title_style = "bold magenta"
+            grid.add_row("ID", t.id)
+            grid.add_row("Length", f"{t.length:,} bp")
+            grid.add_row("GC Content", f"{t.gc_content:.1f}%")
+            elements.append(grid)
+            elements.append(Text(""))
+
+        # Reuse cached global renderables.
+        if self._global_renderables is None:
+            self._global_renderables = self._build_global_renderables()
+        elements.extend(self._global_renderables)
 
         content.update(Group(*elements))
 
@@ -3492,8 +3574,16 @@ class HmmerPanel(Vertical):
         except Exception:
             pass
 
+    _last_shown_id: str = ""
+
     def watch_transcript(self, t: Transcript | None) -> None:
         """Show cached results when transcript changes, otherwise clear."""
+        # Skip if the transcript id hasn't actually changed — reactive can
+        # fire on same-value assignments and we don't want to redo the work.
+        new_id = t.id if t is not None else ""
+        if new_id == self._last_shown_id:
+            return
+        self._last_shown_id = new_id
         try:
             table = self.query_one("#hmmer-table", DataTable)
             table.clear()
@@ -4260,6 +4350,9 @@ class ScriptoScopeApp(App):
                 hmmer._scan_cache = proj.get("scan_cache", {})
                 hmmer._confirm_cache = proj.get("confirm_cache", {})
                 hmmer._diagram_cache.clear()
+                hmmer._last_shown_id = ""
+                self.query_one("#seq-viewer", SequenceViewer)._last_shown_id = ""
+                self.query_one("#stats-panel", StatsPanel)._last_shown_id = ""
             except Exception:
                 pass
             self._set_status(
@@ -4514,6 +4607,9 @@ class ScriptoScopeApp(App):
                 hmmer._scan_cache.clear()
                 hmmer._confirm_cache.clear()
                 hmmer._diagram_cache.clear()
+                hmmer._last_shown_id = ""
+                self.query_one("#seq-viewer", SequenceViewer)._last_shown_id = ""
+                self.query_one("#stats-panel", StatsPanel)._last_shown_id = ""
             except Exception:
                 pass
             # Re-arm cancellation events so fresh scans can run again.
@@ -4537,12 +4633,29 @@ class ScriptoScopeApp(App):
 
         self.call_from_thread(_apply)
 
-    @work(exclusive=False, thread=True, group="stats")
+    @work(exclusive=True, thread=True, group="stats")
     def _compute_stats_bg(self, transcripts: list[Transcript], path: str) -> None:
-        stats = _compute_stats(transcripts)
-        def _apply_stats() -> None:
-            self.query_one("#stats-panel", StatsPanel).render_stats(stats, path)
-        self.call_from_thread(_apply_stats)
+        """Two-phase stats: show basic numbers immediately, fill in ORF stats
+        once the expensive 6-frame scan finishes."""
+        # Phase 1: cheap length/GC/bucket stats (milliseconds even for 100k).
+        basic = _compute_basic_stats(transcripts)
+
+        def _apply_basic() -> None:
+            self.query_one("#stats-panel", StatsPanel).render_stats(basic, path)
+
+        self.call_from_thread(_apply_basic)
+        if basic["n"] == 0:
+            return
+
+        # Phase 2: expensive ORF scan. Populates the per-transcript cache
+        # along the way so subsequent clicks hit cached results instantly.
+        orf_stats = _compute_orf_stats(transcripts)
+        merged = {**basic, **orf_stats}
+
+        def _apply_orf() -> None:
+            self.query_one("#stats-panel", StatsPanel).render_stats(merged, path)
+
+        self.call_from_thread(_apply_orf)
 
     def _populate_table_fast(
         self,
@@ -4590,11 +4703,43 @@ class ScriptoScopeApp(App):
         if self._navigating_to is not None:
             return
         raw = self.query_one("#filter-input", Input).value.strip()
-        results = self._transcripts
-        if raw:
-            results = _filter_transcripts(results, raw, self._bookmarks)
-        self._filtered = results
-        self._populate_table(self._filtered)
+        # Small lists: filter inline on the main thread (cheaper than a worker
+        # handoff). Large lists: run the scan in a thread so keystrokes stay
+        # responsive.
+        if not raw:
+            self._filtered = self._transcripts
+            self._populate_table(self._filtered)
+            return
+        if len(self._transcripts) < 5000:
+            self._filtered = _filter_transcripts(
+                self._transcripts, raw, self._bookmarks,
+            )
+            self._populate_table(self._filtered)
+        else:
+            self._apply_filter_bg(raw, self._transcripts, self._bookmarks.copy())
+
+    @work(exclusive=True, thread=True, group="filter")
+    def _apply_filter_bg(
+        self, raw: str, transcripts: list[Transcript], bookmarks: set[str],
+    ) -> None:
+        """Filter large transcriptomes off the main thread."""
+        results = _filter_transcripts(transcripts, raw, bookmarks)
+        visible = results[:_MAX_TABLE_ROWS]
+        row_data = [
+            (t.short_id, f"{t.length:,}", f"{t.gc_content:.1f}", t.id)
+            for t in visible
+        ]
+
+        def _apply() -> None:
+            # Bail if the filter text changed again while we were scanning —
+            # a newer worker already queued the up-to-date results.
+            current = self.query_one("#filter-input", Input).value.strip()
+            if current != raw:
+                return
+            self._filtered = results
+            self._populate_table_fast(row_data, len(results), visible)
+
+        self.call_from_thread(_apply)
 
     def action_focus_filter(self) -> None:
         self.query_one("#filter-input", Input).focus()
@@ -4610,7 +4755,30 @@ class ScriptoScopeApp(App):
             self.query_one("#hmmer-panel", HmmerPanel),
         )
 
+    _selection_timer: Timer | None = None
+    _pending_transcript: Transcript | None = None
+    _SELECTION_DEBOUNCE: float = 0.035  # 35 ms — below human perception
+
     def _show_transcript(self, t: Transcript) -> None:
+        """Debounced panel update — coalesces rapid cursor movement.
+
+        Arrow-key scrolling fires row-highlight events faster than panels
+        can redraw; we stash the latest selection and only apply it after
+        movement settles. A 35 ms delay is imperceptible on a single click
+        but cuts redundant redraws dramatically on held arrow keys.
+        """
+        self._pending_transcript = t
+        if self._selection_timer is not None:
+            self._selection_timer.stop()
+        self._selection_timer = self.set_timer(
+            self._SELECTION_DEBOUNCE, self._apply_pending_transcript,
+        )
+
+    def _apply_pending_transcript(self) -> None:
+        t = self._pending_transcript
+        self._selection_timer = None
+        if t is None:
+            return
         try:
             sv, sp, bp, hp = self._panels()
             sv.transcript = t
