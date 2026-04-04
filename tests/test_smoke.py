@@ -564,19 +564,43 @@ class TestHmmerPanel:
 
 class TestStatsPanel:
     @pytest.mark.asyncio
-    async def test_stats_panel_loads(self, app: ScriptoScopeApp):
-        async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause(3.0)  # Stats computed in background
-            sp = app.query_one("#stats-panel", StatsPanel)
-            assert sp._global_stats is not None
-            assert sp._global_stats["n"] == 3
-
-    @pytest.mark.asyncio
-    async def test_stats_export_button(self, app: ScriptoScopeApp):
+    async def test_stats_not_auto_computed(self, app: ScriptoScopeApp):
+        """Stats should NOT auto-run on load — user must press the button."""
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause(1.0)
             sp = app.query_one("#stats-panel", StatsPanel)
-            assert sp.query_one("#stats-export", Button) is not None
+            assert sp._global_stats is None
+
+    @pytest.mark.asyncio
+    async def test_stats_panel_computes_on_button_press(self, app: ScriptoScopeApp):
+        """Pressing Compute Statistics kicks off the two-phase computation."""
+        from textual.widgets import TabbedContent
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(1.0)
+            # Switch to the Statistics tab so the button is interactable
+            app.query_one("#content-area", TabbedContent).active = "tab-stats"
+            await pilot.pause(0.2)
+            sp = app.query_one("#stats-panel", StatsPanel)
+            compute_btn = sp.query_one("#stats-compute", Button)
+            assert compute_btn.disabled is False
+            # Trigger the handler directly — pilot.click through a tab pane is
+            # timing-sensitive, but the handler is a thin wrapper anyway.
+            sp._on_compute_pressed()
+            await pilot.pause(3.0)  # Let both phases finish
+            assert sp._global_stats is not None
+            assert sp._global_stats["n"] == 3
+            # Export should be enabled after stats are available
+            assert sp.query_one("#stats-export", Button).disabled is False
+
+    @pytest.mark.asyncio
+    async def test_stats_export_button_exists(self, app: ScriptoScopeApp):
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(1.0)
+            sp = app.query_one("#stats-panel", StatsPanel)
+            export_btn = sp.query_one("#stats-export", Button)
+            assert export_btn is not None
+            # Export button should start disabled (no stats computed yet)
+            assert export_btn.disabled is True
 
 
 class TestCSVExportIntegration:

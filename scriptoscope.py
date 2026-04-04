@@ -2461,7 +2461,8 @@ class StatsPanel(ScrollableContainer):
     DEFAULT_CSS = """
     StatsPanel { height: 1fr; padding: 1 2; }
     StatsPanel Static { height: auto; }
-    StatsPanel #stats-export { margin: 1 0; }
+    StatsPanel #stats-buttons { height: 3; margin: 0 0 1 0; }
+    StatsPanel #stats-buttons Button { margin-right: 1; }
     """
 
     transcript: reactive[Transcript | None] = reactive(None)
@@ -2476,13 +2477,49 @@ class StatsPanel(ScrollableContainer):
         self._global_renderables: list | None = None
 
     def compose(self) -> ComposeResult:
-        yield Button("Export Stats CSV", id="stats-export", variant="default")
+        with Horizontal(id="stats-buttons"):
+            yield Button("Compute Statistics", id="stats-compute", variant="primary")
+            yield Button("Export Stats CSV", id="stats-export", variant="default", disabled=True)
         yield Static("No transcriptome loaded.", id="stats-content")
 
     _last_shown_id: str = ""
 
     def on_mount(self) -> None:
         self._update_display()
+
+    def reset_for_new_dataset(self) -> None:
+        """Called after a new FASTA/project load — clear stale stats and
+        re-enable the Compute button so the user can trigger a fresh run."""
+        self._global_stats = None
+        self._global_renderables = None
+        self._last_shown_id = ""
+        try:
+            self.query_one("#stats-compute", Button).disabled = False
+            self.query_one("#stats-compute", Button).label = "Compute Statistics"
+            self.query_one("#stats-export", Button).disabled = True
+        except Exception:
+            pass
+        self._update_display()
+
+    @on(Button.Pressed, "#stats-compute")
+    def _on_compute_pressed(self) -> None:
+        """Kick off the two-phase stats computation on the main app."""
+        transcripts = getattr(self.app, "_transcripts", None)
+        if not transcripts:
+            self._update_display_message("[yellow]Load a transcriptome first.[/]")
+            return
+        path = getattr(self.app, "_fasta_path", "") or ""
+        btn = self.query_one("#stats-compute", Button)
+        btn.label = "Computing…"
+        btn.disabled = True
+        self.app._compute_stats_bg(transcripts, path)
+
+    def _update_display_message(self, message: str) -> None:
+        """Replace the panel body with a one-line status message."""
+        try:
+            self.query_one("#stats-content", Static).update(message)
+        except Exception:
+            pass
 
     def watch_transcript(self, t: Transcript | None) -> None:
         new_id = t.id if t is not None else ""
@@ -2495,6 +2532,19 @@ class StatsPanel(ScrollableContainer):
         self._global_stats = s
         self._fasta_path = fasta_path
         self._global_renderables = None  # invalidate cache — rebuild on next display
+        # Update button states: export enabled once we have stats; compute
+        # button changes label based on whether phase 2 (ORF) is still pending.
+        try:
+            self.query_one("#stats-export", Button).disabled = False
+            compute_btn = self.query_one("#stats-compute", Button)
+            if s.get("orfs_pending"):
+                compute_btn.label = "Computing ORFs…"
+                compute_btn.disabled = True
+            else:
+                compute_btn.label = "Recompute"
+                compute_btn.disabled = False
+        except Exception:
+            pass
         self._update_display()
 
     def _build_global_renderables(self) -> list:
@@ -2564,7 +2614,20 @@ class StatsPanel(ScrollableContainer):
             return
 
         if not self._global_stats:
-            content.update("No transcriptome loaded.")
+            # No stats computed yet — show a helpful prompt that reflects
+            # whether a transcriptome is loaded at all.
+            transcripts = getattr(self.app, "_transcripts", None)
+            if not transcripts:
+                content.update("No transcriptome loaded. Open a FASTA file first.")
+                return
+            fasta_path = getattr(self.app, "_fasta_path", "") or "(unknown)"
+            n = len(transcripts)
+            content.update(
+                f"[bold]{n:,}[/] transcripts loaded from [cyan]{fasta_path}[/]\n\n"
+                f"Press [bold]Compute Statistics[/] to scan length, GC, and ORF "
+                f"distributions. The basic stats appear immediately; the ORF "
+                f"scan runs as a second phase."
+            )
             return
 
         # Cheap: rebuild only the "Selected Transcript" grid each call.
@@ -4362,7 +4425,11 @@ class ScriptoScopeApp(App):
                 f"Project loaded: {len(transcripts):,} transcripts",
                 title="Project", severity="information", timeout=3,
             )
-            self._compute_stats_bg(transcripts, path)
+            # Stats are no longer auto-computed — user triggers via button
+            try:
+                self.query_one("#stats-panel", StatsPanel).reset_for_new_dataset()
+            except Exception:
+                pass
         self.call_from_thread(_apply)
 
     def action_genbank_search(self) -> None:
@@ -4628,8 +4695,12 @@ class ScriptoScopeApp(App):
                 f"{len(transcripts):,} transcripts loaded",
                 title="Transcriptome", severity="information", timeout=3,
             )
-            # Compute stats in background (triggers lazy GC on all transcripts)
-            self._compute_stats_bg(transcripts, path)
+            # Stats are no longer auto-computed — user triggers via the
+            # "Compute Statistics" button in the Statistics tab.
+            try:
+                self.query_one("#stats-panel", StatsPanel).reset_for_new_dataset()
+            except Exception:
+                pass
 
         self.call_from_thread(_apply)
 
