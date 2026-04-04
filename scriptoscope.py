@@ -18,15 +18,18 @@ Changelog:
 """
 from __future__ import annotations
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
 import argparse
 import asyncio
+import csv
 import gzip
+import io
 import json
 import logging
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -1819,6 +1822,9 @@ class SequenceViewer(ScrollableContainer):
     SequenceViewer #seq-cds-area { display: none; height: auto; max-height: 12; padding: 0 1; }
     SequenceViewer #seq-cds-area.visible { display: block; }
     SequenceViewer #seq-body { padding: 0 1; height: auto; }
+    SequenceViewer #seq-goto-row { height: 3; padding: 0 1; background: $surface; }
+    SequenceViewer #seq-goto-row Label { width: auto; padding: 0 1 0 0; }
+    SequenceViewer #seq-goto-input { width: 16; }
     """
 
     transcript: reactive[Transcript | None] = reactive(None)
@@ -1852,6 +1858,9 @@ class SequenceViewer(ScrollableContainer):
 
     def compose(self) -> ComposeResult:
         yield Static("Select a transcript from the list.", id="seq-info")
+        with Horizontal(id="seq-goto-row"):
+            yield Label("Go to position:")
+            yield Input(placeholder="e.g. 1250", id="seq-goto-input", type="integer")
         yield Static("", id="seq-cds-btn", classes="hidden")
         yield TextArea("", id="seq-cds-area", read_only=True)
         yield Static("", id="seq-body")
@@ -1861,6 +1870,28 @@ class SequenceViewer(ScrollableContainer):
         t = self.transcript
         if t:
             self.show_transcript(t)
+
+    @on(Input.Submitted, "#seq-goto-input")
+    def _goto_position(self, event: Input.Submitted) -> None:
+        """Scroll the sequence view to the given nucleotide position."""
+        t = self.transcript
+        if not t or not event.value.strip():
+            return
+        try:
+            pos = int(event.value.strip()) - 1  # 1-based → 0-based
+        except ValueError:
+            return
+        pos = max(0, min(pos, t.length - 1))
+        # Find the line in line_map that contains this position
+        target_line = 0
+        for idx, info in enumerate(self._line_map):
+            if info.kind == "dna" and info.seq_offset <= pos < info.seq_offset + info.chunk_len:
+                target_line = idx
+                break
+        # Each line is roughly 1 row in the Static; scroll the parent container
+        body = self.query_one("#seq-body", Static)
+        # Estimate y offset: each line_map entry ≈ 1 terminal row
+        body.scroll_to(0, max(0, target_line - 3), animate=False)
 
     _last_container_w: int = 0
 
@@ -2084,6 +2115,50 @@ class SequenceViewer(ScrollableContainer):
 
 _BUCKET_LABELS = ["<200 bp", "200–500 bp", "500–1k bp", "1k–2k bp", "2k–5k bp", ">5k bp"]
 
+_FILTER_RE = re.compile(r"(len|gc)\s*([<>]=?)\s*([\d.]+)", re.IGNORECASE)
+
+
+def _filter_transcripts(
+    transcripts: list[Transcript], query: str, bookmarks: set[str] | None = None,
+) -> list[Transcript]:
+    """Filter transcripts by text + optional len/gc numeric predicates.
+
+    Example: 'ribosom len>500 len<2000 gc>40'
+    Special keyword: 'bookmarked' to show only bookmarked transcripts.
+    """
+    text_parts = []
+    predicates: list[tuple[str, str, float]] = []
+    only_bookmarked = False
+    for token in query.split():
+        if token.lower() == "bookmarked":
+            only_bookmarked = True
+            continue
+        m = _FILTER_RE.fullmatch(token)
+        if m:
+            predicates.append((m.group(1).lower(), m.group(2), float(m.group(3))))
+        else:
+            text_parts.append(token.lower())
+    text_query = " ".join(text_parts)
+
+    results = transcripts
+    if only_bookmarked and bookmarks:
+        results = [t for t in results if t.id in bookmarks]
+    if text_query:
+        results = [
+            t for t in results
+            if text_query in t.id.lower() or text_query in t.description.lower()
+        ]
+    for field, op, val in predicates:
+        def _check(t: Transcript, f=field, o=op, v=val) -> bool:
+            actual = float(t.length) if f == "len" else t.gc_content
+            if o == ">": return actual > v
+            if o == ">=": return actual >= v
+            if o == "<": return actual < v
+            if o == "<=": return actual <= v
+            return True
+        results = [t for t in results if _check(t)]
+    return results
+
 
 def _compute_stats(transcripts: list[Transcript]) -> dict:
     lengths = sorted(t.length for t in transcripts)
@@ -2126,12 +2201,27 @@ def _compute_stats(transcripts: list[Transcript]) -> dict:
         else:
             bucket_counts[5] += 1
 
+    # ORF statistics (scan all transcripts for longest ORF)
+    orf_count = 0
+    orf_lengths: list[int] = []
+    has_start_codon = 0
+    for t in transcripts:
+        orf = _find_longest_orf(t.sequence, t.id)
+        if orf and orf.aa_length >= 30:
+            orf_count += 1
+            orf_lengths.append(orf.aa_length)
+            if orf.sequence.startswith("M"):
+                has_start_codon += 1
+
     return {
         "n": n, "total_bases": total_bases,
         "shortest": lengths[0], "longest": lengths[-1],
         "mean_len": mean_len, "median_len": median_len,
         "n50": n50, "mean_gc": mean_gc,
         "bucket_counts": bucket_counts,
+        "orf_count": orf_count,
+        "orf_lengths": sorted(orf_lengths),
+        "has_start_codon": has_start_codon,
     }
 
 
@@ -2139,6 +2229,7 @@ class StatsPanel(ScrollableContainer):
     DEFAULT_CSS = """
     StatsPanel { height: 1fr; padding: 1 2; }
     StatsPanel Static { height: auto; }
+    StatsPanel #stats-export { margin: 1 0; }
     """
 
     transcript: reactive[Transcript | None] = reactive(None)
@@ -2149,6 +2240,7 @@ class StatsPanel(ScrollableContainer):
         self._fasta_path: str = ""
 
     def compose(self) -> ComposeResult:
+        yield Button("Export Stats CSV", id="stats-export", variant="default")
         yield Static("No transcriptome loaded.", id="stats-content")
 
     def on_mount(self) -> None:
@@ -2218,8 +2310,51 @@ class StatsPanel(ScrollableContainer):
             dist.add_row(label, f"{count:,}", f"{count / n * 100:.1f}%" if n else "0.0%")
         elements.append(dist)
 
+        # ── ORF Statistics ───────────────────────────────────────────────
+        orf_count = s.get("orf_count", 0)
+        orf_lengths = s.get("orf_lengths", [])
+        has_start = s.get("has_start_codon", 0)
+        if orf_count > 0:
+            elements.append(Text(""))
+            orf_grid = Table.grid(padding=(0, 3))
+            orf_grid.add_column(style="bold cyan", no_wrap=True)
+            orf_grid.add_column(no_wrap=True)
+            orf_grid.title = "ORF Statistics (longest ORF per transcript, >=30 aa)"
+            orf_grid.title_style = "bold magenta"
+            orf_grid.add_row("Transcripts with ORF", f"{orf_count:,} / {n:,} ({orf_count / n * 100:.1f}%)")
+            orf_grid.add_row("With start codon (M)", f"{has_start:,} / {orf_count:,} ({has_start / orf_count * 100:.1f}%)")
+            orf_grid.add_row("Shortest ORF", f"{orf_lengths[0]:,} aa")
+            orf_grid.add_row("Longest ORF", f"{orf_lengths[-1]:,} aa")
+            mean_orf = sum(orf_lengths) / len(orf_lengths)
+            median_orf = orf_lengths[len(orf_lengths) // 2]
+            orf_grid.add_row("Mean ORF length", f"{mean_orf:,.1f} aa")
+            orf_grid.add_row("Median ORF length", f"{median_orf:,} aa")
+            elements.append(orf_grid)
+
         content.update(Group(*elements))
 
+    @on(Button.Pressed, "#stats-export")
+    def _export_stats(self) -> None:
+        if not self._global_stats:
+            return
+        s = self._global_stats
+        path = str(Path.home() / "transcriptome_stats.csv")
+        headers = ["Metric", "Value"]
+        rows = [
+            ["File", self._fasta_path],
+            ["Total transcripts", str(s["n"])],
+            ["Total bases", str(s["total_bases"])],
+            ["Shortest", str(s["shortest"])],
+            ["Longest", str(s["longest"])],
+            ["Mean length", f"{s['mean_len']:.1f}"],
+            ["Median length", str(s["median_len"])],
+            ["N50", str(s["n50"])],
+            ["Mean GC%", f"{s['mean_gc']:.1f}"],
+        ]
+        for label, count in zip(_BUCKET_LABELS, s["bucket_counts"]):
+            rows.append([f"Bucket {label}", str(count)])
+        _export_csv(path, headers, rows)
+        self.app.query_one("#app-status", Static).update(f"[green]Exported stats to {path}[/]")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2253,6 +2388,71 @@ def _list_dir(path: Path) -> tuple[list[Path], list[Path]]:
     dirs.sort(key=lambda p: p.name.lower())
     files.sort(key=lambda p: p.name.lower())
     return dirs, files
+
+
+def _export_csv(path: str, headers: list[str], rows: list[list[str]]) -> None:
+    """Write rows to a CSV file."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+
+class HelpModal(ModalScreen[None]):
+    """Help screen showing keyboard shortcuts and features."""
+    DEFAULT_CSS = """
+    HelpModal { align: center middle; }
+    HelpModal #help-dialog {
+        width: 72; height: auto; max-height: 80%;
+        border: thick $primary 80%; background: $surface; padding: 1 2;
+    }
+    HelpModal #help-title { text-align: center; text-style: bold; }
+    HelpModal #help-body { height: auto; padding: 1 0; }
+    HelpModal Button { margin: 1 0 0 0; width: 100%; }
+    """
+    BINDINGS = [Binding("escape", "close", "Close"), Binding("question_mark", "close", "Close")]
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="help-dialog"):
+            yield Label("ScriptoScope Help", id="help-title")
+            yield Static(
+                "[bold cyan]Keyboard Shortcuts[/]\n"
+                "  [bold]Ctrl+O[/]  Open FASTA file\n"
+                "  [bold]Ctrl+S[/]  Save project\n"
+                "  [bold]Ctrl+G[/]  Search GenBank (TSA)\n"
+                "  [bold]Ctrl+B[/]  Focus BLAST tab\n"
+                "  [bold]Ctrl+P[/]  Focus Pfam / HMM tab\n"
+                "  [bold]Ctrl+F[/]  Focus filter input\n"
+                "  [bold]Ctrl+C[/]  Copy CDS / highlighted region\n"
+                "  [bold]Ctrl+R[/]  Copy reverse complement\n"
+                "  [bold]Ctrl+D[/]  Toggle bookmark on selected transcript\n"
+                "  [bold]?[/]       Show this help\n\n"
+                "[bold cyan]Filter Syntax[/]\n"
+                "  Type text to search by ID or description.\n"
+                "  Use [bold]len>500[/], [bold]len<2000[/], [bold]gc>40[/], [bold]gc<60[/]\n"
+                "  to filter by length or GC%. Combine freely:\n"
+                "  [dim]ribosom len>500 gc>45[/]\n\n"
+                "[bold cyan]Column Sorting[/]\n"
+                "  Click column headers (ID, Length, GC%) to sort.\n"
+                "  Click again to reverse.\n\n"
+                "[bold cyan]Tabs[/]\n"
+                "  [bold]Sequence[/]  — DNA viewer with CDS, Pfam annotations, go-to-position\n"
+                "  [bold]BLAST[/]     — Local BLAST+ and NCBI BlastP search\n"
+                "  [bold]Pfam/HMM[/]  — pyhmmer domain scanning with Pfam-A\n"
+                "  [bold]Statistics[/] — Transcriptome summary stats\n\n"
+                "[bold cyan]Export[/]\n"
+                "  Use Export CSV buttons in BLAST, Pfam, and Statistics tabs.\n"
+                "  Use Ctrl+E to export bookmarked transcripts as FASTA.\n",
+                id="help-body",
+            )
+            yield Button("Close", id="help-close", variant="primary")
+
+    @on(Button.Pressed, "#help-close")
+    def _close(self, event: Button.Pressed) -> None:
+        self.dismiss(None)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
 
 
 class ConfirmModal(ModalScreen[bool]):
@@ -2716,6 +2916,7 @@ class BlastPanel(Vertical):
 
     transcript: reactive[Transcript | None] = reactive(None)
     _row_to_subject: dict[str, str] = {}  # row_key -> original subject_id
+    _row_to_hit: dict[str, BlastHit] = {}  # row_key -> full BlastHit
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="blast-form"):
@@ -2750,6 +2951,7 @@ class BlastPanel(Vertical):
                 yield Button("Run BLAST", id="blast-run", variant="primary")
                 yield Button("NCBI BlastP", id="blast-ncbi", variant="default")
                 yield Button("Build BLAST DB", id="blast-build-db", variant="warning")
+                yield Button("Export CSV", id="blast-export", variant="default")
                 yield Static(id="blast-status")
         yield LoadingIndicator(id="blast-loading")
         with VerticalScroll(id="blast-results-area"):
@@ -2812,6 +3014,22 @@ class BlastPanel(Vertical):
         btn.variant = "success"
         self.app.action_build_blast_db(interactive=False)
 
+    @on(Button.Pressed, "#blast-export")
+    def _export_blast(self) -> None:
+        table = self.query_one("#blast-table", DataTable)
+        if table.row_count == 0:
+            self._set_status("[yellow]No BLAST results to export.[/]")
+            return
+        path = str(Path.home() / "blast_results.csv")
+        headers = ["Subject", "% ID", "Aln Len", "E-value", "Bit Score",
+                    "Q Start", "Q End", "S Start", "S End"]
+        rows = []
+        for row_key in table.rows:
+            row = table.get_row(row_key)
+            rows.append([str(c) for c in row])
+        _export_csv(path, headers, rows)
+        self._set_status(f"[green]Exported {len(rows)} hits to {path}[/]")
+
     @on(Button.Pressed, "#blast-ncbi")
     def _run_ncbi_blastp(self) -> None:
         btn = self.query_one("#blast-ncbi", Button)
@@ -2867,6 +3085,7 @@ class BlastPanel(Vertical):
                 for i, h in enumerate(hits):
                     row_key = f"ncbi_{h.subject_id}_{i}"
                     self._row_to_subject[row_key] = h.subject_id
+                    self._row_to_hit[row_key] = h
                     table.add_row(
                         h.subject_id[:60], f"{h.pct_identity:.1f}",
                         str(h.alignment_length), f"{h.evalue:.2e}", f"{h.bit_score:.1f}",
@@ -2961,6 +3180,7 @@ class BlastPanel(Vertical):
             for i, h in enumerate(hits):
                 row_key = f"{h.subject_id}_{i}"
                 self._row_to_subject[row_key] = h.subject_id
+                self._row_to_hit[row_key] = h
                 table.add_row(
                     h.subject_id[:40], f"{h.pct_identity:.1f}",
                     str(h.alignment_length), f"{h.evalue:.2e}", f"{h.bit_score:.1f}",
@@ -3122,6 +3342,7 @@ class HmmerPanel(Vertical):
                 yield Button("Scan Selected", id="hmmer-run", variant="primary")
                 yield Button("Scan Collection (PFAM)", id="hmmer-scan-all")
                 yield Button("Confirm CDS (NCBI)", id="hmmer-confirm-cds")
+                yield Button("Export CSV", id="hmmer-export", variant="default")
                 yield Static(id="hmmer-status")
         yield ProgressBar(total=100, show_eta=True, id="hmmer-progress")
         yield LoadingIndicator(id="hmmer-loading")
@@ -3161,6 +3382,22 @@ class HmmerPanel(Vertical):
         """Update progress bar from any thread via call_from_thread."""
         bar = self.query_one("#hmmer-progress", ProgressBar)
         bar.update(total=total, progress=current)
+
+    @on(Button.Pressed, "#hmmer-export")
+    def _export_hmmer(self) -> None:
+        table = self.query_one("#hmmer-table", DataTable)
+        if table.row_count == 0:
+            self._set_status("[yellow]No HMMER results to export.[/]")
+            return
+        path = str(Path.home() / "hmmer_results.csv")
+        headers = ["Family", "Accession", "E-value", "Score", "Bias",
+                    "HMM From", "HMM To", "Ali From", "Ali To", "Description"]
+        rows = []
+        for row_key in table.rows:
+            row = table.get_row(row_key)
+            rows.append([str(c) for c in row])
+        _export_csv(path, headers, rows)
+        self._set_status(f"[green]Exported {len(rows)} hits to {path}[/]")
 
     @on(Button.Pressed, "#hmmer-download-pfam")
     def download_pfam_db(self) -> None:
@@ -3564,8 +3801,14 @@ class ScriptoScopeApp(App):
         Binding("ctrl+f", "focus_filter", "Filter"),
         Binding("ctrl+c", "copy_cds", "Copy CDS", show=False),
         Binding("ctrl+r", "copy_revcomp", "Copy RevComp", show=False),
+        Binding("ctrl+d", "toggle_bookmark", "Bookmark", show=False),
+        Binding("ctrl+e", "export_fasta", "Export FASTA", show=False),
+        Binding("question_mark", "show_help", "Help"),
         Binding("ctrl+q", "quit", "Quit"),
     ]
+
+    def action_show_help(self) -> None:
+        self.push_screen(HelpModal())
 
     def action_quit(self) -> None:
         _hmm_cancel.set()
@@ -3614,6 +3857,53 @@ class ScriptoScopeApp(App):
                 self.notify("No DNA highlight active", severity="warning")
         except Exception:
             pass
+
+    def action_toggle_bookmark(self) -> None:
+        """Toggle bookmark on the currently selected transcript (Ctrl+D)."""
+        try:
+            table = self.query_one("#transcript-table", DataTable)
+            row_key = table.cursor_row
+            if row_key is None:
+                return
+            # Get the actual row key object
+            keys = list(table.rows.keys())
+            if row_key >= len(keys):
+                return
+            rk = keys[row_key]
+            tid = str(rk.value)
+            if tid in self._bookmarks:
+                self._bookmarks.discard(tid)
+                self._set_status(f"Removed bookmark: {tid}")
+            else:
+                self._bookmarks.add(tid)
+                self._set_status(f"[green]Bookmarked: {tid}[/]")
+            # Refresh table to show/hide star
+            self._populate_table(self._filtered, auto_select=False)
+            # Restore cursor
+            try:
+                new_idx = next(i for i, k in enumerate(table.rows) if k.value == tid)
+                table.move_cursor(row=new_idx, animate=False)
+            except StopIteration:
+                pass
+        except Exception:
+            pass
+
+    def action_export_fasta(self) -> None:
+        """Export bookmarked transcripts as FASTA (Ctrl+E)."""
+        if not self._bookmarks:
+            self.notify("No bookmarked transcripts. Use Ctrl+D to bookmark.", severity="warning")
+            return
+        path = str(Path.home() / "bookmarked_transcripts.fasta")
+        count = 0
+        with open(path, "w") as f:
+            for tid in self._bookmarks:
+                t = self._by_id.get(tid)
+                if t:
+                    f.write(f">{t.id} {t.description}\n")
+                    for i in range(0, len(t.sequence), 80):
+                        f.write(t.sequence[i:i+80] + "\n")
+                    count += 1
+        self._set_status(f"[green]Exported {count} bookmarked transcripts to {path}[/]")
 
     def action_save_project(self) -> None:
         """Save transcriptome + analysis to a JSON project file (Ctrl+S)."""
@@ -3733,6 +4023,9 @@ class ScriptoScopeApp(App):
         self._pfam_hits: dict[str, set[str]] = {}
         self._filter_timer: Timer | None = None
         self._navigating_to: str | None = None
+        self._sort_column: str = ""   # "", "id", "length", "gc"
+        self._sort_reverse: bool = False
+        self._bookmarks: set[str] = set()  # transcript IDs
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -3742,7 +4035,7 @@ class ScriptoScopeApp(App):
                     yield Label("[bold]Transcripts[/]")
                     yield Static("0 loaded", id="transcript-count")
                 with Vertical(id="sidebar-filters"):
-                    yield Input(placeholder="Filter by ID…", id="filter-input")
+                    yield Input(placeholder="Filter: text  len>500  gc>40 …", id="filter-input")
                     yield Select(
                         [], prompt="Recent transcriptomes…",
                         id="transcriptome-select", allow_blank=True,
@@ -3948,7 +4241,8 @@ class ScriptoScopeApp(App):
         table = self.query_one("#transcript-table", DataTable)
         table.clear()
         for short_id, length, gc, tid in row_data:
-            table.add_row(short_id, length, gc, key=tid)
+            label = f"* {short_id}" if tid in self._bookmarks else short_id
+            table.add_row(label, length, gc, key=tid)
         shown = len(row_data)
         count_text = f"{shown:,} of {total:,} shown" if shown < total else f"{total:,} shown"
         self.query_one("#transcript-count", Static).update(count_text)
@@ -3981,10 +4275,10 @@ class ScriptoScopeApp(App):
         # repopulated by _focus_transcript_from_blast.
         if self._navigating_to is not None:
             return
-        query = self.query_one("#filter-input", Input).value.strip().lower()
+        raw = self.query_one("#filter-input", Input).value.strip()
         results = self._transcripts
-        if query:
-            results = [t for t in results if query in t.id.lower()]
+        if raw:
+            results = _filter_transcripts(results, raw, self._bookmarks)
         self._filtered = results
         self._populate_table(self._filtered)
 
@@ -4021,8 +4315,26 @@ class ScriptoScopeApp(App):
         if t is not None:
             self._show_transcript(t)
 
-    # Use Textual's method-name convention (on_<namespace>_<message>) instead of
-    # @on with CSS selector — the CSS selector matching is unreliable in 8.1.1.
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        if event.data_table.id != "transcript-table":
+            return
+        col_map = {"ID": "id", "Length": "length", "GC%": "gc"}
+        col_key = col_map.get(str(event.label), "")
+        if not col_key:
+            return
+        if self._sort_column == col_key:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_column = col_key
+            self._sort_reverse = False
+        key_funcs = {
+            "id": lambda t: t.id.lower(),
+            "length": lambda t: t.length,
+            "gc": lambda t: t.gc_content,
+        }
+        self._filtered.sort(key=key_funcs[col_key], reverse=self._sort_reverse)
+        self._populate_table(self._filtered, auto_select=False)
+
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.data_table.id == "transcript-table":
             # If we're navigating to a specific transcript (e.g. from a BLAST
@@ -4076,6 +4388,15 @@ class ScriptoScopeApp(App):
         except StopIteration:
             pass
         self._show_transcript(t)
+        # Highlight the hit region in the sequence viewer
+        hit = blast_panel._row_to_hit.get(raw)
+        if hit:
+            sv = self.query_one("#seq-viewer", SequenceViewer)
+            # subject_start/end are 1-based; convert to 0-based half-open
+            lo = min(hit.subject_start, hit.subject_end) - 1
+            hi = max(hit.subject_start, hit.subject_end)
+            sv._highlight = (lo, hi)
+            sv.show_transcript(t)
         # Switch to sequence tab to show the hit
         self.query_one("#content-area", TabbedContent).active = "tab-sequence"
 
