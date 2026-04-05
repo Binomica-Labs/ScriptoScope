@@ -2390,18 +2390,19 @@ def colorize_sequence_annotated(
                 dna_styles[pos] = "dim"
     elif focus_range:
         fr_lo, fr_hi = focus_range
-        # In-focus bases get a subtle dark-grey background behind their
-        # per-base ACGT color so the feature visibly "lights up" against
-        # the dimmed surroundings. Start/stop codon overrides punch
-        # through untouched.
-        focus_bg = " on grey11"
+        # In-focus bases get a strong selection-style highlight —
+        # bright white text on a dark blue background, like a text-
+        # editor mouse-drag selection. Makes it unmistakable that
+        # "this region is selected and can be Ctrl+C'd". Start/stop
+        # codon overrides (green/red bg) punch through untouched.
+        focus_style = "bold bright_white on dark_blue"
         for pos in range(n):
             if fr_lo <= pos < fr_hi:
                 override = base_override[pos]
                 if override is not None:
                     dna_styles[pos] = override
                 else:
-                    dna_styles[pos] = base_colors.get(display_seq[pos].upper(), "white") + focus_bg
+                    dna_styles[pos] = focus_style
             else:
                 dna_styles[pos] = "dim"
     else:
