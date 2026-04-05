@@ -570,6 +570,60 @@ class TestHmmerPanel:
             assert "No HMMER results" in text
 
 
+class TestNoOrfWorkOnUnscannedClicks:
+    """Sacred invariant: clicking a transcript that has NOT been HMM-scanned
+    must NOT trigger ORF detection anywhere in the app. ORF work is expensive
+    and semantically belongs to explicit scan actions (HMM scan, CDS confirm,
+    NCBI blastp), not to passive browsing. This test asserts zero calls to
+    both _find_longest_orf and _longest_orf_aa_length across a burst of
+    transcript clicks on a fresh (unscanned) transcriptome."""
+
+    @pytest.mark.asyncio
+    async def test_unscanned_clicks_do_not_invoke_orf_finder(
+        self, app: ScriptoScopeApp,
+    ):
+        import scriptoscope as ss
+
+        calls = {"find_longest": 0, "length_only": 0}
+        real_find = ss._find_longest_orf
+        real_len = ss._longest_orf_aa_length
+
+        def traced_find(nuc, sid):
+            calls["find_longest"] += 1
+            return real_find(nuc, sid)
+
+        def traced_len(nuc, min_aa=30):
+            calls["length_only"] += 1
+            return real_len(nuc, min_aa)
+
+        ss._find_longest_orf = traced_find
+        ss._longest_orf_aa_length = traced_len
+        try:
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause(1.5)
+                # Reset counters after initial load + auto-select
+                calls["find_longest"] = 0
+                calls["length_only"] = 0
+                # Burst-click every transcript in the loaded fixture
+                for t in app._transcripts:
+                    app._show_transcript(t)
+                    await pilot.pause(0.05)
+                await pilot.pause(1.5)  # let debounce + render workers settle
+                # Zero ORF calls — passive browsing must not invoke ORF work
+                assert calls["find_longest"] == 0, (
+                    f"_find_longest_orf was called {calls['find_longest']} "
+                    f"times on unscanned clicks — ORF work must only happen "
+                    f"during explicit scans"
+                )
+                assert calls["length_only"] == 0, (
+                    f"_longest_orf_aa_length was called {calls['length_only']} "
+                    f"times on unscanned clicks"
+                )
+        finally:
+            ss._find_longest_orf = real_find
+            ss._longest_orf_aa_length = real_len
+
+
 class TestSelectSentinelHandling:
     """Regression for the infinite-loop bug where set_options() on some
     Textual versions fires a Select.Changed event with a sentinel value
