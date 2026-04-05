@@ -2390,13 +2390,18 @@ def colorize_sequence_annotated(
                 dna_styles[pos] = "dim"
     elif focus_range:
         fr_lo, fr_hi = focus_range
+        # In-focus bases get a subtle dark-grey background behind their
+        # per-base ACGT color so the feature visibly "lights up" against
+        # the dimmed surroundings. Start/stop codon overrides punch
+        # through untouched.
+        focus_bg = " on grey11"
         for pos in range(n):
             if fr_lo <= pos < fr_hi:
                 override = base_override[pos]
                 if override is not None:
                     dna_styles[pos] = override
                 else:
-                    dna_styles[pos] = base_colors.get(display_seq[pos].upper(), "white")
+                    dna_styles[pos] = base_colors.get(display_seq[pos].upper(), "white") + focus_bg
             else:
                 dna_styles[pos] = "dim"
     else:

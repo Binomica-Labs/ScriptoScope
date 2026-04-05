@@ -34,6 +34,8 @@ from scriptoscope import (
     _filter_transcripts,
     _find_longest_orf,
     _parse_fasta,
+    _text_to_content,
+    colorize_sequence,
     colorize_sequence_annotated,
     load_all,
 )
@@ -829,3 +831,203 @@ class TestAppState:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause(2.0)
             assert len(app._filtered) == len(app._transcripts)
+
+
+class TestRenderPerformanceBudget:
+    """Sacred performance budgets for the sequence viewer render paths.
+
+    These tests catch regressions in the paint pipeline that would cause
+    the "nigh-inoperable after Pfam scan" class of bug. The UI budget is
+    ~33 ms per frame at 30 FPS — any single render step that exceeds its
+    individual budget will push the UI over the edge when combined with
+    other per-click work.
+
+    Budgets are set generously (2-3x measured times on the maintainer's
+    machine) so CI machines don't flake, but tightly enough that a 10x
+    regression like the kind I introduced twice in this codebase would
+    trip the assertion immediately.
+    """
+
+    @pytest.fixture
+    def long_transcript(self) -> Transcript:
+        """A ~5.8 kb transcript — the size where perf problems showed up
+        in real user sessions on GHJI data."""
+        import random
+        random.seed(0xC0DE)
+        seq = "".join(random.choices("ACGT", k=5800))
+        return Transcript(id="perf_test", description="", sequence=seq)
+
+    def test_colorize_sequence_plain_budget(self, long_transcript: Transcript):
+        """Plain (unscanned click) render must stay under 30 ms on a ~5.8 kb
+        transcript. Measured baseline ~8 ms; budget is 4x headroom."""
+        import time
+        # Warmup
+        for _ in range(3):
+            colorize_sequence(long_transcript.sequence, width=100)
+        t0 = time.perf_counter()
+        for _ in range(5):
+            colorize_sequence(long_transcript.sequence, width=100)
+        dt_ms = (time.perf_counter() - t0) / 5 * 1000
+        assert dt_ms < 30, (
+            f"colorize_sequence took {dt_ms:.1f} ms/render for 5800 bp; "
+            f"budget is 30 ms. A regression here makes unscanned clicks lag."
+        )
+
+    def test_colorize_sequence_annotated_budget(self, long_transcript: Transcript):
+        """Annotated (post-scan) render must stay under 60 ms on a ~5.8 kb
+        transcript with Pfam hits. Measured baseline ~22 ms; budget is
+        ~3x headroom."""
+        import time
+        orf = _find_longest_orf(long_transcript.sequence, long_transcript.id)
+        if orf is None:
+            pytest.skip("random sequence produced no ORF >= 30 aa")
+        hits = [
+            HmmerHit(target_name="K", accession="PF1", query_name=orf.orf_id,
+                     evalue=1e-40, score=120.0, bias=0.3, description="",
+                     ali_from=5, ali_to=20, hmm_from=1, hmm_to=15,
+                     dom_evalue=1e-40, dom_score=120.0),
+            HmmerHit(target_name="P", accession="PF2", query_name=orf.orf_id,
+                     evalue=1e-20, score=80.0, bias=0.1, description="",
+                     ali_from=30, ali_to=60, hmm_from=1, hmm_to=30,
+                     dom_evalue=1e-20, dom_score=80.0),
+        ]
+        for _ in range(3):
+            colorize_sequence_annotated(long_transcript.sequence, orf=orf,
+                                         hits=hits, width=100)
+        t0 = time.perf_counter()
+        for _ in range(5):
+            colorize_sequence_annotated(long_transcript.sequence, orf=orf,
+                                         hits=hits, width=100)
+        dt_ms = (time.perf_counter() - t0) / 5 * 1000
+        assert dt_ms < 60, (
+            f"colorize_sequence_annotated took {dt_ms:.1f} ms/render for 5800 bp; "
+            f"budget is 60 ms. A regression here makes scanned clicks lag."
+        )
+
+    def test_find_longest_orf_budget(self, long_transcript: Transcript):
+        """ORF finding must stay under 10 ms for a ~5.8 kb transcript.
+        Measured baseline ~2.3 ms; budget is 4x headroom. Catches any
+        return of the old Biopython-translate slow path."""
+        import time
+        from scriptoscope import _longest_orf_cache
+        _longest_orf_cache.clear()
+        _find_longest_orf(long_transcript.sequence, long_transcript.id)  # warmup
+        _longest_orf_cache.clear()
+        t0 = time.perf_counter()
+        for _ in range(20):
+            _find_longest_orf(long_transcript.sequence, long_transcript.id)
+            _longest_orf_cache.clear()
+        dt_ms = (time.perf_counter() - t0) / 20 * 1000
+        assert dt_ms < 10, (
+            f"_find_longest_orf took {dt_ms:.1f} ms/call; budget is 10 ms. "
+            f"Check that the regex fast path isn't routing through Biopython."
+        )
+
+    def test_text_to_content_budget(self, long_transcript: Transcript):
+        """Textual Content conversion must stay under 100 ms on a ~5.8 kb
+        annotated render. Measured baseline ~33 ms; budget is 3x headroom.
+        This is what runs on every body.update() call in the main thread
+        if we forget to pre-convert on the worker — blowing it is the
+        root cause of 'nigh-inoperable' UI after a scan."""
+        import time
+        orf = _find_longest_orf(long_transcript.sequence, long_transcript.id)
+        if orf is None:
+            pytest.skip("random sequence produced no ORF >= 30 aa")
+        render = colorize_sequence_annotated(
+            long_transcript.sequence, orf=orf, hits=[], width=100,
+        )
+        # Warmup
+        for _ in range(3):
+            _text_to_content(render.text)
+        t0 = time.perf_counter()
+        for _ in range(5):
+            _text_to_content(render.text)
+        dt_ms = (time.perf_counter() - t0) / 5 * 1000
+        assert dt_ms < 100, (
+            f"_text_to_content took {dt_ms:.1f} ms/call; budget is 100 ms. "
+            f"If this runs on the main thread via body.update(text), the UI "
+            f"will lag on every click — use _text_to_content on the worker."
+        )
+
+    def test_compute_stats_budget(self):
+        """_compute_stats over 1000 transcripts must stay under 2 s.
+        Measured baseline ~0.4 s at 2.5 ms/transcript on ORF scan;
+        budget is 5x. Catches regressions in the ORF regex scanner."""
+        import time, random
+        random.seed(42)
+        transcripts = [
+            Transcript(
+                id=f"t{i}",
+                description="",
+                sequence="".join(random.choices("ACGT", k=random.randint(500, 3000))),
+            )
+            for i in range(1000)
+        ]
+        t0 = time.perf_counter()
+        stats = _compute_stats(transcripts)
+        dt = time.perf_counter() - t0
+        assert dt < 2.0, (
+            f"_compute_stats took {dt:.2f} s for 1000 transcripts; "
+            f"budget is 2 s. The fast ORF regex path may be broken."
+        )
+        assert stats["n"] == 1000
+
+
+class TestClickToFocusRender:
+    """Regression: clicking a feature arrow/body or an AA line must apply
+    a visible DNA highlight inside the feature, not just dim the
+    surroundings. This test locks in the 'focus mode' behavior so nobody
+    accidentally removes the in-range highlight again."""
+
+    def test_focus_range_applies_visible_bg_to_in_range_bases(self):
+        """With focus_range set, in-range DNA bases must get a
+        distinguishable style (not just their default per-base color).
+        Out-of-range bases must be dimmed."""
+        import random
+        random.seed(7)
+        seq = "".join(random.choices("ACGT", k=600))
+        t = Transcript(id="t", description="", sequence=seq)
+        orf = _find_longest_orf(t.sequence, t.id)
+        if orf is None:
+            pytest.skip("no ORF found in fixture sequence")
+        result = colorize_sequence_annotated(
+            t.sequence, orf=orf, hits=[], width=60,
+            focus_range=(orf.nt_start, orf.nt_end),
+        )
+        spans = result.text.spans
+        # Styles used inside the focus range must include the background-
+        # highlight pattern ("on grey..." or similar) — NOT plain "dim"
+        # and NOT plain ACGT colors alone.
+        in_focus_bg_styles = [
+            s for s in spans if "on grey" in str(s.style)
+        ]
+        out_focus_dim_styles = [
+            s for s in spans if str(s.style) == "dim"
+        ]
+        assert len(in_focus_bg_styles) > 0, (
+            "focus_range produced no in-focus background highlight — "
+            "the user visibly cannot tell where the feature is"
+        )
+        assert len(out_focus_dim_styles) > 0, (
+            "focus_range produced no dim-outside spans — surrounding "
+            "bases are not being muted"
+        )
+
+    def test_focus_off_has_no_bg_highlight(self):
+        """Default render (no focus_range) must NOT apply the bg highlight,
+        so that focus mode visibly differs from the idle view."""
+        import random
+        random.seed(7)
+        seq = "".join(random.choices("ACGT", k=600))
+        t = Transcript(id="t", description="", sequence=seq)
+        orf = _find_longest_orf(t.sequence, t.id)
+        if orf is None:
+            pytest.skip("no ORF found in fixture sequence")
+        result = colorize_sequence_annotated(
+            t.sequence, orf=orf, hits=[], width=60,
+        )
+        bg_styles = [s for s in result.text.spans if "on grey" in str(s.style)]
+        assert len(bg_styles) == 0, (
+            "default render leaked the focus-mode bg highlight — "
+            "focus mode no longer visibly differs from idle"
+        )
