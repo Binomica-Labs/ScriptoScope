@@ -89,7 +89,7 @@ scriptoscope /path/to/transcriptome.fasta
 
 ### Sequence
 
-Displays the selected transcript's nucleotide sequence with per-base coloring (A=green, T=red, G=yellow, C=cyan). After running a Pfam scan, the view automatically updates to show:
+Displays the selected transcript's nucleotide sequence with per-base coloring designed so GC content is visible at a glance: **A = cyan**, **T = lime green** (cool colors for A/T pairs), **C = orange**, **G = red** (warm colors for G/C pairs). GC-rich regions show up as bands of warm color. After running a Pfam scan, the view automatically updates to show:
 
 - **Amino acid translation** aligned beneath the DNA, with each residue centered on its codon
 - **Pfam domain bars** spanning the corresponding nucleotide positions

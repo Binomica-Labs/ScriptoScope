@@ -1889,12 +1889,16 @@ def pfam_db_exists(dest_dir: Path = _PFAM_DEFAULT_DIR) -> str | None:
 # Sequence viewer widget
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Base colors chosen so GC content is visible at a glance:
+#   A = cyan, T/U = lime-green  → "cool" colors for AT pairs
+#   C = orange, G = red          → "warm" colors for GC pairs
+# A GC-rich region reads as a band of warm color; AT-rich as cool.
 _BASE_COLORS = {
-    "A": "bold green",
-    "T": "bold red",
-    "U": "bold red",
-    "G": "bold yellow",
-    "C": "bold cyan",
+    "A": "bold cyan",
+    "T": "bold bright_green",
+    "U": "bold bright_green",
+    "C": "bold dark_orange",
+    "G": "bold red",
     "N": "dim white",
 }
 _MAX_DISPLAY_BASES = 10_000
@@ -2488,10 +2492,10 @@ class SequenceViewer(ScrollableContainer):
             grid.add_row(
                 "Composition",
                 (
-                    f"[bold green]A[/]:{counts['A']}  "
-                    f"[bold cyan]C[/]:{counts['C']}  "
-                    f"[bold yellow]G[/]:{counts['G']}  "
-                    f"[bold red]T[/]:{counts['T']}  "
+                    f"[bold cyan]A[/]:{counts['A']}  "
+                    f"[bold dark_orange]C[/]:{counts['C']}  "
+                    f"[bold red]G[/]:{counts['G']}  "
+                    f"[bold bright_green]T[/]:{counts['T']}  "
                     f"[dim]N[/]:{counts['N']}"
                 ),
             )
