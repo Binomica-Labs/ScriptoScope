@@ -4623,6 +4623,10 @@ class ScriptoScopeApp(App):
         if event.value is Select.BLANK or event.value is None:
             return
         path = str(event.value)
+        _log.info(
+            "Transcriptome select changed: event.value=%r -> path=%r",
+            event.value, path,
+        )
         if path == self._fasta_path:
             return
         if path.endswith(".scriptoscope.json"):
@@ -4637,6 +4641,7 @@ class ScriptoScopeApp(App):
         self.push_screen(FileBrowserModal(start_path=start), self._on_file_selected)
 
     def _on_file_selected(self, path: str | None) -> None:
+        _log.info("FileBrowserModal returned path=%r", path)
         if path:
             if path.endswith(".scriptoscope.json"):
                 self._load_project_file(path)
@@ -4645,6 +4650,7 @@ class ScriptoScopeApp(App):
 
     @work(exclusive=True, thread=True)
     def _load_fasta(self, path: str) -> None:
+        _log.info("_load_fasta invoked with path=%r", path)
         # Cancel any in-flight HMM scans from a previous transcriptome so they
         # don't write stale results into the freshly loaded state.
         _hmm_cancel.set()
@@ -4654,6 +4660,10 @@ class ScriptoScopeApp(App):
         # dead command-line args before `load_all` turns them into raw
         # "[Errno 2] No such file or directory" noise.
         p = Path(path).expanduser()
+        _log.info(
+            "_load_fasta pre-flight: resolved=%r exists=%s is_file=%s",
+            str(p), p.exists(), p.is_file() if p.exists() else False,
+        )
         if not p.exists():
             msg = f"File not found: {path}"
             self.call_from_thread(self.clear_notifications)
@@ -4739,47 +4749,70 @@ class ScriptoScopeApp(App):
         ]
 
         def _apply() -> None:
-            self.clear_notifications()
-            self._transcripts = transcripts
-            self._filtered = transcripts
-            self._by_id = by_id
-            self._fasta_path = path
-            self._pfam_hits = {}
-            # Clear stale per-transcript caches from the previous dataset.
             try:
-                hmmer = self.query_one("#hmmer-panel")
-                hmmer._scan_cache.clear()
-                hmmer._confirm_cache.clear()
-                hmmer._diagram_cache.clear()
-                hmmer._last_shown_id = ""
-                self.query_one("#seq-viewer", SequenceViewer)._last_shown_id = ""
-                self.query_one("#stats-panel", StatsPanel)._last_shown_id = ""
+                self._apply_loaded_transcripts(
+                    path, transcripts, by_id, row_data, visible, dup_shortfall,
+                )
             except Exception:
-                pass
-            # Re-arm cancellation events so fresh scans can run again.
-            _hmm_cancel.clear()
-            _ncbi_blast_cancel.clear()
-            # Invalidate per-transcript ORF cache — cheap and prevents cross-
-            # session collisions on the (id, length, fingerprint) key.
-            _longest_orf_cache.clear()
-            self._populate_table_fast(row_data, len(transcripts), visible)
-            self._refresh_transcriptome_select()
-            status_msg = f"[green]{len(transcripts):,} transcripts loaded from {path}[/]"
-            if dup_shortfall:
-                status_msg += f" [yellow](dedup anomaly: {dup_shortfall})[/]"
-            self._set_status(status_msg)
-            self.notify(
-                f"{len(transcripts):,} transcripts loaded",
-                title="Transcriptome", severity="information", timeout=3,
-            )
-            # Stats are no longer auto-computed — user triggers via the
-            # "Compute Statistics" button in the Statistics tab.
-            try:
-                self.query_one("#stats-panel", StatsPanel).reset_for_new_dataset()
-            except Exception:
-                pass
+                _log.exception("_apply_loaded_transcripts raised for %s", path)
+                self._set_status(f"[red]Load succeeded but UI update failed (see log)[/]")
 
         self.call_from_thread(_apply)
+
+    def _apply_loaded_transcripts(
+        self,
+        path: str,
+        transcripts: list[Transcript],
+        by_id: dict[str, Transcript],
+        row_data: list[tuple[str, str, str, str]],
+        visible: list[Transcript],
+        dup_shortfall: int,
+    ) -> None:
+        """Main-thread tail of `_load_fasta` — split out so exceptions in any
+        of the DOM/state mutations surface clearly in the log instead of
+        silently eating the worker."""
+        self.clear_notifications()
+        self._transcripts = transcripts
+        self._filtered = transcripts
+        self._by_id = by_id
+        self._fasta_path = path
+        self._pfam_hits = {}
+        # Clear stale per-transcript caches from the previous dataset.
+        try:
+            hmmer = self.query_one("#hmmer-panel")
+            hmmer._scan_cache.clear()
+            hmmer._confirm_cache.clear()
+            hmmer._diagram_cache.clear()
+            hmmer._last_shown_id = ""
+            self.query_one("#seq-viewer", SequenceViewer)._last_shown_id = ""
+            self.query_one("#stats-panel", StatsPanel)._last_shown_id = ""
+        except Exception:
+            _log.exception("Failed to clear per-panel caches")
+        # Re-arm cancellation events so fresh scans can run again.
+        _hmm_cancel.clear()
+        _ncbi_blast_cancel.clear()
+        # Invalidate per-transcript ORF cache — cheap and prevents cross-
+        # session collisions on the (id, length, fingerprint) key.
+        _longest_orf_cache.clear()
+        self._populate_table_fast(row_data, len(transcripts), visible)
+        try:
+            self._refresh_transcriptome_select()
+        except Exception:
+            _log.exception("refresh_transcriptome_select raised during load apply")
+        status_msg = f"[green]{len(transcripts):,} transcripts loaded from {path}[/]"
+        if dup_shortfall:
+            status_msg += f" [yellow](dedup anomaly: {dup_shortfall})[/]"
+        self._set_status(status_msg)
+        self.notify(
+            f"{len(transcripts):,} transcripts loaded",
+            title="Transcriptome", severity="information", timeout=3,
+        )
+        # Stats are no longer auto-computed — user triggers via the
+        # "Compute Statistics" button in the Statistics tab.
+        try:
+            self.query_one("#stats-panel", StatsPanel).reset_for_new_dataset()
+        except Exception:
+            _log.exception("StatsPanel.reset_for_new_dataset raised")
 
     @work(exclusive=True, thread=True, group="stats")
     def _compute_stats_bg(self, transcripts: list[Transcript], path: str) -> None:
