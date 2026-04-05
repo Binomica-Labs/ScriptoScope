@@ -1895,15 +1895,21 @@ def pfam_db_exists(dest_dir: Path = _PFAM_DEFAULT_DIR) -> str | None:
 # colorblind-safe blue/orange pairing; within each pair a hue shift
 # distinguishes individual bases without breaking the family reading.
 #
-#   A = blue,   T/U = cyan          → cool colors for A/T pairs
-#   C = orange, G   = red           → warm colors for G/C pairs
+#   A = blue   (#0087ff)  \  cool — AT family
+#   T = cyan   (#00ffff)  /
+#   C = orange (#ff8700)  \  warm — GC family
+#   G = red    (#ff0000)  /
 #
-# A GC-rich stretch reads as a band of warm color, AT-rich as cool.
-# Red-green pairings are deliberately avoided.
+# All four are fixed xterm-256 color names (dodger_blue1, cyan1,
+# dark_orange, red1). The basic ANSI 16-color names (bright_blue,
+# bright_cyan, bright_red) are avoided because terminal themes remap
+# them freely — bright_blue in particular shows up as violet/purple
+# in many common palettes (Solarized, macOS Terminal default, etc.).
+# 256-color names are RGB-anchored and render consistently.
 _BASE_COLORS = {
-    "A": "bold bright_blue",
-    "T": "bold bright_cyan",
-    "U": "bold bright_cyan",
+    "A": "bold dodger_blue1",
+    "T": "bold cyan1",
+    "U": "bold cyan1",
     "C": "bold dark_orange",
     "G": "bold red1",
     "N": "dim white",
@@ -2499,10 +2505,10 @@ class SequenceViewer(ScrollableContainer):
             grid.add_row(
                 "Composition",
                 (
-                    f"[bold bright_blue]A[/]:{counts['A']}  "
+                    f"[bold dodger_blue1]A[/]:{counts['A']}  "
                     f"[bold dark_orange]C[/]:{counts['C']}  "
                     f"[bold red1]G[/]:{counts['G']}  "
-                    f"[bold bright_cyan]T[/]:{counts['T']}  "
+                    f"[bold cyan1]T[/]:{counts['T']}  "
                     f"[dim]N[/]:{counts['N']}"
                 ),
             )
