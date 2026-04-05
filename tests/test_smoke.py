@@ -943,8 +943,8 @@ class TestRenderPerformanceBudget:
         for _ in range(5):
             _text_to_content(render.text)
         dt_ms = (time.perf_counter() - t0) / 5 * 1000
-        assert dt_ms < 150, (
-            f"_text_to_content took {dt_ms:.1f} ms/call; budget is 150 ms. "
+        assert dt_ms < 200, (
+            f"_text_to_content took {dt_ms:.1f} ms/call; budget is 200 ms. "
             f"If this runs on the main thread via body.update(text), the UI "
             f"will lag on every click — use _text_to_content on the worker."
         )

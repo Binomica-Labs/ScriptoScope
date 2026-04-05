@@ -2699,8 +2699,12 @@ class SequenceViewer(ScrollableContainer):
             except Exception:
                 pass
 
-            # Clear body immediately so Textual doesn't render stale large content
-            body.update(Text("Loading…", style="dim"))
+            # For NEW transcripts, clear body so stale content doesn't linger
+            # while the worker runs. For SAME-transcript re-renders (highlight
+            # toggles), keep the existing content to avoid a scroll-position
+            # reset — the worker will swap the content in-place shortly.
+            if self._render_seq_id != t.id:
+                body.update(Text("Loading…", style="dim"))
             self._render_seq_id = t.id
             self._render_sequence_bg(t, seq_width, scan_cache)
         except Exception as exc:
@@ -4343,7 +4347,7 @@ class HmmerPanel(Vertical):
                 yield Switch(value=True, id="hmmer-translate")
             with Horizontal(classes="hmmer-row"):
                 yield Label("Pfam GA cutoffs:", classes="hmmer-label")
-                yield Switch(value=True, id="hmmer-gathering")
+                yield Switch(value=False, id="hmmer-gathering")
                 yield Static(
                     "[dim]Use Pfam's per-HMM gathering thresholds "
                     "(correct for Pfam — ignores e-value)[/]",
