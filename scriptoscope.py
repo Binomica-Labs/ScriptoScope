@@ -4363,6 +4363,11 @@ class ScriptoScopeApp(App):
 
     @work(exclusive=True, thread=True, group="load-project")
     def _do_load_project(self, path: str) -> None:
+        # Defensive: reject upstream dispatch garbage before it becomes a
+        # user-visible error.
+        if not path or not isinstance(path, str) or path.startswith("Select."):
+            _log.warning("_do_load_project: ignoring invalid path %r", path)
+            return
         # Cancel any in-flight work tied to the previous dataset.
         _hmm_cancel.set()
         _ncbi_blast_cancel.set()
@@ -4620,13 +4625,18 @@ class ScriptoScopeApp(App):
     def _on_transcriptome_select(self, event: Select.Changed) -> None:
         if self._refreshing_select:
             return
-        if event.value is Select.BLANK or event.value is None:
+        # Reject any non-string value. Real paths are always strings; anything
+        # else is a Textual sentinel (Select.BLANK, Select.NULL, None) whose
+        # exact identity varies between Textual versions. This catches the
+        # reset-to-NULL event fired by set_options() on some versions.
+        if not isinstance(event.value, str):
+            _log.debug(
+                "Ignoring non-string Select value: %r (type=%s)",
+                event.value, type(event.value).__name__,
+            )
             return
-        path = str(event.value)
-        _log.info(
-            "Transcriptome select changed: event.value=%r -> path=%r",
-            event.value, path,
-        )
+        path = event.value
+        _log.info("Transcriptome select changed -> path=%r", path)
         if path == self._fasta_path:
             return
         if path.endswith(".scriptoscope.json"):
@@ -4651,6 +4661,12 @@ class ScriptoScopeApp(App):
     @work(exclusive=True, thread=True)
     def _load_fasta(self, path: str) -> None:
         _log.info("_load_fasta invoked with path=%r", path)
+        # Defensive: sentinel-looking strings from upstream dispatch bugs
+        # should never reach the loader. Silently ignore instead of showing
+        # the user a "File not found: Select.NULL" error.
+        if not path or not isinstance(path, str) or path.startswith("Select."):
+            _log.warning("_load_fasta: ignoring invalid path %r", path)
+            return
         # Cancel any in-flight HMM scans from a previous transcriptome so they
         # don't write stale results into the freshly loaded state.
         _hmm_cancel.set()

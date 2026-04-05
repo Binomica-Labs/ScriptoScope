@@ -570,6 +570,50 @@ class TestHmmerPanel:
             assert "No HMMER results" in text
 
 
+class TestSelectSentinelHandling:
+    """Regression for the infinite-loop bug where set_options() on some
+    Textual versions fires a Select.Changed event with a sentinel value
+    (Select.BLANK, Select.NULL, etc.) instead of a real path string.
+
+    The guard must reject any non-string value up front, and _load_fasta
+    must also reject obvious sentinel-looking strings as a safety net.
+    """
+
+    @pytest.mark.asyncio
+    async def test_load_fasta_rejects_sentinel_string(self, app: ScriptoScopeApp):
+        """_load_fasta must silently ignore 'Select.NULL' without triggering
+        a File Not Found error (that error handler refreshes the dropdown,
+        which would re-fire the sentinel and loop forever)."""
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(1.0)
+            original_transcripts = list(app._transcripts)
+            original_path = app._fasta_path
+            # Simulate what Textual's set_options() fires in some versions
+            app._load_fasta("Select.NULL")
+            await pilot.pause(1.0)
+            # State must be untouched
+            assert app._transcripts == original_transcripts
+            assert app._fasta_path == original_path
+
+    @pytest.mark.asyncio
+    async def test_load_fasta_rejects_empty_string(self, app: ScriptoScopeApp):
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(1.0)
+            original = list(app._transcripts)
+            app._load_fasta("")
+            await pilot.pause(0.5)
+            assert app._transcripts == original
+
+    @pytest.mark.asyncio
+    async def test_do_load_project_rejects_sentinel_string(self, app: ScriptoScopeApp):
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(1.0)
+            original = list(app._transcripts)
+            app._do_load_project("Select.NULL")
+            await pilot.pause(0.5)
+            assert app._transcripts == original
+
+
 class TestMissingFileHandling:
     """Regression: loading a non-existent path must surface a user-friendly
     "File not found" error, never a raw [Errno 2] traceback, and never
