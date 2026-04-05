@@ -2882,34 +2882,34 @@ class SequenceViewer(ScrollableContainer):
         nt_pos = line_info.chunk_start + (x - 1)
 
         if line_info.line_type in ("feat", "pfam"):
-            # Click on feature/pfam line → focus the ORF/domain it belongs to.
+            # Click on feature/pfam line → highlight DNA only.
+            # Clears any AA highlight so only one is active at a time.
             for feat in self._features:
                 if feat.nt_start <= nt_pos < feat.nt_end:
                     new_focus = (feat.nt_start, feat.nt_end)
-                    if self._focus_range == new_focus and self._aa_highlight is None:
-                        # Already focused on this feature — toggle off.
+                    if self._focus_range == new_focus:
                         self._clear_highlights()
                     else:
                         self._focus_range = new_focus
-                        self._highlight = None
                         self._aa_highlight = None
                         self._aa_highlight_seq = ""
+                        self._highlight = None
                         self.show_transcript(self.transcript)
                     return
             self._clear_highlights()
 
         elif line_info.line_type == "aa":
-            # Click on AA line → focus the feature AND highlight its aa run
-            # for clipboard copy on Ctrl+C.
+            # Click on AA line → highlight amino acids only.
+            # Clears any DNA focus so only one is active at a time.
             for feat in self._features:
                 if feat.nt_start <= nt_pos < feat.nt_end:
-                    new_focus = (feat.nt_start, feat.nt_end)
-                    if self._aa_highlight == new_focus:
+                    new_hl = (feat.nt_start, feat.nt_end)
+                    if self._aa_highlight == new_hl:
                         self._clear_highlights()
                     else:
-                        self._focus_range = new_focus
-                        self._aa_highlight = new_focus
+                        self._aa_highlight = new_hl
                         self._aa_highlight_seq = feat.aa_seq
+                        self._focus_range = None
                         self._highlight = None
                         self.show_transcript(self.transcript)
                     return
