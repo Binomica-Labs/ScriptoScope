@@ -511,9 +511,11 @@ class TestSequenceViewer:
             sv = app.query_one("#seq-viewer", SequenceViewer)
             assert sv.transcript is not None
             body = sv.query_one("#seq-body", Static)
-            # Body should have some rendered content
-            text = body.content
-            assert len(text) > 0
+            # Body should have content attached. The renderable is wrapped
+            # in CachedSegmentRenderable for paint performance — assert it
+            # was set (not None / the initial empty string).
+            assert body.content is not None
+            assert body.content != ""
 
     @pytest.mark.asyncio
     async def test_goto_position_widget_exists(self, app: ScriptoScopeApp):
