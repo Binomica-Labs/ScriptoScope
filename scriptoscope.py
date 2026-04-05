@@ -42,13 +42,142 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Generator, Optional
 
-# Debug log — tail /tmp/scriptoscope.log to see runtime errors
-logging.basicConfig(
-    filename="/tmp/scriptoscope.log",
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-_log = logging.getLogger("scriptoscope")
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Every session writes to a rotating log file. Default is /tmp/scriptoscope.log;
+# override with the SCRIPTOSCOPE_LOG env var. Each session gets a unique 8-char
+# session ID prefix so multi-run logs can be cleanly separated with grep.
+#
+# If a user reports a bug, ask them to share the last run's log lines (find the
+# newest SESSION ID at the top of the file and copy from there). The startup
+# banner below captures version, platform, and dependency info so reproducing
+# the environment is trivial.
+import uuid as _uuid
+from logging.handlers import RotatingFileHandler
+
+_LOG_PATH = os.environ.get("SCRIPTOSCOPE_LOG") or "/tmp/scriptoscope.log"
+_SESSION_ID = _uuid.uuid4().hex[:8]
+
+
+class _SessionFilter(logging.Filter):
+    """Inject the per-session ID into every log record."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.session = _SESSION_ID
+        return True
+
+
+def _configure_logging() -> logging.Logger:
+    root = logging.getLogger("scriptoscope")
+    root.setLevel(logging.DEBUG)
+    # Idempotent: if Python re-imports the module (e.g. in tests), don't
+    # stack duplicate handlers on top of each other.
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    try:
+        Path(_LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
+        handler: logging.Handler = RotatingFileHandler(
+            _LOG_PATH,
+            maxBytes=5 * 1024 * 1024,  # 5 MB per file
+            backupCount=3,              # keep 3 rotated copies
+            encoding="utf-8",
+        )
+    except OSError:
+        # Fallback: if we can't open the log file, write to stderr so at
+        # least errors are visible somewhere.
+        handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s [%(session)s] %(levelname)-5s "
+            "%(name)s.%(funcName)s:%(lineno)d %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    handler.addFilter(_SessionFilter())
+    root.addHandler(handler)
+    root.propagate = False
+    return root
+
+
+_log = _configure_logging()
+
+
+def _log_startup_banner() -> None:
+    """Log a clear, self-contained session header. Every bug report starts
+    here — tell me the session ID and I can tell you exactly what was running."""
+    import platform, sys as _sys
+    banner_lines = [
+        "=" * 70,
+        f"ScriptoScope session {_SESSION_ID} starting",
+        f"  version         : {__version__}",
+        f"  python          : {_sys.version.split()[0]} ({platform.python_implementation()})",
+        f"  platform        : {platform.platform()}",
+        f"  cwd             : {os.getcwd()}",
+        f"  argv            : {_sys.argv}",
+        f"  log file        : {_LOG_PATH}",
+        f"  pid             : {os.getpid()}",
+    ]
+    # Best-effort dependency version capture. importlib.metadata works for
+    # any installed distribution; module.__version__ is unreliable (e.g.
+    # rich doesn't expose it directly).
+    try:
+        from importlib.metadata import version as _pkg_version, PackageNotFoundError
+    except ImportError:
+        _pkg_version = None  # type: ignore
+
+    def _safe_version(dist_name: str, import_name: str) -> str:
+        if _pkg_version is not None:
+            try:
+                return _pkg_version(dist_name)
+            except Exception:
+                pass
+        try:
+            mod = __import__(import_name)
+            return getattr(mod, "__version__", "unknown")
+        except ImportError:
+            return "NOT INSTALLED"
+
+    for pkg_name, dist_name, import_name in [
+        ("textual", "textual", "textual"),
+        ("rich", "rich", "rich"),
+        ("biopython", "biopython", "Bio"),
+        ("pyhmmer", "pyhmmer", "pyhmmer"),
+    ]:
+        banner_lines.append(f"  {pkg_name:<15} : {_safe_version(dist_name, import_name)}")
+    banner_lines.append("=" * 70)
+    for line in banner_lines:
+        _log.info(line)
+
+
+def _install_exception_hooks() -> None:
+    """Capture unhandled exceptions from the main thread AND worker threads.
+    Without this, a crash in a background worker is silently lost to the TUI."""
+    import sys as _sys
+
+    prev_excepthook = _sys.excepthook
+
+    def _hook(exc_type, exc_value, exc_tb):
+        _log.critical(
+            "UNCAUGHT EXCEPTION (main thread)",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+        prev_excepthook(exc_type, exc_value, exc_tb)
+
+    _sys.excepthook = _hook
+
+    # threading.excepthook exists in Python 3.8+
+    prev_thread_hook = getattr(threading, "excepthook", None)
+
+    def _thread_hook(args):
+        _log.critical(
+            "UNCAUGHT EXCEPTION in thread %s",
+            args.thread.name if args.thread else "<unknown>",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+        if prev_thread_hook is not None:
+            prev_thread_hook(args)
+
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _thread_hook
+
+
+_install_exception_hooks()
 
 # ── third-party ───────────────────────────────────────────────────────────────
 from rich.console import Group
@@ -2311,11 +2440,16 @@ class SequenceViewer(ScrollableContainer):
     @work(exclusive=True, thread=True, group="seq-render")
     def _render_sequence_bg(self, t: Transcript, seq_width: int, scan_cache: dict | None) -> None:
         """Heavy sequence rendering on a background thread."""
+        scanned = scan_cache is not None and t.id in scan_cache
+        _log.debug(
+            "render_sequence_bg start id=%s length=%d width=%d scanned=%s",
+            t.id, t.length, seq_width, scanned,
+        )
         # Gather inputs
         orf = None
         hits: list[HmmerHit] = []
         try:
-            if scan_cache is not None and t.id in scan_cache:
+            if scanned:
                 all_hits = scan_cache[t.id]
                 hits = sorted(all_hits, key=lambda h: h.evalue)[:5]
                 orf = _find_longest_orf(t.sequence, t.id)
@@ -5343,7 +5477,15 @@ def main() -> None:
     )
     parser.add_argument("fasta", nargs="?", help="FASTA file to open on startup")
     args = parser.parse_args()
-    ScriptoScopeApp(startup_fasta=args.fasta or "").run()
+
+    _log_startup_banner()
+    try:
+        ScriptoScopeApp(startup_fasta=args.fasta or "").run()
+    except Exception:
+        _log.exception("App terminated with an unhandled exception")
+        raise
+    finally:
+        _log.info("ScriptoScope session %s ending", _SESSION_ID)
     os._exit(0)
 
 

@@ -129,6 +129,43 @@ The filter bar supports multiple criteria separated by spaces:
 | GC content | `gc>45` or `gc<60` | GC percentage threshold |
 | Pfam domain | `pfam:PF00069` or `pfam:kinase` | Transcripts with matching Pfam hits (after collection scan) |
 
+## Debugging & bug reports
+
+Every session writes a structured log. If you hit a bug, grab the last few hundred lines of the log file and share them — the log includes everything needed to diagnose the failure remotely.
+
+**Log location**: `/tmp/scriptoscope.log` by default. Override with the `SCRIPTOSCOPE_LOG` environment variable (e.g. `SCRIPTOSCOPE_LOG=~/scriptoscope.log scriptoscope ...`).
+
+**Rotation**: the file is capped at 5 MB with 3 backups (`scriptoscope.log.1`, `.log.2`, `.log.3`) — it can't grow unbounded.
+
+**Finding a specific session**: every session logs a startup banner with a unique 8-character session ID, and every log line is tagged with that ID. To extract just one session:
+
+```bash
+# Find recent session IDs
+grep "session .* starting" /tmp/scriptoscope.log | tail
+
+# Dump everything from one session
+grep "\[a1b2c3d4\]" /tmp/scriptoscope.log
+```
+
+**What the banner captures**:
+
+```
+ScriptoScope session a1b2c3d4 starting
+  version         : 0.6.0
+  python          : 3.12.3 (CPython)
+  platform        : Linux-...
+  cwd             : /home/user/work
+  argv            : ['scriptoscope', 'my.fasta']
+  log file        : /tmp/scriptoscope.log
+  pid             : 12345
+  textual         : 8.2.2
+  rich            : 14.3.3
+  biopython       : 1.87
+  pyhmmer         : 0.12.0
+```
+
+**Unhandled exceptions**: both main-thread and worker-thread uncaught exceptions are captured with full tracebacks via `sys.excepthook` and `threading.excepthook`. If ScriptoScope crashes silently, the log will still have the stack trace.
+
 ## Testing
 
 ```bash
