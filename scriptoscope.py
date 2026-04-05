@@ -2113,8 +2113,19 @@ def colorize_sequence_annotated(
     width: int = 60,
     highlight_range: tuple[int, int] | None = None,
     aa_highlight_range: tuple[int, int] | None = None,
+    focus_range: tuple[int, int] | None = None,
 ) -> SeqRenderResult:
-    """Render DNA with CDS amino-acid translation and Pfam domain tracks."""
+    """Render DNA with CDS amino-acid translation and Pfam domain tracks.
+
+    highlight_range: strong blue-background highlight over an arbitrary
+      window (used when navigating from a BLAST hit). Out-of-range bases
+      are dimmed.
+    focus_range: soft focus — bases inside the range keep their normal
+      per-base ACGT colors; bases outside the range are dimmed to gray.
+      Used when the user clicks the CDS arrow or AA translation line to
+      "focus" on an ORF without losing the per-base color information
+      inside the feature.
+    """
     truncated = len(seq) > _MAX_DISPLAY_BASES
     display_seq = seq[:_MAX_DISPLAY_BASES] if truncated else seq
     prefix_w = 0
@@ -2245,15 +2256,13 @@ def colorize_sequence_annotated(
     base_colors = _BASE_COLORS
 
     # DNA line style strategy:
-    # - In the ANNOTATED view (orf is set), use a uniform neutral color for
-    #   bases that don't carry special meaning (start codon, stop codon, or
-    #   a search-result highlight). Rich per-base ACGT coloring in this mode
-    #   creates ~75 spans per 100-char line, which bloats the rendered Text
-    #   to thousands of spans and slows every Textual repaint while the
-    #   sequence tab is visible. The user's attention is on the feature/Pfam
-    #   tracks here, not on individual nucleotides.
-    # - In the PLAIN view (no orf), per-base coloring is still useful so we
-    #   fall through to colorize_sequence() elsewhere.
+    # - highlight_range (BLAST nav): strong blue-background for in-range,
+    #   "dim" everywhere else.
+    # - focus_range (click on feat/aa line of an ORF): per-base ACGT colors
+    #   inside the range, "dim" outside. Preserves GC-at-a-glance inside
+    #   the focused feature while muting the rest of the transcript.
+    # - default (no highlight, no focus): per-base ACGT colors everywhere,
+    #   with start/stop codon overrides punched through via base_override.
     dna_styles: list[str] = [""] * n
     if highlight_range:
         hl_lo, hl_hi = highlight_range
@@ -2263,14 +2272,18 @@ def colorize_sequence_annotated(
                 dna_styles[pos] = hl_style
             else:
                 dna_styles[pos] = "dim"
-    elif orf:
-        # Annotated view — uniform DNA backbone, only start/stop overrides
-        # punch through. A handful of spans per line instead of ~75.
+    elif focus_range:
+        fr_lo, fr_hi = focus_range
         for pos in range(n):
-            override = base_override[pos]
-            dna_styles[pos] = override if override is not None else "white"
+            if fr_lo <= pos < fr_hi:
+                override = base_override[pos]
+                if override is not None:
+                    dna_styles[pos] = override
+                else:
+                    dna_styles[pos] = base_colors.get(display_seq[pos].upper(), "white")
+            else:
+                dna_styles[pos] = "dim"
     else:
-        # No ORF, no highlight — per-base coloring adds information here.
         for pos in range(n):
             override = base_override[pos]
             if override is not None:
@@ -2409,9 +2422,10 @@ class SequenceViewer(ScrollableContainer):
     _cds_dna: str = ""  # raw CDS DNA for clipboard copy
     _line_map: list[SeqLineInfo] = []
     _features: list[SeqFeatureRegion] = []
-    _highlight: tuple[int, int] | None = None
-    _aa_highlight: tuple[int, int] | None = None
-    _aa_highlight_seq: str = ""  # AA sequence for clipboard (N-term to C-term)
+    _highlight: tuple[int, int] | None = None      # strong BLAST nav highlight
+    _aa_highlight: tuple[int, int] | None = None   # AA line highlight
+    _aa_highlight_seq: str = ""                    # for clipboard (N→C)
+    _focus_range: tuple[int, int] | None = None    # soft focus — dim bases outside this range
     _last_orf: ORFCoord | None = None
     _last_hits: list[HmmerHit] = []
     _last_width: int = 60
@@ -2426,6 +2440,7 @@ class SequenceViewer(ScrollableContainer):
         self._highlight = None
         self._aa_highlight = None
         self._aa_highlight_seq = ""
+        self._focus_range = None
         if t:
             self.show_transcript(t)
         else:
@@ -2573,7 +2588,10 @@ class SequenceViewer(ScrollableContainer):
         # Render (expensive)
         if orf:
             hit_key = tuple((h.target_name, h.ali_from, h.ali_to) for h in hits)
-            cache_key = (t.id, seq_width, self._highlight, self._aa_highlight, hit_key)
+            cache_key = (
+                t.id, seq_width, self._highlight, self._aa_highlight,
+                self._focus_range, hit_key,
+            )
             render = self._seq_render_cache.get(cache_key)
             if render is not None:
                 self._seq_render_cache.move_to_end(cache_key)
@@ -2582,6 +2600,7 @@ class SequenceViewer(ScrollableContainer):
                     t.sequence, orf=orf, hits=hits, width=seq_width,
                     highlight_range=self._highlight,
                     aa_highlight_range=self._aa_highlight,
+                    focus_range=self._focus_range,
                 )
                 if len(self._seq_render_cache) >= self._RENDER_CACHE_MAX:
                     self._seq_render_cache.popitem(last=False)
@@ -2622,16 +2641,26 @@ class SequenceViewer(ScrollableContainer):
             self.app.notify("No CDS detected for this transcript", severity="warning")
 
     def _clear_highlights(self) -> None:
-        changed = self._highlight is not None or self._aa_highlight is not None
+        changed = (
+            self._highlight is not None
+            or self._aa_highlight is not None
+            or self._focus_range is not None
+        )
         self._highlight = None
         self._aa_highlight = None
         self._aa_highlight_seq = ""
+        self._focus_range = None
         if changed:
             self.show_transcript(self.transcript)
 
     @on(events.Click, "#seq-body")
     def _on_seq_body_click(self, event: events.Click) -> None:
-        """Click a feature/pfam line to highlight DNA; click AA line to highlight amino acids."""
+        """Click behavior in the sequence body:
+          - feat/pfam line click on a feature → focus the feature (dim bases
+            outside the feature range, keep per-base colors inside)
+          - AA line click on a feature → focus + copy the feature's aa seq
+          - DNA/blank/header click → clear focus, restore full per-base coloring
+        """
         if not self._line_map or not self._features:
             return
         event.stop()
@@ -2645,14 +2674,16 @@ class SequenceViewer(ScrollableContainer):
         nt_pos = line_info.chunk_start + (x - 1)
 
         if line_info.line_type in ("feat", "pfam"):
-            # Click on feature/pfam line → highlight DNA
+            # Click on feature/pfam line → focus the ORF/domain it belongs to.
             for feat in self._features:
                 if feat.nt_start <= nt_pos < feat.nt_end:
-                    new_hl = (feat.nt_start, feat.nt_end)
-                    if self._highlight == new_hl:
+                    new_focus = (feat.nt_start, feat.nt_end)
+                    if self._focus_range == new_focus and self._aa_highlight is None:
+                        # Already focused on this feature — toggle off.
                         self._clear_highlights()
                     else:
-                        self._highlight = new_hl
+                        self._focus_range = new_focus
+                        self._highlight = None
                         self._aa_highlight = None
                         self._aa_highlight_seq = ""
                         self.show_transcript(self.transcript)
@@ -2660,14 +2691,16 @@ class SequenceViewer(ScrollableContainer):
             self._clear_highlights()
 
         elif line_info.line_type == "aa":
-            # Click on AA line → highlight amino acids and copy to clipboard
+            # Click on AA line → focus the feature AND highlight its aa run
+            # for clipboard copy on Ctrl+C.
             for feat in self._features:
                 if feat.nt_start <= nt_pos < feat.nt_end:
-                    new_hl = (feat.nt_start, feat.nt_end)
-                    if self._aa_highlight == new_hl:
+                    new_focus = (feat.nt_start, feat.nt_end)
+                    if self._aa_highlight == new_focus:
                         self._clear_highlights()
                     else:
-                        self._aa_highlight = new_hl
+                        self._focus_range = new_focus
+                        self._aa_highlight = new_focus
                         self._aa_highlight_seq = feat.aa_seq
                         self._highlight = None
                         self.show_transcript(self.transcript)
@@ -2675,7 +2708,7 @@ class SequenceViewer(ScrollableContainer):
             self._clear_highlights()
 
         else:
-            # Clicked on DNA/blank/header — clear all highlights
+            # Clicked on DNA/blank/header — clear focus, return to default coloring
             self._clear_highlights()
 
     @on(events.Click, "#seq-cds-btn")
@@ -5446,6 +5479,7 @@ class ScriptoScopeApp(App):
             lo = min(hit.subject_start, hit.subject_end) - 1
             hi = max(hit.subject_start, hit.subject_end)
             sv._highlight = (lo, hi)
+            sv._focus_range = None  # BLAST highlight supersedes any prior focus
             sv.show_transcript(t)
         # Switch to sequence tab to show the hit
         self.query_one("#content-area", TabbedContent).active = "tab-sequence"
