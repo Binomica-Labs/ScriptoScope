@@ -2786,10 +2786,21 @@ class SequenceViewer(ScrollableContainer):
         else:
             content = _text_to_content(plain_text)
 
+        # Preserve scroll position when the render is just a highlight
+        # toggle (focus_range, aa_highlight) on the same transcript. We
+        # DON'T want to scroll to top every time the user clicks a feature
+        # arrow or AA line.  We DO want to scroll to top on a new transcript.
+        preserve_scroll = (
+            self._render_seq_id == t.id
+            and self._last_width == seq_width
+        )
+
         # Apply results on main thread — bail if user already switched transcripts
         def _apply() -> None:
             if self._render_seq_id != t.id:
                 return  # user clicked another transcript, discard
+            # Save scroll position BEFORE the content update resets it.
+            saved_y = self.scroll_y if preserve_scroll else 0
             self._cds_dna = cds_dna
             self._last_orf = orf
             self._last_hits = hits
@@ -2804,6 +2815,9 @@ class SequenceViewer(ScrollableContainer):
             # `content` is already a Textual Visual (Content) so update()
             # accepts it directly with zero conversion cost.
             body.update(content)  # type: ignore[arg-type]
+            # Restore scroll position after the content swap.
+            if preserve_scroll and saved_y > 0:
+                self.call_after_refresh(self.scroll_to, 0, saved_y, animate=False)
 
         self.app.call_from_thread(_apply)
 
