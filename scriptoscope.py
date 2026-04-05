@@ -2052,14 +2052,29 @@ def _text_to_content(text: "Text"):
     already a Visual and returns it as-is with zero extra work, so body.update
     is essentially free and subsequent paints use Content's fast native path.
 
-    CRITICAL: we pass console=None so Content.from_rich_text creates a
-    fresh temporary Console internally. Using the app's shared console
-    (active_app.get().console) from a worker thread causes lock contention
-    with the main-thread paint cycle — Rich's Console isn't thread-safe —
-    which manifests as multi-second stalls after HMM scans.
+    CRITICAL: we use a thread-local Console with explicit settings.
+    - Using the app's shared console → lock contention with paint cycle.
+    - Using console=None → Rich creates Console() with color_system="auto"
+      which runs terminal capability detection that blocks on worker threads
+      (no TTY access, especially on WSL2).
+    - Using a thread-local Console with force_terminal=True avoids both.
     """
     from textual.content import Content
-    return Content.from_rich_text(text, console=None)
+    tl = _render_console_local
+    console = getattr(tl, "console", None)
+    if console is None:
+        from rich.console import Console as RichConsole
+        console = RichConsole(
+            color_system="truecolor",
+            force_terminal=True,
+            width=200,      # oversize — Content rewraps on paint anyway
+            no_color=False,
+        )
+        tl.console = console
+    return Content.from_rich_text(text, console=console)
+
+
+_render_console_local = threading.local()
 
 
 @dataclass
