@@ -1895,12 +1895,17 @@ def pfam_db_exists(dest_dir: Path = _PFAM_DEFAULT_DIR) -> str | None:
 # colorblind-safe blue/orange pairing; within each pair a hue shift
 # distinguishes individual bases without breaking the family reading.
 #
-#   A = blue   (#0087ff)  \  cool — AT family
-#   T = cyan   (#00ffff)  /
-#   C = orange (#ff8700)  \  warm — GC family
-#   G = red    (#ff0000)  /
+#   A = blue        (#0087ff)  \  cool — AT family
+#   T = aquamarine  (#87ffd7)  /  (green-shifted for distance from A)
+#   C = orange      (#ff8700)  \  warm — GC family
+#   G = red         (#ff0000)  /
 #
-# All four are fixed xterm-256 color names (dodger_blue1, cyan1,
+# T is aquamarine1 rather than pure cyan so it's more distinguishable
+# from A (dodger_blue1) while still reading as "cool" — the AT-vs-GC
+# pair-grouping is preserved and an AT-rich region still shows as a
+# uniformly cool-toned band.
+#
+# All four are fixed xterm-256 color names (dodger_blue1, aquamarine1,
 # dark_orange, red1). The basic ANSI 16-color names (bright_blue,
 # bright_cyan, bright_red) are avoided because terminal themes remap
 # them freely — bright_blue in particular shows up as violet/purple
@@ -1908,8 +1913,8 @@ def pfam_db_exists(dest_dir: Path = _PFAM_DEFAULT_DIR) -> str | None:
 # 256-color names are RGB-anchored and render consistently.
 _BASE_COLORS = {
     "A": "bold dodger_blue1",
-    "T": "bold cyan1",
-    "U": "bold cyan1",
+    "T": "bold aquamarine1",
+    "U": "bold aquamarine1",
     "C": "bold dark_orange",
     "G": "bold red1",
     "N": "dim white",
@@ -2523,7 +2528,7 @@ class SequenceViewer(ScrollableContainer):
                     f"[bold dodger_blue1]A[/]:{counts['A']}  "
                     f"[bold dark_orange]C[/]:{counts['C']}  "
                     f"[bold red1]G[/]:{counts['G']}  "
-                    f"[bold cyan1]T[/]:{counts['T']}  "
+                    f"[bold aquamarine1]T[/]:{counts['T']}  "
                     f"[dim]N[/]:{counts['N']}"
                 ),
             )
