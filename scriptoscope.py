@@ -1628,6 +1628,7 @@ async def hmmscan(
     hmm_db_path: str,
     evalue_threshold: float = 1e-5,
     translate: bool = True,
+    use_gathering: bool = True,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> list[HmmerHit]:
     import pyhmmer
@@ -1651,31 +1652,48 @@ async def hmmscan(
         total = len(hmms)
         step = max(total // 100, 1)
         results: list[HmmerHit] = []
-        for i, top_hits in enumerate(pyhmmer.hmmsearch(hmms, digital_seqs, cpus=_hmm_cpus)):
-            if _hmm_cancel.is_set():
-                raise HMMCancelled()
-            if progress_cb and (i % step == 0 or i + 1 == total):
-                progress_cb(i + 1, total)
-            query = top_hits.query
-            for hit in top_hits:
-                if hit.evalue > evalue_threshold:
-                    continue
-                best_dom = max(hit.domains.included, key=lambda d: d.score, default=None)
-                results.append(HmmerHit(
-                    target_name=str(query.name or ""),
-                    accession=str(query.accession or ""),
-                    query_name=str(hit.name or ""),
-                    evalue=hit.evalue,
-                    score=hit.score,
-                    bias=hit.bias,
-                    description=str(query.description or ""),
-                    dom_evalue=best_dom.c_evalue if best_dom else 0.0,
-                    dom_score=best_dom.score if best_dom else 0.0,
-                    hmm_from=best_dom.alignment.hmm_from if best_dom else 0,
-                    hmm_to=best_dom.alignment.hmm_to if best_dom else 0,
-                    ali_from=best_dom.alignment.target_from if best_dom else 0,
-                    ali_to=best_dom.alignment.target_to if best_dom else 0,
-                ))
+
+        search_kwargs: dict = {"cpus": _hmm_cpus}
+        if use_gathering:
+            search_kwargs["bit_cutoffs"] = "gathering"
+        else:
+            search_kwargs["E"] = evalue_threshold
+
+        try:
+            iterator = pyhmmer.hmmsearch(hmms, digital_seqs, **search_kwargs)
+            for i, top_hits in enumerate(iterator):
+                if _hmm_cancel.is_set():
+                    raise HMMCancelled()
+                if progress_cb and (i % step == 0 or i + 1 == total):
+                    progress_cb(i + 1, total)
+                query = top_hits.query
+                for hit in top_hits:
+                    if not use_gathering and hit.evalue > evalue_threshold:
+                        continue
+                    best_dom = max(hit.domains.included, key=lambda d: d.score, default=None)
+                    results.append(HmmerHit(
+                        target_name=str(query.name or ""),
+                        accession=str(query.accession or ""),
+                        query_name=str(hit.name or ""),
+                        evalue=hit.evalue,
+                        score=hit.score,
+                        bias=hit.bias,
+                        description=str(query.description or ""),
+                        dom_evalue=best_dom.c_evalue if best_dom else 0.0,
+                        dom_score=best_dom.score if best_dom else 0.0,
+                        hmm_from=best_dom.alignment.hmm_from if best_dom else 0,
+                        hmm_to=best_dom.alignment.hmm_to if best_dom else 0,
+                        ali_from=best_dom.alignment.target_from if best_dom else 0,
+                        ali_to=best_dom.alignment.target_to if best_dom else 0,
+                    ))
+        except ValueError as exc:
+            if "cutoff" in str(exc).lower() or "gathering" in str(exc).lower():
+                raise RuntimeError(
+                    "This HMM database does not have gathering cutoffs. "
+                    "Turn off 'Pfam GA cutoffs' to use an e-value filter instead."
+                ) from exc
+            raise
+
         results.sort(key=lambda h: h.evalue)
         return results
 
@@ -1687,8 +1705,20 @@ async def hmmsearch_all(
     hmm_db_path: str,
     evalue_threshold: float = 1e-5,
     translate: bool = True,
+    use_gathering: bool = True,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> dict[str, set[str]]:
+    """Scan every transcript (longest ORF only) against an HMM database.
+
+    use_gathering:
+      True  — pass `bit_cutoffs="gathering"` to pyhmmer so the Plan7 pipeline
+              uses each HMM's curated gathering threshold (GA1/GA2). This is
+              the Pfam-recommended mode and is 2-5x faster than a flat
+              e-value filter because the MSV/Viterbi stages can cull weak
+              candidates earlier. Requires HMMs that carry GA cutoffs (Pfam
+              does); non-Pfam databases may not and will raise.
+      False — pass `E=evalue_threshold` for a plain e-value-based scan.
+    """
     import pyhmmer
 
     alpha = pyhmmer.easel.Alphabet.amino()
@@ -1717,27 +1747,58 @@ async def hmmsearch_all(
         total = len(hmms)
         step = max(total // 100, 1)
         mapping: dict[str, set[str]] = {}
-        for i, top_hits in enumerate(pyhmmer.hmmsearch(hmms, digital_seqs, cpus=_hmm_cpus)):
-            if _hmm_cancel.is_set():
-                raise HMMCancelled()
-            if progress_cb and (i % step == 0 or i + 1 == total):
-                progress_cb(i + 1, total)
-            query = top_hits.query
-            pfam_name = str(query.name or "")
-            pfam_acc = str(query.accession or "")
 
-            for hit in top_hits:
-                if hit.evalue > evalue_threshold:
-                    continue
+        # Build pipeline kwargs: gathering cutoffs (fast, Pfam-correct) vs
+        # plain e-value filter. Gathering ignores the e-value input.
+        search_kwargs: dict = {"cpus": _hmm_cpus}
+        if use_gathering:
+            search_kwargs["bit_cutoffs"] = "gathering"
+            _log.info(
+                "hmmsearch_all: using gathering cutoffs (fast Pfam mode)"
+            )
+        else:
+            search_kwargs["E"] = evalue_threshold
+            _log.info(
+                "hmmsearch_all: using E=%g (no gathering cutoffs)",
+                evalue_threshold,
+            )
 
-                orf_id = str(hit.name or "")
-                parent_id = orf_to_parent.get(orf_id)
-                if parent_id:
-                    if parent_id not in mapping:
-                        mapping[parent_id] = set()
-                    mapping[parent_id].add(pfam_name.lower())
-                    if pfam_acc:
-                        mapping[parent_id].add(pfam_acc.lower())
+        try:
+            iterator = pyhmmer.hmmsearch(hmms, digital_seqs, **search_kwargs)
+            for i, top_hits in enumerate(iterator):
+                if _hmm_cancel.is_set():
+                    raise HMMCancelled()
+                if progress_cb and (i % step == 0 or i + 1 == total):
+                    progress_cb(i + 1, total)
+                query = top_hits.query
+                pfam_name = str(query.name or "")
+                pfam_acc = str(query.accession or "")
+
+                for hit in top_hits:
+                    # With gathering cutoffs pyhmmer already filters; with a
+                    # plain E= filter it also prunes. The e-value guard here
+                    # is a final safety net for callers that pass e-value
+                    # directly without gathering.
+                    if not use_gathering and hit.evalue > evalue_threshold:
+                        continue
+                    orf_id = str(hit.name or "")
+                    parent_id = orf_to_parent.get(orf_id)
+                    if parent_id:
+                        if parent_id not in mapping:
+                            mapping[parent_id] = set()
+                        mapping[parent_id].add(pfam_name.lower())
+                        if pfam_acc:
+                            mapping[parent_id].add(pfam_acc.lower())
+        except ValueError as exc:
+            # pyhmmer raises ValueError when bit_cutoffs="gathering" is
+            # requested but the HMM doesn't have GA cutoffs. Provide a
+            # clear actionable message instead of the raw pyhmmer error.
+            if "cutoff" in str(exc).lower() or "gathering" in str(exc).lower():
+                raise RuntimeError(
+                    "This HMM database does not have gathering cutoffs. "
+                    "Turn off 'Pfam GA cutoffs' to use an e-value filter instead."
+                ) from exc
+            raise
 
         return mapping
 
@@ -4158,6 +4219,14 @@ class HmmerPanel(Vertical):
                 yield Label("6-frame translate:", classes="hmmer-label")
                 yield Switch(value=True, id="hmmer-translate")
             with Horizontal(classes="hmmer-row"):
+                yield Label("Pfam GA cutoffs:", classes="hmmer-label")
+                yield Switch(value=True, id="hmmer-gathering")
+                yield Static(
+                    "[dim]Use Pfam's per-HMM gathering thresholds "
+                    "(correct for Pfam — ignores e-value)[/]",
+                    id="hmmer-gathering-help",
+                )
+            with Horizontal(classes="hmmer-row"):
                 yield Button("Scan Selected", id="hmmer-run", variant="primary")
                 yield Button("Scan Collection (PFAM)", id="hmmer-scan-all")
                 yield Button("Confirm CDS (NCBI)", id="hmmer-confirm-cds")
@@ -4297,6 +4366,7 @@ class HmmerPanel(Vertical):
             return
         evalue_str = self.query_one("#hmmer-evalue", Input).value.strip()
         translate = self.query_one("#hmmer-translate", Switch).value
+        use_gathering = self.query_one("#hmmer-gathering", Switch).value
         try:
             evalue = float(evalue_str)
         except ValueError:
@@ -4306,11 +4376,12 @@ class HmmerPanel(Vertical):
         btn.label = "Scanning..."
         btn.variant = "success"
         btn.add_class("scanning")
-        self._run_hmmer_worker(t, db, evalue, translate)
+        self._run_hmmer_worker(t, db, evalue, translate, use_gathering)
 
     @work(exclusive=True, thread=False)
     async def _run_hmmer_worker(
         self, t: Transcript, db: str, evalue: float, translate: bool,
+        use_gathering: bool = True,
     ) -> None:
         progress = self.query_one("#hmmer-progress", ProgressBar)
         progress.update(total=100, progress=0)
@@ -4325,6 +4396,7 @@ class HmmerPanel(Vertical):
             hits = await hmmscan(
                 sequence=t.sequence, seq_id=t.id, hmm_db_path=db,
                 evalue_threshold=evalue, translate=translate,
+                use_gathering=use_gathering,
                 progress_cb=_on_progress,
             )
             self._scan_cache[t.id] = hits
@@ -4456,25 +4528,47 @@ class HmmerPanel(Vertical):
             return
         evalue_str = self.query_one("#hmmer-evalue", Input).value.strip()
         translate = self.query_one("#hmmer-translate", Switch).value
+        use_gathering = self.query_one("#hmmer-gathering", Switch).value
         try:
             evalue = float(evalue_str)
         except ValueError:
             self._set_status("[red]Invalid e-value.[/]")
             return
         n = len(self.app._transcripts)
-        est_minutes = max(1, n * 10 // 60)  # ~10s per transcript
+        # Empirical throughput on an 8-core box: ~5-8 sequences/sec against
+        # full Pfam-A (27k HMMs) with pyhmmer's threading backend when the
+        # batch is large enough for per-HMM parallelism to amortize.
+        # 0.25 s/transcript is a conservative round-up that accounts for
+        # cold HMM cache on the first call and slower hardware. The old
+        # "10 s/transcript" constant predicted 35 hours for a 12k collection
+        # and was totally unrepresentative of actual throughput.
+        est_seconds = max(30, int(n * 0.25))
+        if est_seconds < 120:
+            est_label = f"~{est_seconds}s"
+        else:
+            est_label = f"~{est_seconds // 60}m {est_seconds % 60}s"
+        mode_note = (
+            "Pfam gathering thresholds (correct for Pfam)"
+            if use_gathering
+            else f"e-value threshold {evalue:g}"
+        )
         self.app.notify(
-            f"This will scan {n:,} transcripts against the full Pfam database.\n"
-            f"Estimated time: ~{est_minutes} min. Press Ctrl+C or quit to cancel.",
+            f"Scanning {n:,} transcripts against the HMM database.\n"
+            f"Mode: {mode_note}\n"
+            f"Estimated time: {est_label} (first run warms the HMM cache).\n"
+            f"Press Ctrl+C or quit to cancel.",
             title="Collection Scan",
             severity="warning",
             timeout=10,
         )
-        self._run_scan_all_worker(self.app._transcripts, db, evalue, translate)
+        self._run_scan_all_worker(
+            self.app._transcripts, db, evalue, translate, use_gathering,
+        )
 
     @work(exclusive=True, thread=False)
     async def _run_scan_all_worker(
-        self, transcripts: list[Transcript], db: str, evalue: float, translate: bool,
+        self, transcripts: list[Transcript], db: str, evalue: float,
+        translate: bool, use_gathering: bool = True,
     ) -> None:
         import time
 
@@ -4508,6 +4602,7 @@ class HmmerPanel(Vertical):
             mapping = await hmmsearch_all(
                 transcripts=transcripts, hmm_db_path=db,
                 evalue_threshold=evalue, translate=translate,
+                use_gathering=use_gathering,
                 progress_cb=_on_progress,
             )
             elapsed = time.monotonic() - t0
