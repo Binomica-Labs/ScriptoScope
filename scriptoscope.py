@@ -2158,6 +2158,38 @@ def colorize_sequence_annotated(
             _emit("".join(chars[start:k]), run_style)
         _emit("\n")
 
+    def _flush_line_str(plain: str, styles: list[str]) -> None:
+        """Fast path for lines where the plain text is already a string.
+        Avoids the per-run `"".join(chars[start:k])` list-slice allocation
+        that _flush_line does. Used for the DNA line which is the single
+        hottest emitter in the render.
+
+        The spans are built by walking `styles` and slicing `plain`
+        directly — no intermediate list construction.
+        """
+        n_local = len(styles)
+        if n_local == 0:
+            _emit("\n")
+            return
+        # Inlined emit loop — avoids the function-call overhead of
+        # calling _emit once per run when there can be 75+ runs per line.
+        nonlocal offset
+        local_plain_parts = plain_parts
+        local_spans = spans
+        k = 0
+        while k < n_local:
+            run_style = styles[k]
+            start = k
+            while k < n_local and styles[k] == run_style:
+                k += 1
+            run_text = plain[start:k]
+            local_plain_parts.append(run_text)
+            if run_style:
+                local_spans.append(Span(offset, offset + (k - start), run_style))
+            offset += k - start
+        local_plain_parts.append("\n")
+        offset += 1
+
     # Header
     if orf:
         cds_color = _FRAME_COLORS.get((orf.strand, orf.frame), "bright_cyan")
@@ -2189,88 +2221,144 @@ def colorize_sequence_annotated(
             dom_aa = orf.sequence[aa_start:aa_end]
             features.append(SeqFeatureRegion(h.target_name, max(0, nt_dom_start), min(n, nt_dom_end), aa_seq=dom_aa))
 
-    for i in range(0, len(display_seq), width):
-        chunk = display_seq[i : i + width]
-        chunk_len = len(chunk)
+    # Precompute flat per-position style arrays ONCE for each line type.
+    # The chunk loop then just slices these arrays instead of rebuilding
+    # them character by character every chunk — previously the dominant
+    # cost (~1M list.appends per render for a 5 kb transcript).
+    base_colors = _BASE_COLORS
+
+    # DNA line style strategy:
+    # - In the ANNOTATED view (orf is set), use a uniform neutral color for
+    #   bases that don't carry special meaning (start codon, stop codon, or
+    #   a search-result highlight). Rich per-base ACGT coloring in this mode
+    #   creates ~75 spans per 100-char line, which bloats the rendered Text
+    #   to thousands of spans and slows every Textual repaint while the
+    #   sequence tab is visible. The user's attention is on the feature/Pfam
+    #   tracks here, not on individual nucleotides.
+    # - In the PLAIN view (no orf), per-base coloring is still useful so we
+    #   fall through to colorize_sequence() elsewhere.
+    dna_styles: list[str] = [""] * n
+    if highlight_range:
+        hl_lo, hl_hi = highlight_range
+        hl_style = "bold bright_white on dark_blue"
+        for pos in range(n):
+            if hl_lo <= pos < hl_hi:
+                dna_styles[pos] = hl_style
+            else:
+                dna_styles[pos] = "dim"
+    elif orf:
+        # Annotated view — uniform DNA backbone, only start/stop overrides
+        # punch through. A handful of spans per line instead of ~75.
+        for pos in range(n):
+            override = base_override[pos]
+            dna_styles[pos] = override if override is not None else "white"
+    else:
+        # No ORF, no highlight — per-base coloring adds information here.
+        for pos in range(n):
+            override = base_override[pos]
+            if override is not None:
+                dna_styles[pos] = override
+            else:
+                dna_styles[pos] = base_colors.get(display_seq[pos].upper(), "white")
+
+    # AA line: only populated positions have chars/styles; others are spaces.
+    if orf:
+        aa_chars: list[str] = [" "] * n
+        aa_styles: list[str] = [""] * n
+        aa_hl = aa_highlight_range
+        aa_hl_style = "bold bright_white on dark_magenta"
+        for pos in range(n):
+            glyph = aa_at[pos]
+            if glyph is None:
+                continue
+            aa_chars[pos] = glyph
+            if aa_hl:
+                if aa_hl[0] <= pos < aa_hl[1]:
+                    aa_styles[pos] = aa_hl_style
+                else:
+                    aa_styles[pos] = "dim"
+            else:
+                aa_styles[pos] = aa_color[pos]
+    else:
+        aa_chars = []
+        aa_styles = []
+
+    # Feature (CDS arrow) line: most positions are spaces.
+    if orf:
+        feat_line_chars: list[str] = [" "] * n
+        feat_line_styles: list[str] = [""] * n
+        for pos in range(n):
+            ch = feat_ch[pos]
+            if ch is None:
+                continue
+            feat_line_chars[pos] = ch
+            if ch in ("▓", "━"):
+                feat_line_styles[pos] = feat_color[pos]
+            else:
+                feat_line_styles[pos] = f"bold {feat_color[pos]}"
+    else:
+        feat_line_chars = []
+        feat_line_styles = []
+
+    # Pfam domain label line: most positions are spaces.
+    if hits and orf:
+        pfam_line_chars: list[str] = [" "] * n
+        pfam_line_styles: list[str] = [""] * n
+        for pos in range(n):
+            ch = pfam_label[pos]
+            if ch is None:
+                continue
+            if ch == "━":
+                pfam_line_chars[pos] = "▄"
+                pfam_line_styles[pos] = pfam_color[pos]
+            else:
+                pfam_line_chars[pos] = ch
+                pfam_line_styles[pos] = f"bold {pfam_color[pos]}"
+    else:
+        pfam_line_chars = []
+        pfam_line_styles = []
+
+    # Bitmaps of which chunks need feat / pfam / aa lines (avoids per-chunk
+    # `any(...)` scans over the sub-track arrays).
+    def _chunks_with_content(chars_arr: list[str]) -> set[int]:
+        if not chars_arr:
+            return set()
+        result = set()
+        for pos in range(n):
+            if chars_arr[pos] != " ":
+                result.add(pos // width)
+        return result
+
+    feat_chunks = _chunks_with_content(feat_line_chars)
+    pfam_chunks = _chunks_with_content(pfam_line_chars)
+    aa_chunks = _chunks_with_content(aa_chars)
+
+    for chunk_idx, i in enumerate(range(0, n, width)):
+        chunk_end = min(i + width, n)
+        chunk_len = chunk_end - i
 
         # CDS feature arrow
-        if orf:
-            has_feat = any(feat_ch[i + j] is not None for j in range(chunk_len) if i + j < n)
-            if has_feat:
-                line_ch: list[str] = []
-                line_st: list[str] = []
-                for j in range(chunk_len):
-                    pos = i + j
-                    if pos < n and feat_ch[pos] is not None:
-                        ch = feat_ch[pos]
-                        if ch in ("▓", "━"):
-                            line_ch.append(ch); line_st.append(feat_color[pos])
-                        else:
-                            line_ch.append(ch); line_st.append(f"bold {feat_color[pos]}")
-                    else:
-                        line_ch.append(" "); line_st.append("")
-                _flush_line(line_ch, line_st)
-                line_map.append(SeqLineInfo("feat", i, chunk_len))
-                cur_line += 1
+        if orf and chunk_idx in feat_chunks:
+            _flush_line(feat_line_chars[i:chunk_end], feat_line_styles[i:chunk_end])
+            line_map.append(SeqLineInfo("feat", i, chunk_len))
+            cur_line += 1
 
         # Pfam domain track
-        if hits and orf:
-            has_pfam = any(pfam_label[i + j] is not None for j in range(chunk_len) if i + j < n)
-            if has_pfam:
-                line_ch = []
-                line_st = []
-                for j in range(chunk_len):
-                    pos = i + j
-                    if pos < n and pfam_label[pos] is not None:
-                        ch = pfam_label[pos]
-                        if ch == "━":
-                            line_ch.append("▄"); line_st.append(pfam_color[pos])
-                        else:
-                            line_ch.append(ch); line_st.append(f"bold {pfam_color[pos]}")
-                    else:
-                        line_ch.append(" "); line_st.append("")
-                _flush_line(line_ch, line_st)
-                line_map.append(SeqLineInfo("pfam", i, chunk_len))
-                cur_line += 1
+        if hits and orf and chunk_idx in pfam_chunks:
+            _flush_line(pfam_line_chars[i:chunk_end], pfam_line_styles[i:chunk_end])
+            line_map.append(SeqLineInfo("pfam", i, chunk_len))
+            cur_line += 1
 
-        # DNA line
-        line_ch = []
-        line_st = []
-        for j in range(chunk_len):
-            pos = i + j
-            base = chunk[j]
-            if highlight_range and highlight_range[0] <= pos < highlight_range[1]:
-                line_ch.append(base); line_st.append("bold bright_white on dark_blue")
-            elif highlight_range:
-                line_ch.append(base); line_st.append("dim")
-            elif pos < n and base_override[pos] is not None:
-                line_ch.append(base); line_st.append(base_override[pos])
-            else:
-                line_ch.append(base); line_st.append(_BASE_COLORS.get(base.upper(), "white"))
-        _flush_line(line_ch, line_st)
+        # DNA line — use the fast string-slice path
+        _flush_line_str(display_seq[i:chunk_end], dna_styles[i:chunk_end])
         line_map.append(SeqLineInfo("dna", i, chunk_len))
         cur_line += 1
 
         # Amino acid translation line
-        if orf:
-            has_aa = any(aa_at[i + j] is not None for j in range(chunk_len) if i + j < n)
-            if has_aa:
-                line_ch = []
-                line_st = []
-                for j in range(chunk_len):
-                    pos = i + j
-                    if pos < n and aa_at[pos] is not None:
-                        if aa_highlight_range and aa_highlight_range[0] <= pos < aa_highlight_range[1]:
-                            line_ch.append(aa_at[pos]); line_st.append("bold bright_white on dark_magenta")
-                        elif aa_highlight_range:
-                            line_ch.append(aa_at[pos]); line_st.append("dim")
-                        else:
-                            line_ch.append(aa_at[pos]); line_st.append(aa_color[pos])
-                    else:
-                        line_ch.append(" "); line_st.append("")
-                _flush_line(line_ch, line_st)
-                line_map.append(SeqLineInfo("aa", i, chunk_len))
-                cur_line += 1
+        if orf and chunk_idx in aa_chunks:
+            _flush_line(aa_chars[i:chunk_end], aa_styles[i:chunk_end])
+            line_map.append(SeqLineInfo("aa", i, chunk_len))
+            cur_line += 1
 
         _emit("\n")
         line_map.append(SeqLineInfo("blank", i, chunk_len))
