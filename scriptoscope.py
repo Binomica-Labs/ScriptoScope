@@ -2051,14 +2051,15 @@ def _text_to_content(text: "Text"):
     hand Textual a ready-made Visual. Textual's visualize() sees it's
     already a Visual and returns it as-is with zero extra work, so body.update
     is essentially free and subsequent paints use Content's fast native path.
+
+    CRITICAL: we pass console=None so Content.from_rich_text creates a
+    fresh temporary Console internally. Using the app's shared console
+    (active_app.get().console) from a worker thread causes lock contention
+    with the main-thread paint cycle — Rich's Console isn't thread-safe —
+    which manifests as multi-second stalls after HMM scans.
     """
     from textual.content import Content
-    from textual.app import active_app
-    try:
-        console = active_app.get().console
-    except LookupError:
-        console = None
-    return Content.from_rich_text(text, console=console)
+    return Content.from_rich_text(text, console=None)
 
 
 @dataclass
@@ -2589,11 +2590,27 @@ class SequenceViewer(ScrollableContainer):
         yield TextArea("", id="seq-cds-area", read_only=True)
         yield Static("", id="seq-body")
 
+    _needs_annotation_refresh: bool = False
+
     def refresh_annotations(self) -> None:
-        """Re-render the sequence with current scan data from the HmmerPanel."""
+        """Re-render the sequence with current scan data from the HmmerPanel.
+
+        If the Sequence tab is not currently visible (user is on Hmmer/BLAST
+        tab), defer the render until the tab becomes active. Rendering a
+        hidden tab wastes ~55 ms of worker time AND uses a fallback width
+        (60) that doesn't match the actual display width, so the render
+        cache misses when the user eventually switches tabs.
+        """
         t = self.transcript
-        if t:
-            self.show_transcript(t)
+        if not t:
+            return
+        # Check if the Sequence tab is active by looking at our visibility.
+        # If the widget has zero width, it's in a hidden tab pane.
+        if self.size.width <= 4:
+            self._needs_annotation_refresh = True
+            return
+        self._needs_annotation_refresh = False
+        self.show_transcript(t)
 
     @on(Input.Submitted, "#seq-goto-input")
     def _goto_position(self, event: Input.Submitted) -> None:
@@ -2620,11 +2637,19 @@ class SequenceViewer(ScrollableContainer):
     _last_container_w: int = 0
 
     def on_resize(self, event) -> None:
-        """Re-render sequence when terminal/widget size changes."""
+        """Re-render sequence when terminal/widget size changes.
+
+        Also picks up any deferred annotation refresh that was skipped
+        because the Sequence tab was hidden at scan-completion time.
+        """
         w = self.size.width
-        if w == self._last_container_w:
-            return  # width unchanged — skip re-render
+        if w <= 4:
+            return  # still hidden — ignore
+        force = self._needs_annotation_refresh
+        if w == self._last_container_w and not force:
+            return  # width unchanged and no pending refresh
         self._last_container_w = w
+        self._needs_annotation_refresh = False
         t = self.transcript
         if t:
             self.show_transcript(t)
