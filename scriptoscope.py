@@ -4366,6 +4366,24 @@ class ScriptoScopeApp(App):
         # Cancel any in-flight work tied to the previous dataset.
         _hmm_cancel.set()
         _ncbi_blast_cancel.set()
+
+        # Pre-flight existence check to produce a clean error instead of a
+        # raw "[Errno 2] No such file or directory" toast.
+        p = Path(path).expanduser()
+        if not p.exists():
+            msg = f"Project file not found: {path}"
+            self.call_from_thread(self._set_status, f"[red]{msg}[/]")
+            self.call_from_thread(
+                self.notify,
+                f"{msg}\nThe entry may be stale — dropdown will refresh.",
+                title="File not found", severity="error", timeout=5,
+            )
+            self.call_from_thread(self._refresh_transcriptome_select)
+            return
+        if not p.is_file():
+            self.call_from_thread(self._set_status, f"[red]Not a file: {path}[/]")
+            return
+
         self.call_from_thread(self._set_status, f"Loading project {path}…")
         try:
             proj = load_project(path)
@@ -4373,6 +4391,20 @@ class ScriptoScopeApp(App):
             self.call_from_thread(self._set_status, f"[red]Invalid project: {exc}[/]")
             self.call_from_thread(
                 self.notify, str(exc), title="Invalid project", severity="error",
+            )
+            return
+        except FileNotFoundError:
+            msg = f"Project file disappeared during load: {path}"
+            self.call_from_thread(self._set_status, f"[red]{msg}[/]")
+            self.call_from_thread(
+                self.notify, msg, title="File not found", severity="error",
+            )
+            return
+        except PermissionError as exc:
+            self.call_from_thread(self._set_status, f"[red]Permission denied: {exc}[/]")
+            self.call_from_thread(
+                self.notify, f"Permission denied: {path}",
+                title="Load error", severity="error",
             )
             return
         except OSError as exc:
@@ -4618,6 +4650,33 @@ class ScriptoScopeApp(App):
         _hmm_cancel.set()
         _ncbi_blast_cancel.set()
 
+        # Pre-flight existence check — catches stale dropdown entries and
+        # dead command-line args before `load_all` turns them into raw
+        # "[Errno 2] No such file or directory" noise.
+        p = Path(path).expanduser()
+        if not p.exists():
+            msg = f"File not found: {path}"
+            self.call_from_thread(self.clear_notifications)
+            self.call_from_thread(self._set_status, f"[red]{msg}[/]")
+            self.call_from_thread(
+                self.notify,
+                f"{msg}\nThe entry may be stale — dropdown will refresh.",
+                title="File not found", severity="error", timeout=5,
+            )
+            # Refresh the dropdown to drop any stale entries.
+            self.call_from_thread(self._refresh_transcriptome_select)
+            return
+        if not p.is_file():
+            self.call_from_thread(self.clear_notifications)
+            self.call_from_thread(
+                self._set_status, f"[red]Not a file: {path}[/]",
+            )
+            self.call_from_thread(
+                self.notify, f"Not a regular file: {path}",
+                title="Load error", severity="error",
+            )
+            return
+
         self.call_from_thread(self._set_status, f"Loading {path}…")
         self.call_from_thread(
             self.notify, f"Loading {Path(path).name}…",
@@ -4634,7 +4693,25 @@ class ScriptoScopeApp(App):
                 self.notify, str(exc), title="Invalid FASTA", severity="error",
             )
             return
+        except FileNotFoundError:
+            # Race: file existed at pre-flight but vanished before load.
+            msg = f"File disappeared during load: {path}"
+            self.call_from_thread(self.clear_notifications)
+            self.call_from_thread(self._set_status, f"[red]{msg}[/]")
+            self.call_from_thread(
+                self.notify, msg, title="File not found", severity="error",
+            )
+            return
+        except PermissionError as exc:
+            self.call_from_thread(self.clear_notifications)
+            self.call_from_thread(self._set_status, f"[red]Permission denied: {exc}[/]")
+            self.call_from_thread(
+                self.notify, f"Permission denied: {path}",
+                title="Load error", severity="error",
+            )
+            return
         except Exception as exc:
+            _log.exception("Load fasta failed for %s", path)
             self.call_from_thread(self.clear_notifications)
             self.call_from_thread(self._set_status, f"[red]Error loading file: {exc}[/]")
             self.call_from_thread(

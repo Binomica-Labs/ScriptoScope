@@ -109,6 +109,14 @@ class TestFastaLoader:
         p.write_text("")
         assert load_all(str(p)) == []
 
+    def test_missing_fasta_raises_file_not_found(self, tmp_path: Path):
+        """Explicit: load_all on a missing path raises FileNotFoundError
+        (and the app's _load_fasta worker surfaces it as a user-friendly
+        "File not found" message instead of raw Errno 2)."""
+        missing = tmp_path / "does_not_exist.fasta"
+        with pytest.raises(FileNotFoundError):
+            load_all(str(missing))
+
 
 class TestComputeStats:
     def test_basic_stats(self, transcripts: list[Transcript]):
@@ -560,6 +568,41 @@ class TestHmmerPanel:
             status = hp.query_one("#hmmer-status", Static)
             text = status.content
             assert "No HMMER results" in text
+
+
+class TestMissingFileHandling:
+    """Regression: loading a non-existent path must surface a user-friendly
+    "File not found" error, never a raw [Errno 2] traceback, and never
+    clobber the previously loaded dataset with stale state."""
+
+    @pytest.mark.asyncio
+    async def test_load_missing_fasta_preserves_state(
+        self, app: ScriptoScopeApp, tmp_path: Path,
+    ):
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(1.0)
+            original_path = app._fasta_path
+            original_transcripts = list(app._transcripts)
+            bogus = str(tmp_path / "nope.fasta")
+            app._load_fasta(bogus)
+            await pilot.pause(1.0)
+            # A failed load must not clobber previously loaded state
+            assert app._fasta_path == original_path
+            assert app._transcripts == original_transcripts
+
+    @pytest.mark.asyncio
+    async def test_load_missing_project_preserves_state(
+        self, app: ScriptoScopeApp, tmp_path: Path,
+    ):
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(1.0)
+            original_path = app._fasta_path
+            original_transcripts = list(app._transcripts)
+            bogus = str(tmp_path / "nope.scriptoscope.json")
+            app._do_load_project(bogus)
+            await pilot.pause(1.0)
+            assert app._fasta_path == original_path
+            assert app._transcripts == original_transcripts
 
 
 class TestStatsPanel:
