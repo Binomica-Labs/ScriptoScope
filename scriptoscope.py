@@ -2038,36 +2038,27 @@ def colorize_sequence(seq: str, width: int = 60) -> Text:
     return Text("".join(plain_parts), spans=spans, no_wrap=False)
 
 
-class CachedSegmentRenderable:
-    """A Rich renderable that caches its Segment list per console width.
+def _text_to_content(text: "Text"):
+    """Convert a Rich Text to a Textual Content ONCE, outside the paint loop.
 
-    The sequence viewer generates Rich Text with thousands of spans. Rich's
-    default rendering pipeline re-resolves those spans into Segments on
-    EVERY paint the Textual compositor triggers — benchmarked at 60-90 ms
-    per paint for a ~5 kb transcript, way over the 33 ms/frame budget. The
-    UI becomes "nigh-inoperable" after a scan because every mouse move,
-    keystroke, or tick pays that cost.
+    When body.update(text) is called with a Rich Text, Textual's visualize()
+    runs Content.from_rich_text(text) to convert it to its native Content
+    format. That conversion is ~33 ms per call for a ~5k-span annotated
+    sequence render — enough to blow the 33 ms/frame budget on every click.
 
-    Wrapping the Text in this class flips the model: we pre-render to
-    Segments once at a given width, cache them, and yield them directly
-    from __rich_console__. Subsequent paints at the same width cost
-    essentially zero. Benchmarked at ~83x speedup (53 ms → 0.6 ms).
-
-    Width changes invalidate the cache and re-render from the source Text.
+    By pre-building the Content in the background render worker, we pay the
+    conversion cost once on the worker thread (off the main UI thread) and
+    hand Textual a ready-made Visual. Textual's visualize() sees it's
+    already a Visual and returns it as-is with zero extra work, so body.update
+    is essentially free and subsequent paints use Content's fast native path.
     """
-
-    def __init__(self, text: "Text") -> None:
-        self._text = text
-        self._cached_width: int | None = None
-        self._cached_segments: list | None = None
-
-    def __rich_console__(self, console, options):
-        from rich.segment import Segment
-        width = options.max_width
-        if self._cached_width != width or self._cached_segments is None:
-            self._cached_segments = list(console.render(self._text, options))
-            self._cached_width = width
-        yield from self._cached_segments
+    from textual.content import Content
+    from textual.app import active_app
+    try:
+        console = active_app.get().console
+    except LookupError:
+        console = None
+    return Content.from_rich_text(text, console=console)
 
 
 @dataclass
@@ -2753,6 +2744,17 @@ class SequenceViewer(ScrollableContainer):
                     self._seq_render_cache.popitem(last=False)
                 self._seq_render_cache[plain_key] = plain_text  # type: ignore[assignment]
 
+        # Pre-convert the Rich Text to a Textual Content on this worker thread.
+        # Textual's body.update(text) normally runs Content.from_rich_text()
+        # on the main thread — ~33 ms per call for a ~5k-span annotated
+        # render, which blows the 33 ms/frame budget. Doing it here moves
+        # that cost off the main UI thread.
+        content: object
+        if render is not None:
+            content = _text_to_content(render.text)
+        else:
+            content = _text_to_content(plain_text)
+
         # Apply results on main thread — bail if user already switched transcripts
         def _apply() -> None:
             if self._render_seq_id != t.id:
@@ -2762,17 +2764,15 @@ class SequenceViewer(ScrollableContainer):
             self._last_hits = hits
             self._last_width = seq_width
             body = self.query_one("#seq-body", Static)
-            # Wrap in CachedSegmentRenderable so Textual's per-paint cost
-            # drops from O(spans × text_length) to near-zero after the
-            # first paint. See CachedSegmentRenderable docstring.
             if render is not None:
                 self._line_map = render.line_map
                 self._features = render.features
-                body.update(CachedSegmentRenderable(render.text))
             else:
                 self._line_map = []
                 self._features = []
-                body.update(CachedSegmentRenderable(plain_text))
+            # `content` is already a Textual Visual (Content) so update()
+            # accepts it directly with zero conversion cost.
+            body.update(content)  # type: ignore[arg-type]
 
         self.app.call_from_thread(_apply)
 
