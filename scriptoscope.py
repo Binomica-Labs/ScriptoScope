@@ -1889,16 +1889,23 @@ def pfam_db_exists(dest_dir: Path = _PFAM_DEFAULT_DIR) -> str | None:
 # Sequence viewer widget
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Base colors chosen so GC content is visible at a glance:
-#   A = cyan, T/U = lime-green  → "cool" colors for AT pairs
-#   C = orange, G = red          → "warm" colors for GC pairs
-# A GC-rich region reads as a band of warm color; AT-rich as cool.
+# Base colors chosen so GC content is visible at a glance AND the scheme
+# remains legible for users with red-green color vision deficiency
+# (~8% of men). The primary AT-vs-GC signal uses the canonical
+# colorblind-safe blue/orange pairing; within each pair a hue shift
+# distinguishes individual bases without breaking the family reading.
+#
+#   A = blue,   T/U = cyan          → cool colors for A/T pairs
+#   C = orange, G   = red           → warm colors for G/C pairs
+#
+# A GC-rich stretch reads as a band of warm color, AT-rich as cool.
+# Red-green pairings are deliberately avoided.
 _BASE_COLORS = {
-    "A": "bold cyan",
-    "T": "bold bright_green",
-    "U": "bold bright_green",
+    "A": "bold bright_blue",
+    "T": "bold bright_cyan",
+    "U": "bold bright_cyan",
     "C": "bold dark_orange",
-    "G": "bold red",
+    "G": "bold red1",
     "N": "dim white",
 }
 _MAX_DISPLAY_BASES = 10_000
@@ -2492,10 +2499,10 @@ class SequenceViewer(ScrollableContainer):
             grid.add_row(
                 "Composition",
                 (
-                    f"[bold cyan]A[/]:{counts['A']}  "
+                    f"[bold bright_blue]A[/]:{counts['A']}  "
                     f"[bold dark_orange]C[/]:{counts['C']}  "
-                    f"[bold red]G[/]:{counts['G']}  "
-                    f"[bold bright_green]T[/]:{counts['T']}  "
+                    f"[bold red1]G[/]:{counts['G']}  "
+                    f"[bold bright_cyan]T[/]:{counts['T']}  "
                     f"[dim]N[/]:{counts['N']}"
                 ),
             )
