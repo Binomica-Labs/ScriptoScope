@@ -1984,31 +1984,58 @@ _MAX_DISPLAY_BASES = 10_000
 
 
 def colorize_sequence(seq: str, width: int = 60) -> Text:
+    """Render a plain (unannotated) DNA sequence with per-base ACGT coloring.
+
+    Builds the full plain text once (sequence + newlines at every `width`
+    chars) and emits pre-offset Spans in a single pass, then constructs one
+    Text object at the end. This avoids the ~4000 per-run Text.append calls
+    the naive RLE emit does, each of which runs Rich's strip_control_codes
+    validation — the dominant cost on plain unscanned clicks.
+    """
+    from rich.text import Span
     truncated = len(seq) > _MAX_DISPLAY_BASES
     display_seq = seq[:_MAX_DISPLAY_BASES] if truncated else seq
+    n = len(display_seq)
 
-    result = Text(no_wrap=False)
-    for i in range(0, len(display_seq), width):
-        chunk = display_seq[i : i + width]
-        run_base = chunk[0].upper()
-        run_chars: list[str] = [chunk[0]]
-        for base in chunk[1:]:
-            upper = base.upper()
-            if upper == run_base:
-                run_chars.append(base)
-            else:
-                result.append("".join(run_chars), style=_BASE_COLORS.get(run_base, "white"))
-                run_base = upper
-                run_chars = [base]
-        result.append("".join(run_chars), style=_BASE_COLORS.get(run_base, "white"))
-        result.append("\n")
+    if n == 0:
+        return Text("", no_wrap=False)
+
+    base_colors = _BASE_COLORS
+    default_style = "white"
+
+    # Build the plain string with newlines inserted every `width` chars,
+    # and emit spans for each RLE run adjusting for the newline offsets.
+    plain_parts: list[str] = []
+    spans: list[Span] = []
+    offset = 0
+
+    i = 0
+    while i < n:
+        chunk_end = min(i + width, n)
+        chunk = display_seq[i:chunk_end]
+        chunk_len = chunk_end - i
+        plain_parts.append(chunk)
+        # RLE the chunk by base-color bucket and emit spans.
+        k = 0
+        while k < chunk_len:
+            run_base_upper = chunk[k].upper()
+            start = k
+            k += 1
+            while k < chunk_len and chunk[k].upper() == run_base_upper:
+                k += 1
+            style = base_colors.get(run_base_upper, default_style)
+            spans.append(Span(offset + start, offset + k, style))
+        offset += chunk_len
+        plain_parts.append("\n")
+        offset += 1
+        i = chunk_end
 
     if truncated:
-        result.append(
-            f"\n  … {len(seq) - _MAX_DISPLAY_BASES:,} more bases not shown\n",
-            style="dim italic",
-        )
-    return result
+        footer = f"\n  … {len(seq) - _MAX_DISPLAY_BASES:,} more bases not shown\n"
+        plain_parts.append(footer)
+        spans.append(Span(offset, offset + len(footer), "dim italic"))
+
+    return Text("".join(plain_parts), spans=spans, no_wrap=False)
 
 
 @dataclass
@@ -2518,7 +2545,11 @@ class SequenceViewer(ScrollableContainer):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self._seq_render_cache: OrderedDict[tuple, SeqRenderResult] = OrderedDict()
+        # Stores both annotated (SeqRenderResult) and plain (Text) renders,
+        # disambiguated by the cache key shape. Plain-render keys are
+        # ("plain", id, length, width); annotated keys are the longer tuple
+        # that includes orf/hits/highlight state.
+        self._seq_render_cache: OrderedDict[tuple, object] = OrderedDict()
 
     def compose(self) -> ComposeResult:
         yield Static("Select a transcript from the list.", id="seq-info")
@@ -2676,7 +2707,19 @@ class SequenceViewer(ScrollableContainer):
 
         plain_text = None
         if not orf:
-            plain_text = colorize_sequence(t.sequence, width=seq_width)
+            # Cache plain renders in the same OrderedDict as annotated ones,
+            # keyed with a "plain:" prefix so they don't collide. Re-clicking
+            # a previously-seen unscanned transcript hits the cache instantly.
+            plain_key = ("plain", t.id, t.length, seq_width)
+            cached_plain = self._seq_render_cache.get(plain_key)
+            if cached_plain is not None:
+                self._seq_render_cache.move_to_end(plain_key)
+                plain_text = cached_plain  # type: ignore[assignment]
+            else:
+                plain_text = colorize_sequence(t.sequence, width=seq_width)
+                if len(self._seq_render_cache) >= self._RENDER_CACHE_MAX:
+                    self._seq_render_cache.popitem(last=False)
+                self._seq_render_cache[plain_key] = plain_text  # type: ignore[assignment]
 
         # Apply results on main thread — bail if user already switched transcripts
         def _apply() -> None:
