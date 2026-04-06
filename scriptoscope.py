@@ -6340,7 +6340,9 @@ class HmmerPanel(Vertical):
             btn.variant = "default"
             btn.remove_class("scanning")
         except HMMCancelled:
-            self._set_status("[dim]Scan cancelled — no partial results saved.[/]")
+            # Single-transcript scan: partial results aren't useful
+            # (we need the full HMM profile pass to get correct e-values).
+            self._set_status("[dim]Scan cancelled.[/]")
             self._reset_scan_button()
         except Exception as exc:
             self._set_status(f"[red]Error: {exc}[/]")
@@ -6492,7 +6494,20 @@ class HmmerPanel(Vertical):
             btn.variant = "default"
             btn.remove_class("scanning")
         except HMMCancelled:
-            self._set_status("[dim]Scan cancelled — partial results discarded.[/]")
+            # Bacterial/collection scan: results committed so far are kept.
+            scan_dt = _time.monotonic() - scan_t0
+            existing = len(self._scan_cache.get(t.id, []))
+            if existing:
+                self._set_status(
+                    f"[yellow]Scan cancelled after {scan_dt:.1f}s — "
+                    f"{existing} hits from completed genes preserved.[/]"
+                )
+                try:
+                    self.app._auto_save_annotations()
+                except Exception:
+                    pass
+            else:
+                self._set_status("[dim]Scan cancelled — no results yet.[/]")
             self._reset_scan_button()
         except Exception as exc:
             self._set_status(f"[red]Error: {exc}[/]")
@@ -6699,16 +6714,25 @@ class HmmerPanel(Vertical):
             self.app._pfam_hits = mapping
             self._set_status(
                 f"[green]Collection scan complete: {len(mapping)} transcripts "
-                f"with hits ({elapsed_str}).[/]"
+                f"with hits ({elapsed_str}) — saved.[/]"
             )
-            # Auto-save annotations after collection scan
             try:
                 self.app._auto_save_annotations()
             except Exception:
                 _log.exception("Auto-save after collection scan failed")
             self.app._apply_filter()
         except HMMCancelled:
-            self._set_status("[dim]Collection scan cancelled.[/]")
+            # hmmsearch_all accumulates hits as it iterates HMM profiles.
+            # On cancel, the partial mapping was built inside the function
+            # but not returned. However, any PREVIOUS scan results in
+            # _pfam_hits are untouched (we only overwrite on success).
+            elapsed = time.monotonic() - t0
+            prev = len(self.app._pfam_hits)
+            self._set_status(
+                f"[yellow]Collection scan cancelled after "
+                f"{int(elapsed // 60)}m {int(elapsed % 60)}s. "
+                f"Previous annotations ({prev} transcripts) preserved.[/]"
+            )
         except Exception as exc:
             self._set_status(f"[red]Scan failed: {exc}[/]")
             _log.exception("HmmerPanel._run_scan_all_worker failed: %s", exc)
