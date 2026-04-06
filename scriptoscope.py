@@ -5202,11 +5202,12 @@ class ScriptoScopeApp(App):
             except Exception:
                 pass
             self._set_status(
-                f"[green]{len(transcripts):,} transcripts loaded from project[/]"
+                f"[green]{len(transcripts):,} transcripts loaded from project — ready[/]"
             )
+            self.clear_notifications()
             self.notify(
-                f"Project loaded: {len(transcripts):,} transcripts",
-                title="Project", severity="information", timeout=3,
+                f"Project loaded: {len(transcripts):,} transcripts — ready",
+                title="Ready", severity="information", timeout=3,
             )
             # Stats are no longer auto-computed — user triggers via button
             try:
@@ -5561,13 +5562,14 @@ class ScriptoScopeApp(App):
             self._refresh_transcriptome_select()
         except Exception:
             _log.exception("refresh_transcriptome_select raised during load apply")
-        status_msg = f"[green]{len(transcripts):,} transcripts loaded from {path}[/]"
+        status_msg = f"[green]{len(transcripts):,} transcripts loaded from {path} — ready[/]"
         if dup_shortfall:
             status_msg += f" [yellow](dedup anomaly: {dup_shortfall})[/]"
         self._set_status(status_msg)
+        self.clear_notifications()
         self.notify(
-            f"{len(transcripts):,} transcripts loaded",
-            title="Transcriptome", severity="information", timeout=3,
+            f"{len(transcripts):,} transcripts loaded — ready",
+            title="Ready", severity="information", timeout=3,
         )
         # Stats are no longer auto-computed — user triggers via the
         # "Compute Statistics" button in the Statistics tab.
