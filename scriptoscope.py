@@ -675,17 +675,36 @@ _LIBRARY_PATH = Path.home() / ".scriptoscope" / "library.json"
 
 
 def load_library() -> list[dict]:
-    """Load the library registry. Returns empty list on any error."""
+    """Load the library registry. Returns empty list on any error.
+
+    Automatically prunes entries whose FASTA files no longer exist
+    (temp files from test runs, deleted downloads, moved files).
+    """
     if not _LIBRARY_PATH.is_file():
         return []
     try:
         with open(_LIBRARY_PATH, "r", encoding="utf-8") as fh:
             raw = json.load(fh)
         entries = raw.get("transcriptomes", [])
-        return entries if isinstance(entries, list) else []
+        if not isinstance(entries, list):
+            return []
     except (json.JSONDecodeError, OSError) as exc:
         _log.warning("Failed to load library: %s", exc)
         return []
+
+    # Prune stale entries (missing FASTA files, temp paths)
+    valid = []
+    pruned = 0
+    for entry in entries:
+        p = entry.get("fasta_path", "")
+        if not p or p.startswith("/tmp/") or not Path(p).is_file():
+            pruned += 1
+            continue
+        valid.append(entry)
+    if pruned:
+        _log.info("Pruned %d stale library entries", pruned)
+        save_library(valid)
+    return valid
 
 
 def save_library(entries: list[dict]) -> None:
@@ -715,7 +734,13 @@ def save_library(entries: list[dict]) -> None:
 def register_transcriptome(
     fasta_path: str, name: str, organism: str, transcript_count: int,
 ) -> None:
-    """Register or update a transcriptome in the library."""
+    """Register or update a transcriptome in the library.
+
+    Files in /tmp/ are silently skipped — they are test artifacts that
+    get cleaned up and would leave stale library entries.
+    """
+    if fasta_path.startswith("/tmp/"):
+        return
     entries = load_library()
     resolved = str(Path(fasta_path).resolve())
     has_ann = _annotation_path(fasta_path).is_file()
