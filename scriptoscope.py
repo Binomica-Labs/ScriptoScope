@@ -38,7 +38,7 @@ import tempfile
 import threading
 import time
 import urllib.request
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
 from functools import lru_cache
 from pathlib import Path
@@ -2368,8 +2368,9 @@ def _kozak_score(seq: str, atg_pos: int) -> float:
         if offset < 0:
             pos = atg_pos + offset
         else:
-            # +4 means 4th position counting from the A in ATG (A=+1, T=+2, G=+3, next=+4)
-            pos = atg_pos + 2 + offset  # ATG occupies +1,+2,+3 so +4 is atg_pos+3
+            # Kozak +4 = first base after ATG. In 0-based coords:
+            # A=+1→atg_pos, T=+2→atg_pos+1, G=+3→atg_pos+2, +4→atg_pos+3
+            pos = atg_pos + offset - 1
         if 0 <= pos < len(s):
             base = s[pos]
             total += weights.get(base, 0.0)
@@ -5448,7 +5449,7 @@ class SaveProjectModal(ModalScreen[str | None]):
             if app._fasta_path:
                 try:
                     orf_cache: dict = {}
-                    for (tid, _length, _fp), orf in _longest_orf_cache.items():
+                    for (tid, _length, _fp), orf in list(_longest_orf_cache.items()):
                         if orf is not None and tid in app._by_id:
                             orf_cache[tid] = orf
                     save_annotations(
@@ -7423,7 +7424,7 @@ class ScriptoScopeApp(App):
             # Build orf_cache from the global _longest_orf_cache, filtered to
             # transcript IDs in the current dataset.
             orf_cache: dict = {}
-            for (tid, _length, _fp), orf in _longest_orf_cache.items():
+            for (tid, _length, _fp), orf in list(_longest_orf_cache.items()):
                 if orf is not None and tid in self._by_id:
                     orf_cache[tid] = orf
 
@@ -7545,90 +7546,6 @@ class ScriptoScopeApp(App):
     # ── Library panel (replaces old Select dropdown) ───────────────────────
 
     _refreshing_library: bool = False
-
-    def _discover_transcriptome_files(self) -> list[tuple[str, str]]:
-        """Build library entries from the persistent registry plus downloads dir.
-
-        Returns list of (label, path) tuples sorted by last_opened (newest first).
-        Also auto-discovers un-registered downloads.
-        """
-        entries = load_library()
-
-        # Also scan downloads dir for un-registered FASTA files
-        dl_dir = Path.home() / ".scriptoscope" / "downloads"
-        registered_paths = {
-            str(Path(e.get("fasta_path", "")).resolve())
-            for e in entries
-        }
-        if dl_dir.is_dir():
-            for f in dl_dir.iterdir():
-                try:
-                    if not f.is_file():
-                        continue
-                    if f.suffix not in (".fasta", ".fa", ".fna"):
-                        continue
-                    resolved = str(f.resolve())
-                    if resolved in registered_paths:
-                        continue
-                    # Auto-discover: read meta if available
-                    meta_path = f.with_suffix(".meta.json")
-                    organism = ""
-                    if meta_path.is_file():
-                        try:
-                            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                            organism = meta.get("organism", "")
-                        except Exception:
-                            pass
-                    label = organism if organism else f.stem
-                    entries.append({
-                        "fasta_path": str(f),
-                        "name": f.stem,
-                        "organism": organism,
-                        "transcript_count": 0,
-                        "scanned_count": 0,
-                        "last_opened": "",
-                        "has_annotations": _annotation_path(str(f)).is_file(),
-                    })
-                except OSError:
-                    continue
-
-        # If a FASTA is currently loaded and not in entries, add it
-        if self._fasta_path:
-            path_resolved = str(Path(self._fasta_path).resolve())
-            if not any(
-                str(Path(e.get("fasta_path", "")).resolve()) == path_resolved
-                for e in entries
-            ):
-                entries.append({
-                    "fasta_path": self._fasta_path,
-                    "name": Path(self._fasta_path).stem,
-                    "organism": "",
-                    "transcript_count": len(self._transcripts),
-                    "scanned_count": 0,
-                    "last_opened": datetime.datetime.now().isoformat(timespec="seconds"),
-                    "has_annotations": False,
-                })
-
-        # Sort by last_opened descending (empty dates at the end)
-        entries.sort(
-            key=lambda e: e.get("last_opened", "") or "",
-            reverse=True,
-        )
-
-        result: list[tuple[str, str]] = []
-        seen: set[str] = set()
-        for e in entries:
-            fp = e.get("fasta_path", "")
-            if not fp:
-                continue
-            resolved = str(Path(fp).resolve())
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            organism = e.get("organism", "")
-            name = organism if organism else e.get("name", Path(fp).stem)
-            result.append((name, fp))
-        return result
 
     def _refresh_library_table(self) -> None:
         """Refresh the library panel DataTable with known transcriptomes."""
@@ -7934,7 +7851,7 @@ class ScriptoScopeApp(App):
                             else:
                                 orf_dna = t.sequence[nt_s:nt_e]
                                 orf_dna = orf_dna.upper().translate(
-                                    str.maketrans("ACGTN", "TGCAN")
+                                    _RC_TABLE
                                 )[::-1]
                             aa_seq = _translate_orf_dna(orf_dna)
                             orf = ORFCoord(
