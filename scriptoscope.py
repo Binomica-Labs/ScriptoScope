@@ -3091,23 +3091,21 @@ async def hmmsearch_all(
     translate: bool = True,
     use_gathering: bool = True,
     progress_cb: Callable[[int, int], None] | None = None,
-) -> dict[str, set[str]]:
+) -> tuple[dict[str, set[str]], dict[str, list[HmmerHit]]]:
     """Scan every transcript (longest ORF only) against an HMM database.
 
-    use_gathering:
-      True  — pass `bit_cutoffs="gathering"` to pyhmmer so the Plan7 pipeline
-              uses each HMM's curated gathering threshold (GA1/GA2). This is
-              the Pfam-recommended mode and is 2-5x faster than a flat
-              e-value filter because the MSV/Viterbi stages can cull weak
-              candidates earlier. Requires HMMs that carry GA cutoffs (Pfam
-              does); non-Pfam databases may not and will raise.
-      False — pass `E=evalue_threshold` for a plain e-value-based scan.
+    Returns (pfam_mapping, scan_hits) where:
+    - pfam_mapping: transcript_id → set of Pfam family/accession names
+      (lowercase, for filtering)
+    - scan_hits: transcript_id → list of full HmmerHit objects (for the
+      annotated sequence viewer — contains ali_from/ali_to coordinates
+      needed to position domains on the protein)
     """
     import pyhmmer
 
     alpha = pyhmmer.easel.Alphabet.amino()
 
-    def _run() -> dict[str, set[str]]:
+    def _run() -> tuple[dict[str, set[str]], dict[str, list]]:
         digital_seqs = []
         orf_to_parent: dict[str, str] = {}
 
@@ -3125,12 +3123,14 @@ async def hmmsearch_all(
                 orf_to_parent[t.id] = t.id
 
         if not digital_seqs:
-            return {}
+            return {}, {}
 
         hmms = _hmm_cache.get(hmm_db_path)
         total = len(hmms)
         step = max(total // 100, 1)
         mapping: dict[str, set[str]] = {}
+        # Full per-transcript hit lists for the annotated sequence viewer.
+        scan_hits: dict[str, list] = {}
 
         # Build pipeline kwargs: gathering cutoffs (fast, Pfam-correct) vs
         # plain e-value filter. Gathering ignores the e-value input.
@@ -3173,6 +3173,26 @@ async def hmmsearch_all(
                         mapping[parent_id].add(pfam_name.lower())
                         if pfam_acc:
                             mapping[parent_id].add(pfam_acc.lower())
+                        # Also store full HmmerHit for the annotated view.
+                        best_dom = max(hit.domains.included, key=lambda d: d.score, default=None)
+                        full_hit = HmmerHit(
+                            target_name=pfam_name,
+                            accession=pfam_acc,
+                            query_name=orf_id,
+                            evalue=hit.evalue,
+                            score=hit.score,
+                            bias=hit.bias,
+                            description=str(query.description or ""),
+                            dom_evalue=best_dom.c_evalue if best_dom else 0.0,
+                            dom_score=best_dom.score if best_dom else 0.0,
+                            hmm_from=best_dom.alignment.hmm_from if best_dom else 0,
+                            hmm_to=best_dom.alignment.hmm_to if best_dom else 0,
+                            ali_from=best_dom.alignment.target_from if best_dom else 0,
+                            ali_to=best_dom.alignment.target_to if best_dom else 0,
+                        )
+                        if parent_id not in scan_hits:
+                            scan_hits[parent_id] = []
+                        scan_hits[parent_id].append(full_hit)
         except ValueError as exc:
             # pyhmmer raises ValueError when bit_cutoffs="gathering" is
             # requested but the HMM doesn't have GA cutoffs. Provide a
@@ -3184,7 +3204,10 @@ async def hmmsearch_all(
                 ) from exc
             raise
 
-        return mapping
+        # Sort each transcript's hits by e-value
+        for tid in scan_hits:
+            scan_hits[tid].sort(key=lambda h: h.evalue)
+        return mapping, scan_hits
 
     return await asyncio.get_running_loop().run_in_executor(None, _run)
 
@@ -6936,7 +6959,7 @@ class HmmerPanel(Vertical):
 
         try:
             _hmm_cancel.clear()
-            mapping = await hmmsearch_all(
+            mapping, scan_hits = await hmmsearch_all(
                 transcripts=transcripts, hmm_db_path=db,
                 evalue_threshold=evalue, translate=translate,
                 use_gathering=use_gathering,
@@ -6945,6 +6968,19 @@ class HmmerPanel(Vertical):
             elapsed = time.monotonic() - t0
             elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
             self.app._pfam_hits = mapping
+            # Populate scan_cache with full HmmerHit objects so the
+            # annotated sequence viewer can show domain positions when
+            # the user clicks individual transcripts after a collection scan.
+            try:
+                hmmer_panel = self
+                for tid, hits in scan_hits.items():
+                    hmmer_panel._scan_cache[tid] = hits
+                _log.info(
+                    "Collection scan: populated scan_cache for %d transcripts",
+                    len(scan_hits),
+                )
+            except Exception:
+                _log.exception("Failed to populate scan_cache from collection scan")
             self._set_status(
                 f"[green]Collection scan complete: {len(mapping)} transcripts "
                 f"with hits ({elapsed_str}) — saved.[/]"
