@@ -514,7 +514,7 @@ def load_project(path: str | Path) -> dict:
 # Annotation sidecar files
 # ══════════════════════════════════════════════════════════════════════════════
 
-_ANNOTATION_VERSION = 3
+_ANNOTATION_VERSION = 4
 
 
 def _annotation_path(fasta_path: str) -> Path:
@@ -530,6 +530,7 @@ def save_annotations(
     bookmarks: set,
     orf_cache: dict,
     predictions: dict | None = None,
+    prodigal_cache: dict | None = None,
 ) -> None:
     """Save annotation sidecar file next to the FASTA. Atomic write."""
     data: dict = {"version": _ANNOTATION_VERSION}
@@ -588,6 +589,25 @@ def save_annotations(
         }
     else:
         data["predictions"] = {}
+
+    if prodigal_cache:
+        data["prodigal_cache"] = {
+            tid: [
+                {
+                    "gene_id": g.gene_id,
+                    "start": g.start,
+                    "end": g.end,
+                    "strand": g.strand,
+                    "partial": g.partial,
+                    "score": g.score,
+                    "aa_sequence": g.aa_sequence,
+                }
+                for g in genes
+            ]
+            for tid, genes in prodigal_cache.items()
+        }
+    else:
+        data["prodigal_cache"] = {}
 
     dest = _annotation_path(fasta_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -696,10 +716,34 @@ def load_annotations(fasta_path: str) -> dict | None:
                 _log.warning("Skipping malformed CDSPrediction for %s: %s", tid, exc)
     result["predictions"] = predictions
 
+    # prodigal_cache — reconstruct ProdigalGene objects
+    prodigal_cache: dict[str, list[ProdigalGene]] = {}
+    for tid, gene_list in (raw.get("prodigal_cache") or {}).items():
+        if not isinstance(gene_list, list):
+            continue
+        genes: list[ProdigalGene] = []
+        for g in gene_list:
+            if isinstance(g, dict):
+                try:
+                    genes.append(ProdigalGene(
+                        gene_id=str(g.get("gene_id", "")),
+                        start=int(g.get("start", 0)),
+                        end=int(g.get("end", 0)),
+                        strand=str(g.get("strand", "+")),
+                        partial=str(g.get("partial", "00")),
+                        score=float(g.get("score", 0.0)),
+                        aa_sequence=str(g.get("aa_sequence", "")),
+                    ))
+                except (TypeError, ValueError) as exc:
+                    _log.warning("Skipping malformed ProdigalGene for %s: %s", tid, exc)
+        if genes:
+            prodigal_cache[str(tid)] = genes
+    result["prodigal_cache"] = prodigal_cache
+
     _log.info(
-        "Loaded annotations sidecar: %s (scan=%d, confirm=%d, pfam=%d, bookmarks=%d, predictions=%d)",
+        "Loaded annotations sidecar: %s (scan=%d, confirm=%d, pfam=%d, bookmarks=%d, predictions=%d, prodigal=%d)",
         dest, len(scan_cache), len(confirm_cache), len(pfam_hits),
-        len(result["bookmarks"]), len(predictions),
+        len(result["bookmarks"]), len(predictions), len(prodigal_cache),
     )
     return result
 
@@ -1722,6 +1766,224 @@ def find_best_orf(
 
     # The opposite-strand ORF is much longer: use that instead
     return longest_overall, detected_strand, all_orfs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Prodigal integration — bacterial/archaeal gene prediction
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def prodigal_available() -> bool:
+    """Check if prodigal is in PATH."""
+    try:
+        subprocess.run(
+            ["prodigal", "-v"], capture_output=True, check=False,
+        )
+        return True
+    except FileNotFoundError:
+        return False
+
+
+@dataclass
+class ProdigalGene:
+    """A single gene predicted by Prodigal."""
+    gene_id: str           # e.g. "transcript_1_1"
+    start: int             # 0-based nucleotide start on the transcript
+    end: int               # 0-based nucleotide end (exclusive)
+    strand: str            # '+' or '-'
+    partial: str           # '00'=complete, '10'=no start, '01'=no stop, '11'=neither
+    score: float           # Prodigal confidence score
+    aa_sequence: str       # translated protein sequence
+
+
+def parse_prodigal_gff(gff_text: str, protein_text: str) -> dict[str, list[ProdigalGene]]:
+    """Parse Prodigal GFF3 + protein FASTA output into ProdigalGene objects.
+
+    GFF3 format per gene:
+    seq_id  Prodigal_v2  CDS  start  end  score  strand  frame  attributes
+    Attributes include: ID=1_1;partial=00;start_type=ATG;...
+
+    Protein FASTA has headers like >1_1 # start # end # strand # attributes
+    """
+    # Parse protein FASTA into a dict: gene_id -> aa_sequence
+    proteins: dict[str, str] = {}
+    current_id = ""
+    current_seq: list[str] = []
+    for line in protein_text.splitlines():
+        if line.startswith(">"):
+            if current_id and current_seq:
+                proteins[current_id] = "".join(current_seq).rstrip("*")
+            # Header: >seqid_genenum # start # end # strand # attrs
+            parts = line[1:].split("#")
+            current_id = parts[0].strip()
+            current_seq = []
+        elif current_id:
+            current_seq.append(line.strip())
+    if current_id and current_seq:
+        proteins[current_id] = "".join(current_seq).rstrip("*")
+
+    # Parse GFF3 lines
+    result: dict[str, list[ProdigalGene]] = {}
+    for line in gff_text.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        cols = line.split("\t")
+        if len(cols) < 9:
+            continue
+        if cols[2] != "CDS":
+            continue
+
+        seq_id = cols[0]
+        # Prodigal GFF uses 1-based inclusive coordinates
+        gff_start = int(cols[3])  # 1-based
+        gff_end = int(cols[4])    # 1-based inclusive
+        score = float(cols[5]) if cols[5] != "." else 0.0
+        strand = cols[6]
+
+        # Convert to 0-based half-open: start = gff_start - 1, end = gff_end
+        nt_start = gff_start - 1
+        nt_end = gff_end
+
+        # Parse attributes
+        attrs: dict[str, str] = {}
+        for attr in cols[8].split(";"):
+            if "=" in attr:
+                k, v = attr.split("=", 1)
+                attrs[k.strip()] = v.strip()
+
+        gene_num = attrs.get("ID", "0")
+        gene_id = f"{seq_id}_{gene_num}"
+        partial = attrs.get("partial", "00")
+
+        aa_seq = proteins.get(gene_id, "")
+
+        gene = ProdigalGene(
+            gene_id=gene_id,
+            start=nt_start,
+            end=nt_end,
+            strand=strand,
+            partial=partial,
+            score=score,
+            aa_sequence=aa_seq,
+        )
+        if seq_id not in result:
+            result[seq_id] = []
+        result[seq_id].append(gene)
+
+    return result
+
+
+def run_prodigal(
+    transcripts: list[Transcript], meta: bool = True,
+) -> dict[str, list[ProdigalGene]]:
+    """Run Prodigal on all transcripts and return predicted genes per transcript.
+
+    Uses -p meta mode (no training, good for unknown organisms).
+    Writes all transcripts to a temp FASTA, runs prodigal,
+    parses GFF3 output + protein output.
+
+    Returns: dict mapping transcript_id -> list of ProdigalGene
+    """
+    if not prodigal_available():
+        raise RuntimeError(
+            "Prodigal is not installed or not in PATH. "
+            "Install with: conda install -c bioconda prodigal"
+        )
+
+    tmp_dir = tempfile.mkdtemp(prefix="scriptoscope_prodigal_")
+    fasta_path = os.path.join(tmp_dir, "input.fasta")
+    prot_path = os.path.join(tmp_dir, "proteins.fasta")
+    gff_path = os.path.join(tmp_dir, "output.gff")
+
+    try:
+        # Write multi-FASTA
+        with open(fasta_path, "w", encoding="utf-8") as fh:
+            for t in transcripts:
+                fh.write(f">{t.id}\n")
+                seq = t.sequence
+                for i in range(0, len(seq), 80):
+                    fh.write(seq[i:i + 80])
+                    fh.write("\n")
+
+        # Run Prodigal
+        mode = "meta" if meta else "single"
+        cmd = [
+            "prodigal",
+            "-i", fasta_path,
+            "-f", "gff",
+            "-p", mode,
+            "-a", prot_path,
+            "-o", gff_path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if proc.returncode != 0:
+            raise RuntimeError(f"Prodigal failed (exit {proc.returncode}): {proc.stderr[:500]}")
+
+        # Read outputs
+        with open(gff_path, "r", encoding="utf-8") as fh:
+            gff_text = fh.read()
+        prot_text = ""
+        if os.path.isfile(prot_path):
+            with open(prot_path, "r", encoding="utf-8") as fh:
+                prot_text = fh.read()
+
+        return parse_prodigal_gff(gff_text, prot_text)
+    finally:
+        # Clean up
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def run_prodigal_single(
+    sequence: str, seq_id: str, meta: bool = True,
+) -> list[ProdigalGene]:
+    """Run Prodigal on a single transcript. For quick per-transcript scanning."""
+    t = Transcript(id=seq_id, description="", sequence=sequence)
+    result = run_prodigal([t], meta=meta)
+    return result.get(seq_id, [])
+
+
+def suggest_bacterial_mode(transcripts: list[Transcript]) -> bool:
+    """Heuristic: suggest bacterial mode if the transcriptome looks prokaryotic.
+
+    Indicators:
+    - Mean transcript length > 2000 (operons are long)
+    - High coding density (>80% of transcript is ORF)
+    - Multiple long ORFs per transcript on the same strand
+    """
+    if not transcripts:
+        return False
+
+    # Sample up to 50 transcripts for speed
+    sample = transcripts[:50] if len(transcripts) > 50 else transcripts
+    lengths = [t.length for t in sample]
+    mean_len = sum(lengths) / len(lengths) if lengths else 0
+
+    if mean_len < 2000:
+        return False
+
+    # Check coding density on a subset
+    high_density_count = 0
+    multi_orf_count = 0
+    for t in sample[:20]:
+        orf = _find_longest_orf(t.sequence, t.id)
+        if orf and orf.aa_length * 3 > t.length * 0.6:
+            high_density_count += 1
+        # Check for multiple ORFs on the same strand
+        all_orfs = _six_frame_orf_coords(t.sequence, t.id, min_aa=50)
+        plus_orfs = [o for o in all_orfs if o.strand == "+"]
+        minus_orfs = [o for o in all_orfs if o.strand == "-"]
+        if len(plus_orfs) >= 2 or len(minus_orfs) >= 2:
+            multi_orf_count += 1
+
+    checked = min(20, len(sample))
+    if checked == 0:
+        return False
+
+    density_frac = high_density_count / checked
+    multi_frac = multi_orf_count / checked
+
+    # Suggest bacterial if >60% have high coding density AND >40% have multiple ORFs
+    return density_frac > 0.6 and multi_frac > 0.4
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3125,6 +3387,296 @@ def _build_pfam_track(
     return sorted_hits, domain_colors
 
 
+# ── Gene colors for multi-gene display ──
+_GENE_COLORS = [
+    "bright_red", "bright_green", "bright_blue",
+    "bright_yellow", "bright_magenta", "bright_cyan",
+    # Beyond 6, fall through to _DOMAIN_PALETTE
+] + list(_DOMAIN_PALETTE)
+
+
+def colorize_sequence_multigene(
+    seq: str,
+    genes: list["ProdigalGene"],
+    width: int = 60,
+    highlight_range: tuple[int, int] | None = None,
+    focus_range: tuple[int, int] | None = None,
+) -> SeqRenderResult:
+    """Render DNA with multiple Prodigal-predicted gene tracks.
+
+    Each gene gets its own CDS arrow line + AA translation below the DNA,
+    colored distinctly. Start/stop codons for ALL genes are highlighted on
+    the DNA line.
+    """
+    from rich.text import Span
+
+    truncated = len(seq) > _MAX_DISPLAY_BASES
+    display_seq = seq[:_MAX_DISPLAY_BASES] if truncated else seq
+    n = len(display_seq)
+
+    # Assign a color to each gene
+    gene_colors: list[str] = []
+    for gi in range(len(genes)):
+        gene_colors.append(_GENE_COLORS[gi % len(_GENE_COLORS)])
+
+    # Per-position arrays for base overrides (start/stop codon highlights)
+    base_override: list[str | None] = [None] * n
+
+    # Mark start/stop codons for ALL genes on the DNA
+    for gi, gene in enumerate(genes):
+        g_start = gene.start
+        g_end = gene.end
+        # Start codon highlight (first 3 bases of the gene region)
+        if gene.strand == "+":
+            sc_pos = g_start
+        else:
+            sc_pos = g_end - 3
+        if 0 <= sc_pos and sc_pos + 2 < n:
+            for k in range(3):
+                base_override[sc_pos + k] = "bold bright_white on green"
+        # Stop codon highlight (last 3 bases)
+        if gene.strand == "+":
+            stop_pos = g_end - 3
+        else:
+            stop_pos = g_start
+        if 0 <= stop_pos and stop_pos + 2 < n:
+            for k in range(3):
+                base_override[stop_pos + k] = "bold bright_white on red"
+
+    # Build output using same approach as colorize_sequence_annotated
+    plain_parts: list[str] = []
+    spans: list[Span] = []
+    offset = 0
+    line_map: list[SeqLineInfo] = []
+    features: list[SeqFeatureRegion] = []
+    cur_line = 0
+
+    def _emit(text: str, style: str = "") -> None:
+        nonlocal offset
+        if not text:
+            return
+        plain_parts.append(text)
+        if style:
+            spans.append(Span(offset, offset + len(text), style))
+        offset += len(text)
+
+    def _flush_line(chars: list[str], styles: list[str]) -> None:
+        n_local = len(chars)
+        if n_local == 0:
+            _emit("\n")
+            return
+        k = 0
+        while k < n_local:
+            run_style = styles[k]
+            start = k
+            while k < n_local and styles[k] == run_style:
+                k += 1
+            _emit("".join(chars[start:k]), run_style)
+        _emit("\n")
+
+    def _flush_line_str(plain: str, styles: list[str]) -> None:
+        nonlocal offset
+        n_local = len(styles)
+        if n_local == 0:
+            _emit("\n")
+            return
+        local_plain_parts = plain_parts
+        local_spans = spans
+        k = 0
+        while k < n_local:
+            run_style = styles[k]
+            start = k
+            while k < n_local and styles[k] == run_style:
+                k += 1
+            run_text = plain[start:k]
+            local_plain_parts.append(run_text)
+            if run_style:
+                local_spans.append(Span(offset, offset + (k - start), run_style))
+            offset += k - start
+        local_plain_parts.append("\n")
+        offset += 1
+
+    # ── Header: Prodigal summary ──
+    _emit("  Prodigal: ", "bold bright_white")
+    _emit(f"{len(genes)} gene(s) predicted", "dim")
+    _emit(" (bacterial mode)", "dim italic")
+    _emit("\n")
+    line_map.append(SeqLineInfo("header", 0, 0))
+    cur_line += 1
+
+    for gi, gene in enumerate(genes):
+        color = gene_colors[gi]
+        aa_len = len(gene.aa_sequence)
+        partial_label = {
+            "00": "complete", "10": "no start",
+            "01": "no stop", "11": "partial",
+        }.get(gene.partial, gene.partial)
+        frame_num = ((gene.start % 3) + 1) if gene.strand == "+" else ((gene.end % 3) + 1)
+        tag = f"{gene.strand}f{frame_num}"
+        _emit(f"  gene{gi+1}: ", f"bold {color}")
+        _emit(f"{tag}  {gene.start+1}-{gene.end}", f"{color}")
+        _emit(f"  ({aa_len} aa, score={gene.score:.1f})", f"dim {color}")
+        _emit(f"  {partial_label}", "dim")
+        _emit("\n")
+        line_map.append(SeqLineInfo("header", 0, 0))
+        cur_line += 1
+        features.append(SeqFeatureRegion(
+            f"gene{gi+1}", gene.start, gene.end, aa_seq=gene.aa_sequence,
+        ))
+
+    _emit("  ")
+    _emit(" ATG ", "bold bright_white on green")
+    _emit(" ", "dim")
+    _emit(" STOP ", "bold bright_white on red")
+    _emit("\n\n")
+    line_map.append(SeqLineInfo("header", 0, 0))
+    line_map.append(SeqLineInfo("header", 0, 0))
+    cur_line += 2
+
+    # Precompute per-gene feature/AA arrays
+    # For each gene: feat_chars, feat_styles, aa_chars, aa_styles
+    gene_feat: list[tuple[list[str], list[str]]] = []
+    gene_aa: list[tuple[list[str], list[str]]] = []
+    for gi, gene in enumerate(genes):
+        color = gene_colors[gi]
+        fc = [" "] * n
+        fs = [""] * n
+        ac = [" "] * n
+        a_s = [""] * n
+
+        g_start = gene.start
+        g_end = gene.end
+        # CDS arrow body
+        for pos in range(max(0, g_start), min(n, g_end)):
+            fc[pos] = "\u2593"  # ▓
+            fs[pos] = color
+        # Gene label
+        label = f"gene{gi+1}"
+        nt_len = g_end - g_start
+        if nt_len >= len(label) + 4:
+            label_start = g_start + (nt_len - len(label)) // 2
+            for ci, ch in enumerate(label):
+                lp = label_start + ci
+                if 0 <= lp < n:
+                    fc[lp] = ch
+                    fs[lp] = f"bold {color}"
+        # Arrow tip
+        if gene.strand == "+":
+            tip_pos = min(g_end - 1, n - 1)
+            if 0 <= tip_pos:
+                fc[tip_pos] = "\u25b6"  # ▶
+                fs[tip_pos] = f"bold reverse {color}"
+        else:
+            tip_pos = max(g_start, 0)
+            if tip_pos < n:
+                fc[tip_pos] = "\u25c0"  # ◀
+                fs[tip_pos] = f"bold reverse {color}"
+
+        gene_feat.append((fc, fs))
+
+        # AA translation
+        aa_seq = gene.aa_sequence
+        for aa_idx in range(len(aa_seq)):
+            if gene.strand == "+":
+                codon_start = g_start + aa_idx * 3
+            else:
+                codon_start = g_end - (aa_idx + 1) * 3
+            if codon_start < 0 or codon_start + 2 >= n:
+                continue
+            mid = codon_start + 1
+            ac[mid] = aa_seq[aa_idx]
+            a_s[mid] = color
+
+        gene_aa.append((ac, a_s))
+
+    # DNA styles
+    base_colors = _BASE_COLORS
+    dna_styles: list[str] = [""] * n
+    if highlight_range:
+        hl_lo, hl_hi = highlight_range
+        hl_style = "bold bright_white on dark_blue"
+        for pos in range(n):
+            if hl_lo <= pos < hl_hi:
+                dna_styles[pos] = hl_style
+            else:
+                dna_styles[pos] = "dim"
+    elif focus_range:
+        fr_lo, fr_hi = focus_range
+        focus_style = "bold bright_white on dark_blue"
+        for pos in range(n):
+            if fr_lo <= pos < fr_hi:
+                override = base_override[pos]
+                if override is not None:
+                    dna_styles[pos] = override
+                else:
+                    dna_styles[pos] = focus_style
+            else:
+                dna_styles[pos] = "dim"
+    else:
+        for pos in range(n):
+            override = base_override[pos]
+            if override is not None:
+                dna_styles[pos] = override
+            else:
+                dna_styles[pos] = base_colors.get(display_seq[pos].upper(), "white")
+
+    # Determine which chunks have content for each gene
+    def _gene_chunks(chars: list[str]) -> set[int]:
+        result = set()
+        for pos in range(n):
+            if chars[pos] != " ":
+                result.add(pos // width)
+        return result
+
+    gene_feat_chunks = [_gene_chunks(fc) for fc, _ in gene_feat]
+    gene_aa_chunks = [_gene_chunks(ac) for ac, _ in gene_aa]
+
+    # Render chunks
+    for chunk_idx, i in enumerate(range(0, n, width)):
+        chunk_end = min(i + width, n)
+        chunk_len = chunk_end - i
+
+        # Gene CDS arrow tracks
+        for gi in range(len(genes)):
+            if chunk_idx in gene_feat_chunks[gi]:
+                fc, fs = gene_feat[gi]
+                _flush_line(fc[i:chunk_end], fs[i:chunk_end])
+                line_map.append(SeqLineInfo("feat", i, chunk_len))
+                cur_line += 1
+
+        # DNA line
+        _flush_line_str(display_seq[i:chunk_end], dna_styles[i:chunk_end])
+        line_map.append(SeqLineInfo("dna", i, chunk_len))
+        cur_line += 1
+
+        # Gene AA translation tracks
+        for gi in range(len(genes)):
+            if chunk_idx in gene_aa_chunks[gi]:
+                ac, a_s = gene_aa[gi]
+                _flush_line(ac[i:chunk_end], a_s[i:chunk_end])
+                line_map.append(SeqLineInfo("aa", i, chunk_len))
+                cur_line += 1
+
+        # Separator
+        has_tracks = any(
+            chunk_idx in gene_feat_chunks[gi] or chunk_idx in gene_aa_chunks[gi]
+            for gi in range(len(genes))
+        )
+        if has_tracks:
+            _emit("\n")
+            line_map.append(SeqLineInfo("blank", i, chunk_len))
+            cur_line += 1
+
+    if truncated:
+        _emit(
+            f"\n  … {len(seq) - _MAX_DISPLAY_BASES:,} more bases not shown\n",
+            "dim italic",
+        )
+
+    result_text = Text("".join(plain_parts), spans=spans, no_wrap=False)
+    return SeqRenderResult(text=result_text, line_map=line_map, features=features)
+
+
 def colorize_sequence_annotated(
     seq: str,
     orf: ORFCoord | None = None,
@@ -3780,6 +4332,16 @@ class SequenceViewer(ScrollableContainer):
             "render_sequence_bg start id=%s length=%d width=%d scanned=%s",
             t.id, t.length, seq_width, scanned,
         )
+
+        # Check for Prodigal multi-gene data
+        prodigal_genes: list[ProdigalGene] | None = None
+        try:
+            prodigal_cache = getattr(self.app, "_prodigal_cache", {})
+            if t.id in prodigal_cache:
+                prodigal_genes = prodigal_cache[t.id]
+        except Exception:
+            pass
+
         # Gather inputs
         orf = None
         hits: list[HmmerHit] = []
@@ -3806,7 +4368,14 @@ class SequenceViewer(ScrollableContainer):
         # 1. SeqRenderResult (Text + line_map + features) — keyed by render state
         # 2. Textual Content (pre-converted from Text) — same key, avoids the
         #    ~40-90ms _text_to_content call on cache hits
-        if orf:
+        use_multigene = prodigal_genes is not None and len(prodigal_genes) > 0
+        if use_multigene:
+            n_genes = len(prodigal_genes)
+            cache_key = (
+                "multigene", t.id, seq_width, self._highlight,
+                self._focus_range, n_genes,
+            )
+        elif orf:
             hit_key = tuple((h.target_name, h.ali_from, h.ali_to) for h in hits)
             has_all_orfs = best_orf_all is not None and len(best_orf_all) > 0
             cache_key = (
@@ -3824,7 +4393,7 @@ class SequenceViewer(ScrollableContainer):
 
         if cached_content is not None and cached_render is not None:
             # Full cache hit — skip both render and content conversion
-            render = cached_render if orf else None
+            render = cached_render if (orf or use_multigene) else None
             content = cached_content
             self._seq_render_cache.move_to_end(cache_key)
             self._content_cache.move_to_end(cache_key)
@@ -3837,7 +4406,13 @@ class SequenceViewer(ScrollableContainer):
             # Cache miss — do the work
             render = None
             plain_text = None
-            if orf:
+            if use_multigene:
+                render = colorize_sequence_multigene(
+                    t.sequence, genes=prodigal_genes, width=seq_width,
+                    highlight_range=self._highlight,
+                    focus_range=self._focus_range,
+                )
+            elif orf:
                 render = colorize_sequence_annotated(
                     t.sequence, orf=orf, hits=hits, width=seq_width,
                     highlight_range=self._highlight,
@@ -3874,7 +4449,8 @@ class SequenceViewer(ScrollableContainer):
             # (no focus, no highlight), also render the CDS-focused variant
             # so the user's first click on the feature is a cache hit.
             # This eliminates the 200-280ms cold-click cost on large ORFs.
-            if (orf and self._focus_range is None
+            # Skip pre-warming for multigene renders (different cache key shape).
+            if (orf and not use_multigene and self._focus_range is None
                     and self._highlight is None and self._aa_highlight is None):
                 cds_focus = (orf.nt_start, orf.nt_end)
                 focus_key = (t.id, seq_width, None, None, cds_focus, hit_key, best_orf_strand, has_all_orfs)
@@ -5520,6 +6096,14 @@ class HmmerPanel(Vertical):
                     id="hmmer-gathering-help",
                 )
             with Horizontal(classes="hmmer-row"):
+                yield Label("Bacterial mode:", classes="hmmer-label")
+                yield Switch(value=False, id="hmmer-bacterial")
+                yield Static(
+                    "[dim]Use Prodigal gene prediction instead of 6-frame ORF "
+                    "(for prokaryotic / operon transcriptomes)[/]",
+                    id="hmmer-bacterial-help",
+                )
+            with Horizontal(classes="hmmer-row"):
                 yield Button("Scan Selected", id="hmmer-run", variant="primary")
                 yield Button("Scan Collection (PFAM)", id="hmmer-scan-all")
                 yield Button("Confirm CDS (NCBI)", id="hmmer-confirm-cds")
@@ -5636,6 +6220,7 @@ class HmmerPanel(Vertical):
         if t is None:
             self._set_status("[yellow]Select a transcript first.[/]")
             return
+        bacterial = self.query_one("#hmmer-bacterial", Switch).value
         # Check cache first — instant result
         if t.id in self._scan_cache:
             hits = self._scan_cache[t.id]
@@ -5669,7 +6254,10 @@ class HmmerPanel(Vertical):
         btn.label = "Scanning..."
         btn.variant = "success"
         btn.add_class("scanning")
-        self._run_hmmer_worker(t, db, evalue, translate, use_gathering)
+        if bacterial:
+            self._run_bacterial_scan_worker(t, db, evalue, use_gathering)
+        else:
+            self._run_hmmer_worker(t, db, evalue, translate, use_gathering)
 
     @work(exclusive=True, thread=False)
     async def _run_hmmer_worker(
@@ -5725,6 +6313,139 @@ class HmmerPanel(Vertical):
             self._reset_scan_button()
         except Exception as exc:
             self._set_status(f"[red]Error: {exc}[/]")
+            self._reset_scan_button()
+        finally:
+            progress.remove_class("running")
+
+    @work(exclusive=True, thread=False)
+    async def _run_bacterial_scan_worker(
+        self, t: Transcript, db: str, evalue: float,
+        use_gathering: bool = False,
+    ) -> None:
+        """Bacterial mode: run Prodigal gene prediction, then scan each gene's
+        protein against the HMM database."""
+        import time as _time
+        progress = self.query_one("#hmmer-progress", ProgressBar)
+        progress.update(total=100, progress=0)
+        progress.add_class("running")
+        self._set_status(f"Running Prodigal on {t.short_id}…")
+
+        scan_t0 = _time.monotonic()
+        try:
+            # Step 1: Run Prodigal in a thread
+            loop = asyncio.get_running_loop()
+            genes = await loop.run_in_executor(
+                None, run_prodigal_single, t.sequence, t.id, True,
+            )
+            if not genes:
+                self._set_status("[yellow]Prodigal found no genes in this transcript.[/]")
+                self._reset_scan_button()
+                return
+
+            # Cache Prodigal results
+            self.app._prodigal_cache[t.id] = genes
+            n_genes = len(genes)
+            self._set_status(
+                f"Prodigal found {n_genes} gene(s) — scanning against Pfam…"
+            )
+
+            # Step 2: Write gene proteins to multi-FASTA and run hmmsearch
+            import pyhmmer
+            alpha = pyhmmer.easel.Alphabet.amino()
+            digital_seqs = []
+            gene_id_map: dict[str, str] = {}  # gene_id -> gene_id (for tracking)
+
+            for gene in genes:
+                if not gene.aa_sequence:
+                    continue
+                ts = pyhmmer.easel.TextSequence(
+                    name=gene.gene_id, sequence=gene.aa_sequence,
+                )
+                digital_seqs.append(ts.digitize(alpha))
+                gene_id_map[gene.gene_id] = gene.gene_id
+
+            if not digital_seqs:
+                self._set_status("[yellow]No translatable genes found by Prodigal.[/]")
+                self._reset_scan_button()
+                return
+
+            def _on_progress(current: int, total: int) -> None:
+                self.app.call_from_thread(self._show_progress, current, total)
+
+            _hmm_cancel.clear()
+
+            def _run_hmm() -> list[HmmerHit]:
+                hmms = _hmm_cache.get(db)
+                total = len(hmms)
+                step = max(total // 100, 1)
+                results: list[HmmerHit] = []
+
+                search_kwargs: dict = {"cpus": _hmm_cpus}
+                if use_gathering:
+                    search_kwargs["bit_cutoffs"] = "gathering"
+                else:
+                    search_kwargs["E"] = evalue
+
+                iterator = pyhmmer.hmmsearch(hmms, digital_seqs, **search_kwargs)
+                for i, top_hits in enumerate(iterator):
+                    if _hmm_cancel.is_set():
+                        raise HMMCancelled()
+                    if _on_progress and (i % step == 0 or i + 1 == total):
+                        _on_progress(i + 1, total)
+                    query = top_hits.query
+                    for hit in top_hits:
+                        if not use_gathering and hit.evalue > evalue:
+                            continue
+                        best_dom = max(
+                            hit.domains.included, key=lambda d: d.score, default=None,
+                        )
+                        results.append(HmmerHit(
+                            target_name=str(query.name or ""),
+                            accession=str(query.accession or ""),
+                            query_name=str(hit.name or ""),
+                            evalue=hit.evalue,
+                            score=hit.score,
+                            bias=hit.bias,
+                            description=str(query.description or ""),
+                            dom_evalue=best_dom.c_evalue if best_dom else 0.0,
+                            dom_score=best_dom.score if best_dom else 0.0,
+                            hmm_from=best_dom.alignment.hmm_from if best_dom else 0,
+                            hmm_to=best_dom.alignment.hmm_to if best_dom else 0,
+                            ali_from=best_dom.alignment.target_from if best_dom else 0,
+                            ali_to=best_dom.alignment.target_to if best_dom else 0,
+                        ))
+                results.sort(key=lambda h: h.evalue)
+                return results
+
+            hits = await loop.run_in_executor(None, _run_hmm)
+
+            scan_dt = _time.monotonic() - scan_t0
+            _log.info(
+                "Bacterial scan done: id=%s genes=%d hits=%d time=%.1fs",
+                t.id, n_genes, len(hits), scan_dt,
+            )
+            self._scan_cache[t.id] = hits
+            self._display_hits(t, hits)
+            self._set_status(
+                f"[green]Bacterial mode: {n_genes} Prodigal genes, "
+                f"{len(hits)} Pfam hits ({scan_dt:.1f}s).[/]"
+            )
+            # Auto-save
+            try:
+                self.app._auto_save_annotations()
+            except Exception:
+                _log.exception("Auto-save after bacterial scan failed")
+            btn = self.query_one("#hmmer-run", Button)
+            btn.label = "Scan Complete"
+            btn.disabled = True
+            btn.variant = "default"
+            btn.remove_class("scanning")
+        except HMMCancelled:
+            self._set_status("[dim]Scan cancelled.[/]")
+            self._reset_scan_button()
+        except Exception as exc:
+            self._set_status(f"[red]Error: {exc}[/]")
+            _log.exception("Bacterial scan failed: %s", exc)
             self._reset_scan_button()
         finally:
             progress.remove_class("running")
@@ -6272,6 +6993,7 @@ class ScriptoScopeApp(App):
             self._fasta_path = proj["fasta_path"] or path
             self._pfam_hits = proj.get("pfam_hits", {})
             self._predictions = {}
+            self._prodigal_cache = {}
             _longest_orf_cache.clear()
             _hmm_cancel.clear()
             _ncbi_blast_cancel.clear()
@@ -6333,6 +7055,8 @@ class ScriptoScopeApp(App):
         self._sort_reverse: bool = False
         self._bookmarks: set[str] = set()  # transcript IDs
         self._predictions: dict[str, CDSPrediction] = {}  # CDS predictions keyed by transcript ID
+        self._prodigal_cache: dict[str, list[ProdigalGene]] = {}  # transcript_id -> genes
+        self._bacterial_mode: bool = False
 
     # ── Annotation auto-save ─────────────────────────────────────────────
 
@@ -6367,6 +7091,7 @@ class ScriptoScopeApp(App):
                 bookmarks=set(self._bookmarks),
                 orf_cache=orf_cache,
                 predictions=dict(self._predictions) if self._predictions else None,
+                prodigal_cache=dict(self._prodigal_cache) if self._prodigal_cache else None,
             )
             # Update library scanned_count
             scanned = len(scan_cache)
@@ -6780,6 +7505,7 @@ class ScriptoScopeApp(App):
         self._fasta_path = path
         self._pfam_hits = {}
         self._predictions = {}
+        self._prodigal_cache = {}
         # Clear stale per-transcript caches from the previous dataset.
         try:
             hmmer = self.query_one("#hmmer-panel")
@@ -6851,6 +7577,11 @@ class ScriptoScopeApp(App):
                 if pred_data:
                     self._predictions = pred_data
                     _log.info("Restored %d CDS predictions", len(pred_data))
+                # Restore Prodigal cache
+                prodigal_data = annotations.get("prodigal_cache") or {}
+                if prodigal_data:
+                    self._prodigal_cache = prodigal_data
+                    _log.info("Restored %d Prodigal predictions", len(prodigal_data))
                 ann_msg = (
                     f" ({len(annotations.get('scan_cache', {}))} scanned, "
                     f"{len(annotations.get('bookmarks', set()))} bookmarked)"
@@ -6896,6 +7627,21 @@ class ScriptoScopeApp(App):
             self.query_one("#stats-panel", StatsPanel).reset_for_new_dataset()
         except Exception:
             _log.exception("StatsPanel.reset_for_new_dataset raised")
+
+        # Auto-detect bacterial mode heuristic
+        try:
+            if suggest_bacterial_mode(transcripts):
+                self.notify(
+                    "This transcriptome may be prokaryotic (long transcripts, "
+                    "high coding density, multiple ORFs per transcript).\n"
+                    "Enable 'Bacterial mode' in the Pfam tab for Prodigal-based "
+                    "gene prediction.",
+                    title="Bacterial mode suggested",
+                    severity="warning",
+                    timeout=10,
+                )
+        except Exception:
+            _log.exception("suggest_bacterial_mode raised")
 
     @work(exclusive=True, thread=True, group="stats")
     def _compute_stats_bg(self, transcripts: list[Transcript], path: str) -> None:
