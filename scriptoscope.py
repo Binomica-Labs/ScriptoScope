@@ -6981,15 +6981,16 @@ class ScriptoScopeApp(App):
             stats_panel._update_display()
             self._auto_save_annotations()
             self._set_status(
-                f"[green]CDS predictions complete ({total_dt:.1f}s): "
+                f"[green]CDS predictions complete ({total_dt:.1f}s) — saved: "
                 f"{counts['HIGH']} HIGH, {counts['MEDIUM']} MEDIUM, "
                 f"{counts['LOW']} LOW, {counts['NONE']} no ORF[/]"
             )
             self.notify(
-                f"CDS predictions done in {total_dt:.1f}s: "
+                f"CDS predictions saved ({total_dt:.1f}s): "
                 f"{counts['HIGH']} HIGH, {counts['MEDIUM']} MEDIUM, "
-                f"{counts['LOW']} LOW, {counts['NONE']} no ORF",
-                title="Gene Prediction",
+                f"{counts['LOW']} LOW, {counts['NONE']} no ORF\n"
+                f"Predictions persist across sessions.",
+                title="Gene Prediction — Saved",
                 severity="information",
                 timeout=6,
             )
