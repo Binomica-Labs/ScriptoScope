@@ -2603,11 +2603,11 @@ class SequenceViewer(ScrollableContainer):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        # Stores both annotated (SeqRenderResult) and plain (Text) renders,
-        # disambiguated by the cache key shape. Plain-render keys are
-        # ("plain", id, length, width); annotated keys are the longer tuple
-        # that includes orf/hits/highlight state.
+        # Level 1: render cache (Rich Text / SeqRenderResult).
         self._seq_render_cache: OrderedDict[tuple, object] = OrderedDict()
+        # Level 2: content cache (Textual Content — pre-converted from Text).
+        # Avoids the ~40-90ms _text_to_content call on cache hits.
+        self._content_cache: OrderedDict[tuple, object] = OrderedDict()
 
     def compose(self) -> ComposeResult:
         yield Static("Select a transcript from the list.", id="seq-info")
@@ -2782,61 +2782,67 @@ class SequenceViewer(ScrollableContainer):
                 from Bio.Seq import Seq
                 cds_dna = str(Seq(t.sequence[orf.nt_start:orf.nt_end]).reverse_complement())
 
-        # Render (expensive)
+        # Render (expensive) — we cache at TWO levels:
+        # 1. SeqRenderResult (Text + line_map + features) — keyed by render state
+        # 2. Textual Content (pre-converted from Text) — same key, avoids the
+        #    ~40-90ms _text_to_content call on cache hits
         if orf:
             hit_key = tuple((h.target_name, h.ali_from, h.ali_to) for h in hits)
             cache_key = (
                 t.id, seq_width, self._highlight, self._aa_highlight,
                 self._focus_range, hit_key,
             )
-            render = self._seq_render_cache.get(cache_key)
-            if render is not None:
-                self._seq_render_cache.move_to_end(cache_key)
-            else:
+        elif t:
+            cache_key = ("plain", t.id, t.length, seq_width)
+        else:
+            cache_key = None
+
+        # Check for a cached Content first (fastest — zero work)
+        cached_content = self._content_cache.get(cache_key) if cache_key else None
+        cached_render = self._seq_render_cache.get(cache_key) if cache_key else None
+
+        if cached_content is not None and cached_render is not None:
+            # Full cache hit — skip both render and content conversion
+            render = cached_render if orf else None
+            content = cached_content
+            self._seq_render_cache.move_to_end(cache_key)
+            self._content_cache.move_to_end(cache_key)
+            _render_dt = (_time.monotonic() - _t0) * 1000
+            _log.debug(
+                "render_sequence_bg done id=%s total=%.0fms (CACHED) scanned=%s",
+                t.id, _render_dt, scanned,
+            )
+        else:
+            # Cache miss — do the work
+            render = None
+            plain_text = None
+            if orf:
                 render = colorize_sequence_annotated(
                     t.sequence, orf=orf, hits=hits, width=seq_width,
                     highlight_range=self._highlight,
                     aa_highlight_range=self._aa_highlight,
                     focus_range=self._focus_range,
                 )
-                if len(self._seq_render_cache) >= self._RENDER_CACHE_MAX:
-                    self._seq_render_cache.popitem(last=False)
-                self._seq_render_cache[cache_key] = render
-        else:
-            render = None
-
-        plain_text = None
-        if not orf:
-            # Cache plain renders in the same OrderedDict as annotated ones,
-            # keyed with a "plain:" prefix so they don't collide. Re-clicking
-            # a previously-seen unscanned transcript hits the cache instantly.
-            plain_key = ("plain", t.id, t.length, seq_width)
-            cached_plain = self._seq_render_cache.get(plain_key)
-            if cached_plain is not None:
-                self._seq_render_cache.move_to_end(plain_key)
-                plain_text = cached_plain  # type: ignore[assignment]
             else:
                 plain_text = colorize_sequence(t.sequence, width=seq_width)
+
+            _t_content_start = _time.monotonic()
+            content = _text_to_content(render.text if render else plain_text)
+            _t_content_ms = (_time.monotonic() - _t_content_start) * 1000
+
+            # Store in both caches
+            if cache_key:
                 if len(self._seq_render_cache) >= self._RENDER_CACHE_MAX:
-                    self._seq_render_cache.popitem(last=False)
-                self._seq_render_cache[plain_key] = plain_text  # type: ignore[assignment]
+                    evicted = self._seq_render_cache.popitem(last=False)
+                    self._content_cache.pop(evicted[0], None)
+                self._seq_render_cache[cache_key] = render if render else plain_text
+                self._content_cache[cache_key] = content
 
-        # Pre-convert the Rich Text to a Textual Content on this worker thread.
-        # Textual's body.update(text) normally runs Content.from_rich_text()
-        # on the main thread — ~33 ms per call for a ~5k-span annotated
-        # render, which blows the 33 ms/frame budget. Doing it here moves
-        # that cost off the main UI thread.
-        content: object
-        if render is not None:
-            content = _text_to_content(render.text)
-        else:
-            content = _text_to_content(plain_text)
-
-        _render_dt = (_time.monotonic() - _t0) * 1000
-        _log.debug(
-            "render_sequence_bg done id=%s %.0fms (scanned=%s)",
-            t.id, _render_dt, scanned,
-        )
+            _render_dt = (_time.monotonic() - _t0) * 1000
+            _log.debug(
+                "render_sequence_bg done id=%s total=%.0fms content=%.0fms scanned=%s",
+                t.id, _render_dt, _t_content_ms, scanned,
+            )
 
         # Preserve scroll position when the render is just a highlight
         # toggle (focus_range, aa_highlight) on the same transcript. We
