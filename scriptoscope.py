@@ -27,6 +27,7 @@ import csv
 import gzip
 import json
 import logging
+import datetime
 import os
 import re
 import signal
@@ -506,6 +507,256 @@ def load_project(path: str | Path) -> dict:
     result["pfam_hits"] = pfam_hits
 
     return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Annotation sidecar files
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ANNOTATION_VERSION = 2
+
+
+def _annotation_path(fasta_path: str) -> Path:
+    """Return the sidecar annotation path for a given FASTA file."""
+    return Path(fasta_path).with_suffix(Path(fasta_path).suffix + ".annotations.json")
+
+
+def save_annotations(
+    fasta_path: str,
+    scan_cache: dict,
+    confirm_cache: dict,
+    pfam_hits: dict,
+    bookmarks: set,
+    orf_cache: dict,
+) -> None:
+    """Save annotation sidecar file next to the FASTA. Atomic write."""
+    data: dict = {"version": _ANNOTATION_VERSION}
+
+    if scan_cache:
+        data["scan_cache"] = {
+            tid: [asdict(h) if hasattr(h, "__dataclass_fields__") else h for h in hits]
+            for tid, hits in scan_cache.items()
+        }
+    else:
+        data["scan_cache"] = {}
+
+    if confirm_cache:
+        data["confirm_cache"] = {
+            tid: asdict(conf) if hasattr(conf, "__dataclass_fields__") else conf
+            for tid, conf in confirm_cache.items()
+        }
+    else:
+        data["confirm_cache"] = {}
+
+    if pfam_hits:
+        data["pfam_hits"] = {
+            tid: sorted(families) for tid, families in pfam_hits.items()
+        }
+    else:
+        data["pfam_hits"] = {}
+
+    data["bookmarks"] = sorted(bookmarks) if bookmarks else []
+
+    if orf_cache:
+        data["orf_cache"] = {
+            tid: {
+                "nt_start": orf.nt_start,
+                "nt_end": orf.nt_end,
+                "aa_length": orf.aa_length,
+                "strand": orf.strand,
+                "frame": orf.frame,
+            }
+            for tid, orf in orf_cache.items()
+            if orf is not None
+        }
+    else:
+        data["orf_cache"] = {}
+
+    dest = _annotation_path(fasta_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{dest.name}.", suffix=".tmp", dir=str(dest.parent),
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, separators=(",", ":"))
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_name, dest)
+        _log.info("Saved annotations sidecar: %s", dest)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def load_annotations(fasta_path: str) -> dict | None:
+    """Load annotation sidecar if it exists. Returns None if no sidecar."""
+    dest = _annotation_path(fasta_path)
+    if not dest.is_file():
+        return None
+    try:
+        with open(dest, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        _log.warning("Failed to load annotations sidecar %s: %s", dest, exc)
+        return None
+
+    if not isinstance(raw, dict):
+        _log.warning("Annotation sidecar %s is not a JSON object", dest)
+        return None
+
+    version = raw.get("version", 0)
+    if not isinstance(version, int) or version > _ANNOTATION_VERSION:
+        _log.warning(
+            "Annotation sidecar %s has version %s (max supported: %d)",
+            dest, version, _ANNOTATION_VERSION,
+        )
+        return None
+
+    result: dict = {}
+
+    # scan_cache
+    scan_cache: dict[str, list] = {}
+    for tid, hit_list in (raw.get("scan_cache") or {}).items():
+        if not isinstance(hit_list, list):
+            continue
+        parsed: list = []
+        for h in hit_list:
+            if isinstance(h, dict):
+                try:
+                    parsed.append(_coerce_dataclass(HmmerHit, h))
+                except (TypeError, ValueError) as exc:
+                    _log.warning("Skipping malformed HmmerHit for %s: %s", tid, exc)
+        scan_cache[str(tid)] = parsed
+    result["scan_cache"] = scan_cache
+
+    # confirm_cache
+    confirm_cache: dict = {}
+    for tid, conf in (raw.get("confirm_cache") or {}).items():
+        if isinstance(conf, dict):
+            try:
+                confirm_cache[str(tid)] = _coerce_dataclass(BlastConfirmation, conf)
+            except (TypeError, ValueError) as exc:
+                _log.warning("Skipping malformed BlastConfirmation for %s: %s", tid, exc)
+    result["confirm_cache"] = confirm_cache
+
+    # pfam_hits
+    pfam_hits: dict[str, set[str]] = {}
+    for tid, families in (raw.get("pfam_hits") or {}).items():
+        if isinstance(families, (list, tuple, set)):
+            pfam_hits[str(tid)] = {str(f) for f in families}
+    result["pfam_hits"] = pfam_hits
+
+    # bookmarks
+    bm = raw.get("bookmarks") or []
+    result["bookmarks"] = set(str(b) for b in bm) if isinstance(bm, list) else set()
+
+    # orf_cache — stored as plain dicts, not ORFCoord (no sequence stored)
+    result["orf_cache"] = raw.get("orf_cache") or {}
+
+    _log.info(
+        "Loaded annotations sidecar: %s (scan=%d, confirm=%d, pfam=%d, bookmarks=%d)",
+        dest, len(scan_cache), len(confirm_cache), len(pfam_hits), len(result["bookmarks"]),
+    )
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Library registry (~/.scriptoscope/library.json)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_LIBRARY_PATH = Path.home() / ".scriptoscope" / "library.json"
+
+
+def load_library() -> list[dict]:
+    """Load the library registry. Returns empty list on any error."""
+    if not _LIBRARY_PATH.is_file():
+        return []
+    try:
+        with open(_LIBRARY_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        entries = raw.get("transcriptomes", [])
+        return entries if isinstance(entries, list) else []
+    except (json.JSONDecodeError, OSError) as exc:
+        _log.warning("Failed to load library: %s", exc)
+        return []
+
+
+def save_library(entries: list[dict]) -> None:
+    """Save the library registry. Atomic write."""
+    _LIBRARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    data = {"transcriptomes": entries}
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=".library.", suffix=".tmp", dir=str(_LIBRARY_PATH.parent),
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_name, _LIBRARY_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def register_transcriptome(
+    fasta_path: str, name: str, organism: str, transcript_count: int,
+) -> None:
+    """Register or update a transcriptome in the library."""
+    entries = load_library()
+    resolved = str(Path(fasta_path).resolve())
+    has_ann = _annotation_path(fasta_path).is_file()
+
+    # Find existing entry by resolved path
+    for entry in entries:
+        if str(Path(entry.get("fasta_path", "")).resolve()) == resolved:
+            entry["name"] = name
+            entry["organism"] = organism
+            entry["transcript_count"] = transcript_count
+            entry["last_opened"] = datetime.datetime.now().isoformat(timespec="seconds")
+            entry["has_annotations"] = has_ann
+            save_library(entries)
+            _log.info("Updated library entry: %s", name)
+            return
+
+    # New entry
+    entries.append({
+        "fasta_path": fasta_path,
+        "name": name,
+        "organism": organism,
+        "transcript_count": transcript_count,
+        "scanned_count": 0,
+        "last_opened": datetime.datetime.now().isoformat(timespec="seconds"),
+        "has_annotations": has_ann,
+    })
+    save_library(entries)
+    _log.info("Registered new library entry: %s", name)
+
+
+def update_library_entry(fasta_path: str, **updates) -> None:
+    """Update fields on an existing library entry by FASTA path."""
+    entries = load_library()
+    resolved = str(Path(fasta_path).resolve())
+    for entry in entries:
+        if str(Path(entry.get("fasta_path", "")).resolve()) == resolved:
+            entry.update(updates)
+            save_library(entries)
+            _log.info("Updated library entry %s: %s", fasta_path, list(updates.keys()))
+            return
+    _log.debug("update_library_entry: no entry found for %s", fasta_path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3581,13 +3832,30 @@ class SaveProjectModal(ModalScreen[str | None]):
                 confirm_cache=confirm_cache,
                 pfam_hits=app._pfam_hits,
             )
+            # Also save the lightweight sidecar alongside the full project
+            if app._fasta_path:
+                try:
+                    orf_cache: dict = {}
+                    for (tid, _length, _fp), orf in _longest_orf_cache.items():
+                        if orf is not None and tid in app._by_id:
+                            orf_cache[tid] = orf
+                    save_annotations(
+                        fasta_path=app._fasta_path,
+                        scan_cache=scan_cache,
+                        confirm_cache=confirm_cache,
+                        pfam_hits=app._pfam_hits,
+                        bookmarks=app._bookmarks,
+                        orf_cache=orf_cache,
+                    )
+                except Exception:
+                    _log.exception("Sidecar save alongside project save failed")
 
             def _on_saved() -> None:
                 self.query_one("#save-status", Static).update(
                     f"[bold green]Saved to {Path(path).name}[/]"
                 )
                 app._set_status(f"[green]Project saved: {path}[/]")
-                app._refresh_transcriptome_select()
+                app._refresh_library_table()
                 self.set_timer(1.2, lambda: self.dismiss(path))
 
             self.app.call_from_thread(_on_saved)
@@ -4654,6 +4922,11 @@ class HmmerPanel(Vertical):
             self._set_status(
                 f"[green]{len(hits)} Pfam domain hits found ({scan_dt:.1f}s).[/]"
             )
+            # Auto-save annotations after scan
+            try:
+                self.app._auto_save_annotations()
+            except Exception:
+                _log.exception("Auto-save after HMM scan failed")
             # Disable button after successful scan
             btn = self.query_one("#hmmer-run", Button)
             btn.label = "Scan Complete"
@@ -4747,6 +5020,11 @@ class HmmerPanel(Vertical):
                 )
 
             self._confirm_cache[t.id] = conf
+            # Auto-save annotations after CDS confirmation
+            try:
+                self.app._auto_save_annotations()
+            except Exception:
+                _log.exception("Auto-save after CDS confirmation failed")
 
             def _final():
                 hits = self._scan_cache.get(t.id, [])
@@ -4864,6 +5142,11 @@ class HmmerPanel(Vertical):
                 f"[green]Collection scan complete: {len(mapping)} transcripts "
                 f"with hits ({elapsed_str}).[/]"
             )
+            # Auto-save annotations after collection scan
+            try:
+                self.app._auto_save_annotations()
+            except Exception:
+                _log.exception("Auto-save after collection scan failed")
             self.app._apply_filter()
         except HMMCancelled:
             self._set_status("[dim]Collection scan cancelled.[/]")
@@ -4958,7 +5241,11 @@ class ScriptoScopeApp(App):
         background: $surface; border-bottom: solid $primary 20%;
     }
     #sidebar-filters Input { margin-bottom: 0; }
-    #transcriptome-select { width: 100%; margin-top: 1; }
+    #library-table {
+        height: auto; max-height: 10;
+        margin-top: 1;
+        background: $surface;
+    }
     #transcript-table { height: 1fr; }
     #content-area { width: 1fr; height: 100%; }
     #app-status {
@@ -5067,6 +5354,8 @@ class ScriptoScopeApp(App):
                     table.move_cursor(row=new_idx, animate=False)
                 except StopIteration:
                     pass
+            # Auto-save annotations after bookmark toggle
+            self._auto_save_annotations()
         except Exception:
             pass
 
@@ -5199,7 +5488,7 @@ class ScriptoScopeApp(App):
             _hmm_cancel.clear()
             _ncbi_blast_cancel.clear()
             self._populate_table_fast(row_data, len(transcripts), visible)
-            self._refresh_transcriptome_select()
+            self._refresh_library_table()
             # Restore scan/confirm caches into HmmerPanel, clearing stale diagrams.
             try:
                 hmmer = self.query_one("#hmmer-panel")
@@ -5211,6 +5500,11 @@ class ScriptoScopeApp(App):
                 self.query_one("#stats-panel", StatsPanel)._last_shown_id = ""
             except Exception:
                 pass
+            # Register in library
+            try:
+                self._register_current_transcriptome()
+            except Exception:
+                _log.exception("register_transcriptome raised during project load")
             self._set_status(
                 f"[green]{len(transcripts):,} transcripts loaded from project — ready[/]"
             )
@@ -5251,6 +5545,70 @@ class ScriptoScopeApp(App):
         self._sort_reverse: bool = False
         self._bookmarks: set[str] = set()  # transcript IDs
 
+    # ── Annotation auto-save ─────────────────────────────────────────────
+
+    @work(exclusive=True, thread=True, group="annotation-save")
+    def _auto_save_annotations(self) -> None:
+        """Save annotation sidecar in the background after mutation events."""
+        if not self._fasta_path:
+            return
+        try:
+            # Gather scan/confirm caches from HmmerPanel
+            scan_cache: dict = {}
+            confirm_cache: dict = {}
+            try:
+                hmmer = self.query_one("#hmmer-panel")
+                scan_cache = dict(getattr(hmmer, "_scan_cache", {}))
+                confirm_cache = dict(getattr(hmmer, "_confirm_cache", {}))
+            except Exception:
+                pass
+
+            # Build orf_cache from the global _longest_orf_cache, filtered to
+            # transcript IDs in the current dataset.
+            orf_cache: dict = {}
+            for (tid, _length, _fp), orf in _longest_orf_cache.items():
+                if orf is not None and tid in self._by_id:
+                    orf_cache[tid] = orf
+
+            save_annotations(
+                fasta_path=self._fasta_path,
+                scan_cache=scan_cache,
+                confirm_cache=confirm_cache,
+                pfam_hits=dict(self._pfam_hits),
+                bookmarks=set(self._bookmarks),
+                orf_cache=orf_cache,
+            )
+            # Update library scanned_count
+            scanned = len(scan_cache)
+            update_library_entry(
+                self._fasta_path,
+                scanned_count=scanned,
+                has_annotations=True,
+            )
+        except Exception:
+            _log.exception("_auto_save_annotations failed")
+
+    def _register_current_transcriptome(self) -> None:
+        """Register the currently loaded FASTA in the library."""
+        if not self._fasta_path:
+            return
+        # Try to read organism from .meta.json if available
+        organism = ""
+        meta_path = Path(self._fasta_path).with_suffix(".meta.json")
+        if meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                organism = meta.get("organism", "")
+            except Exception:
+                pass
+        name = Path(self._fasta_path).stem
+        register_transcriptome(
+            fasta_path=self._fasta_path,
+            name=name,
+            organism=organism,
+            transcript_count=len(self._transcripts),
+        )
+
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="main-layout"):
@@ -5260,9 +5618,11 @@ class ScriptoScopeApp(App):
                     yield Static("0 loaded", id="transcript-count")
                 with Vertical(id="sidebar-filters"):
                     yield Input(placeholder="Filter: text  len>500  gc>40 …", id="filter-input")
-                    yield Select(
-                        [], prompt="Recent transcriptomes…",
-                        id="transcriptome-select", allow_blank=True,
+                    yield DataTable(
+                        id="library-table",
+                        zebra_stripes=True,
+                        cursor_type="row",
+                        show_header=True,
                     )
                 yield DataTable(
                     id="transcript-table",
@@ -5286,7 +5646,10 @@ class ScriptoScopeApp(App):
         table = self.query_one("#transcript-table", DataTable)
         table.add_columns("ID", "Length", "GC%")
         table.focus()
-        self._refresh_transcriptome_select()
+        # Initialize library panel
+        lib_table = self.query_one("#library-table", DataTable)
+        lib_table.add_columns("Name", "Seqs", "Scanned")
+        self._refresh_library_table()
         if self._startup_fasta:
             self._load_fasta(self._startup_fasta)
         # Pre-warm HMM cache in background so first scan is fast
@@ -5300,106 +5663,182 @@ class ScriptoScopeApp(App):
         _hmm_cache.get(db_path)
         _log.info("HMM cache pre-warmed")
 
-    # ── Transcriptome select dropdown ────────────────────────────────────────
+    # ── Library panel (replaces old Select dropdown) ───────────────────────
 
-    _refreshing_select: bool = False
+    _refreshing_library: bool = False
 
     def _discover_transcriptome_files(self) -> list[tuple[str, str]]:
-        """Find saved projects and GenBank downloads.
+        """Build library entries from the persistent registry plus downloads dir.
 
-        Returns list of (label, path) tuples sorted by modification time (newest first).
-        Only scans ~/.scriptoscope/downloads/ — not home or cwd (too slow).
+        Returns list of (label, path) tuples sorted by last_opened (newest first).
+        Also auto-discovers un-registered downloads.
         """
-        entries: list[tuple[float, str, str]] = []  # (mtime, label, path)
-        dl_dir = Path.home() / ".scriptoscope" / "downloads"
+        entries = load_library()
 
-        # Scan downloads dir for FASTA and project files
+        # Also scan downloads dir for un-registered FASTA files
+        dl_dir = Path.home() / ".scriptoscope" / "downloads"
+        registered_paths = {
+            str(Path(e.get("fasta_path", "")).resolve())
+            for e in entries
+        }
         if dl_dir.is_dir():
             for f in dl_dir.iterdir():
                 try:
                     if not f.is_file():
                         continue
-                    if f.suffix in (".fasta", ".fa", ".fna"):
-                        # Check for metadata file with organism name
+                    if f.suffix not in (".fasta", ".fa", ".fna"):
+                        continue
+                    resolved = str(f.resolve())
+                    if resolved in registered_paths:
+                        continue
+                    # Auto-discover: read meta if available
+                    meta_path = f.with_suffix(".meta.json")
+                    organism = ""
+                    if meta_path.is_file():
+                        try:
+                            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                            organism = meta.get("organism", "")
+                        except Exception:
+                            pass
+                    label = organism if organism else f.stem
+                    entries.append({
+                        "fasta_path": str(f),
+                        "name": f.stem,
+                        "organism": organism,
+                        "transcript_count": 0,
+                        "scanned_count": 0,
+                        "last_opened": "",
+                        "has_annotations": _annotation_path(str(f)).is_file(),
+                    })
+                except OSError:
+                    continue
+
+        # If a FASTA is currently loaded and not in entries, add it
+        if self._fasta_path:
+            path_resolved = str(Path(self._fasta_path).resolve())
+            if not any(
+                str(Path(e.get("fasta_path", "")).resolve()) == path_resolved
+                for e in entries
+            ):
+                entries.append({
+                    "fasta_path": self._fasta_path,
+                    "name": Path(self._fasta_path).stem,
+                    "organism": "",
+                    "transcript_count": len(self._transcripts),
+                    "scanned_count": 0,
+                    "last_opened": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "has_annotations": False,
+                })
+
+        # Sort by last_opened descending (empty dates at the end)
+        entries.sort(
+            key=lambda e: e.get("last_opened", "") or "",
+            reverse=True,
+        )
+
+        result: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for e in entries:
+            fp = e.get("fasta_path", "")
+            if not fp:
+                continue
+            resolved = str(Path(fp).resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            organism = e.get("organism", "")
+            name = organism if organism else e.get("name", Path(fp).stem)
+            result.append((name, fp))
+        return result
+
+    def _refresh_library_table(self) -> None:
+        """Refresh the library panel DataTable with known transcriptomes."""
+        self._refreshing_library = True
+        try:
+            lib_table = self.query_one("#library-table", DataTable)
+            lib_table.clear()
+            entries = load_library()
+
+            # Also discover from downloads dir
+            dl_dir = Path.home() / ".scriptoscope" / "downloads"
+            registered_paths = {
+                str(Path(e.get("fasta_path", "")).resolve())
+                for e in entries
+            }
+            if dl_dir.is_dir():
+                for f in dl_dir.iterdir():
+                    try:
+                        if not f.is_file() or f.suffix not in (".fasta", ".fa", ".fna"):
+                            continue
+                        resolved = str(f.resolve())
+                        if resolved in registered_paths:
+                            continue
                         meta_path = f.with_suffix(".meta.json")
-                        label = None
+                        organism = ""
                         if meta_path.is_file():
                             try:
                                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
                                 organism = meta.get("organism", "")
-                                if organism:
-                                    label = f"\u2913 {organism}"
                             except Exception:
                                 pass
-                        if not label:
-                            label = f"\u2913 {f.stem}"
-                        entries.append((f.stat().st_mtime, label, str(f)))
-                    elif f.name.endswith(".scriptoscope.json"):
-                        label = f"\u2606 {f.stem.replace('.scriptoscope', '')}"
-                        entries.append((f.stat().st_mtime, label, str(f)))
-                except OSError:
+                        entries.append({
+                            "fasta_path": str(f),
+                            "name": f.stem,
+                            "organism": organism,
+                            "transcript_count": 0,
+                            "scanned_count": 0,
+                            "last_opened": "",
+                            "has_annotations": False,
+                        })
+                    except OSError:
+                        continue
+
+            # Sort by last_opened descending
+            entries.sort(
+                key=lambda e: e.get("last_opened", "") or "",
+                reverse=True,
+            )
+
+            seen: set[str] = set()
+            for e in entries:
+                fp = e.get("fasta_path", "")
+                if not fp:
                     continue
-
-        # If a FASTA is currently loaded, include it so it shows as an option
-        if self._fasta_path:
-            path_str = self._fasta_path
-            if not any(e[2] == path_str for e in entries):
-                p = Path(path_str)
-                try:
-                    if p.is_file():
-                        entries.append((p.stat().st_mtime, p.name, path_str))
-                except OSError:
-                    pass
-
-        # Sort newest first, deduplicate by path
-        entries.sort(key=lambda e: e[0], reverse=True)
-        seen: set[str] = set()
-        result: list[tuple[str, str]] = []
-        for _, label, path in entries:
-            if path not in seen:
-                seen.add(path)
-                result.append((label, path))
-        return result
+                resolved = str(Path(fp).resolve())
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                organism = e.get("organism", "")
+                name = organism[:20] if organism else e.get("name", Path(fp).stem)[:20]
+                count = e.get("transcript_count", 0)
+                scanned = e.get("scanned_count", 0)
+                count_str = f"{count:,}" if count else "?"
+                scanned_str = str(scanned) if scanned else "-"
+                lib_table.add_row(name, count_str, scanned_str, key=fp)
+        except Exception:
+            _log.exception("_refresh_library_table failed")
+        finally:
+            self._refreshing_library = False
 
     def _refresh_transcriptome_select(self) -> None:
-        """Refresh the transcriptome dropdown with discovered files."""
-        self._refreshing_select = True
-        try:
-            sel = self.query_one("#transcriptome-select", Select)
-            options = self._discover_transcriptome_files()
-            sel.set_options(options)
-            if self._fasta_path:
-                try:
-                    sel.value = self._fasta_path
-                except Exception:
-                    pass
-            else:
-                sel.clear()
-        finally:
-            self._refreshing_select = False
+        """Backward-compat shim — now refreshes the library table."""
+        self._refresh_library_table()
 
-    @on(Select.Changed, "#transcriptome-select")
-    def _on_transcriptome_select(self, event: Select.Changed) -> None:
-        if self._refreshing_select:
+    @on(DataTable.RowSelected, "#library-table")
+    def _on_library_row_selected(self, event: DataTable.RowSelected) -> None:
+        """User clicked a row in the library panel — load that transcriptome."""
+        if self._refreshing_library:
             return
-        # Reject any non-string value. Real paths are always strings; anything
-        # else is a Textual sentinel (Select.BLANK, Select.NULL, None) whose
-        # exact identity varies between Textual versions. This catches the
-        # reset-to-NULL event fired by set_options() on some versions.
-        if not isinstance(event.value, str):
-            _log.debug(
-                "Ignoring non-string Select value: %r (type=%s)",
-                event.value, type(event.value).__name__,
-            )
+        path = str(event.row_key.value)
+        if not path or not isinstance(path, str):
             return
-        path = event.value
-        _log.info("Transcriptome select changed -> path=%r", path)
+        _log.info("Library row selected -> path=%r", path)
         if path == self._fasta_path:
             return
         if path.endswith(".scriptoscope.json"):
             self._load_project_file(path)
         else:
-            self._load_fasta(path)  # _parse_fasta auto-detects gzip
+            self._load_fasta(path)
 
     # ── File loading ──────────────────────────────────────────────────────────
 
@@ -5567,12 +6006,72 @@ class ScriptoScopeApp(App):
         # Invalidate per-transcript ORF cache — cheap and prevents cross-
         # session collisions on the (id, length, fingerprint) key.
         _longest_orf_cache.clear()
-        self._populate_table_fast(row_data, len(transcripts), visible)
+
+        # Auto-load annotations sidecar if it exists
         try:
-            self._refresh_transcriptome_select()
+            annotations = load_annotations(path)
+            if annotations:
+                _log.info("Restoring annotations from sidecar for %s", path)
+                hmmer = self.query_one("#hmmer-panel")
+                if annotations.get("scan_cache"):
+                    hmmer._scan_cache.update(annotations["scan_cache"])
+                if annotations.get("confirm_cache"):
+                    hmmer._confirm_cache.update(annotations["confirm_cache"])
+                if annotations.get("pfam_hits"):
+                    self._pfam_hits = annotations["pfam_hits"]
+                if annotations.get("bookmarks"):
+                    self._bookmarks = annotations["bookmarks"]
+                # Restore ORF cache entries
+                orf_raw = annotations.get("orf_cache") or {}
+                for tid, orf_data in orf_raw.items():
+                    if tid in by_id and isinstance(orf_data, dict):
+                        t = by_id[tid]
+                        fp = _seq_fingerprint(t.sequence)
+                        key = (tid, t.length, fp)
+                        try:
+                            orf = ORFCoord(
+                                orf_id=f"{tid}_restored",
+                                strand=orf_data.get("strand", "+"),
+                                frame=orf_data.get("frame", 1),
+                                nt_start=orf_data.get("nt_start", 0),
+                                nt_end=orf_data.get("nt_end", 0),
+                                aa_length=orf_data.get("aa_length", 0),
+                                sequence="",  # not stored in sidecar
+                            )
+                            _longest_orf_cache[key] = orf
+                        except Exception:
+                            _log.warning("Failed to restore ORF for %s", tid)
+                ann_msg = (
+                    f" ({len(annotations.get('scan_cache', {}))} scanned, "
+                    f"{len(annotations.get('bookmarks', set()))} bookmarked)"
+                )
+            else:
+                ann_msg = ""
         except Exception:
-            _log.exception("refresh_transcriptome_select raised during load apply")
-        status_msg = f"[green]{len(transcripts):,} transcripts loaded from {path} — ready[/]"
+            _log.exception("Failed to load annotations sidecar for %s", path)
+            ann_msg = ""
+
+        # Update row_data with bookmark markers if annotations were loaded
+        if self._bookmarks:
+            row_data = [
+                (
+                    (f"* {short_id}" if tid in self._bookmarks else short_id),
+                    length, gc, tid,
+                )
+                for short_id, length, gc, tid in row_data
+            ]
+
+        self._populate_table_fast(row_data, len(transcripts), visible)
+        # Register in library and refresh the library panel
+        try:
+            self._register_current_transcriptome()
+        except Exception:
+            _log.exception("register_transcriptome raised during load apply")
+        try:
+            self._refresh_library_table()
+        except Exception:
+            _log.exception("_refresh_library_table raised during load apply")
+        status_msg = f"[green]{len(transcripts):,} transcripts loaded from {path}{ann_msg} — ready[/]"
         if dup_shortfall:
             status_msg += f" [yellow](dedup anomaly: {dup_shortfall})[/]"
         self._set_status(status_msg)
