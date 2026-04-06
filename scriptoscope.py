@@ -6063,14 +6063,28 @@ class ScriptoScopeApp(App):
                         fp = _seq_fingerprint(t.sequence)
                         key = (tid, t.length, fp)
                         try:
+                            nt_s = orf_data.get("nt_start", 0)
+                            nt_e = orf_data.get("nt_end", 0)
+                            strand = orf_data.get("strand", "+")
+                            # Re-translate the ORF from the transcript DNA
+                            # so the sequence field is populated (needed by
+                            # _build_aa_track for the AA translation line).
+                            if strand == "+":
+                                orf_dna = t.sequence[nt_s:nt_e]
+                            else:
+                                orf_dna = t.sequence[nt_s:nt_e]
+                                orf_dna = orf_dna.upper().translate(
+                                    str.maketrans("ACGTN", "TGCAN")
+                                )[::-1]
+                            aa_seq = _translate_orf_dna(orf_dna)
                             orf = ORFCoord(
                                 orf_id=f"{tid}_restored",
-                                strand=orf_data.get("strand", "+"),
+                                strand=strand,
                                 frame=orf_data.get("frame", 1),
-                                nt_start=orf_data.get("nt_start", 0),
-                                nt_end=orf_data.get("nt_end", 0),
-                                aa_length=orf_data.get("aa_length", 0),
-                                sequence="",  # not stored in sidecar
+                                nt_start=nt_s,
+                                nt_end=nt_e,
+                                aa_length=len(aa_seq),
+                                sequence=aa_seq,
                             )
                             _longest_orf_cache[key] = orf
                         except Exception:
