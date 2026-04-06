@@ -12,7 +12,7 @@ This file is the **agent handoff document** for ScriptoScope. Any AI agent (Clau
 
 - **Single-file architecture**: the entire app is `scriptoscope.py` (~8,500 lines). This is intentional — it avoids import complexity and makes the codebase greppable.
 - **Test suite**: 196 tests across 4 files in `tests/`. Tests cover DNA parsing correctness (sacred territory), UI smoke tests, performance budgets, strand detection, and Prodigal integration.
-- **Rust port**: a parallel Rust/Ratatui implementation exists at `/home/seb/scriptoscope-rs/` (7,200 lines, 122 tests) for performance-critical use cases.
+- **Rust port**: a parallel Rust/Ratatui implementation exists at `/home/seb/scriptoscope-rs/` (7,490 lines across 26 source files, 122 tests) for performance-critical use cases.
 
 ## Architecture
 
@@ -31,36 +31,43 @@ FASTA file → parse_fasta() → list[Transcript] → sidebar table
 
 | Structure | Location | Purpose |
 |-----------|----------|---------|
-| `Transcript` | dataclass ~line 218 | id, description, sequence, length, gc_content |
-| `ORFCoord` | dataclass ~line 1370 | orf_id, strand, frame, nt_start, nt_end, aa_length, sequence, stop_count |
-| `HmmerHit` | dataclass ~line 1060 | Pfam domain hit with alignment coordinates |
-| `BlastHit` | dataclass ~line 810 | BLAST alignment hit |
-| `CDSPrediction` | dataclass ~line 2025 | hexamer/kozak/cai scores + confidence level |
-| `ProdigalGene` | dataclass ~line 1730 | gene predicted by Prodigal (bacterial mode) |
-| `BlastConfirmation` | dataclass ~line 1200 | CDS confirmation via NCBI blastp |
+| `Transcript` | dataclass ~line 220 | id, description, sequence, length, gc_content |
+| `GenBankResult` | dataclass ~line 873 | NCBI search result (accession, title, organism, length) |
+| `BlastHit` | dataclass ~line 1322 | BLAST alignment hit |
+| `HmmerHit` | dataclass ~line 1590 | Pfam domain hit with alignment coordinates |
+| `ORFCoord` | dataclass ~line 1615 | orf_id, strand, frame, nt_start, nt_end, aa_length, sequence, stop_count |
+| `ProdigalGene` | dataclass ~line 2023 | gene predicted by Prodigal (bacterial mode) |
+| `CDSPrediction` | dataclass ~line 2522 | hexamer/kozak/cai scores + confidence level |
+| `BlastConfirmation` | dataclass ~line 3221 | CDS confirmation via NCBI blastp |
+| `SeqRenderResult` | dataclass ~line 3505 | cached rendered sequence (Text + Content + metadata) |
 
 ### Module sections (all in scriptoscope.py)
 
 The file is organized into sections separated by `# ══════` comment bars:
 
 1. **Logging** (~line 46): rotating file handler, session ID, startup banner
-2. **Data model** (~line 218): Transcript dataclass
-3. **FASTA loader** (~line 274): gzip support, duplicate ID dedup, format validation
-4. **Project save/load** (~line 360): legacy full-JSON format (v1)
-5. **Annotation sidecar** (~line 512): lightweight JSON next to FASTA (v4)
-6. **Library registry** (~line 677): persistent transcriptome list
-7. **GenBank search** (~line 890): NCBI Entrez + RefSeq assembly search
-8. **TSA/RefSeq download** (~line 960): batch contig fetch, CDS FASTA download
-9. **BLAST runner** (~line 810): local blast+ and NCBI remote blastp
-10. **HMMER runner** (~line 1050): pyhmmer hmmscan/hmmsearch
-11. **ORF finder** (~line 1370): regex codon scanner, 6-frame, strand-aware
-12. **Prodigal integration** (~line 1730): bacterial operon gene prediction
-13. **Gene prediction scoring** (~line 1850): hexamer, Kozak, CAI, confidence
-14. **Sequence rendering** (~line 2400): per-base coloring, annotated tracks, multi-gene
-15. **SequenceViewer widget** (~line 3530): scrollable sequence display with caching
-16. **StatsPanel widget** (~line 3900): statistics + prediction display
-17. **HmmerPanel widget** (~line 5700): scan form, ORF diagram, results table
-18. **ScriptoScopeApp** (~line 7100): main app class, compose, key handling
+2. **Data model** (~line 216): Transcript dataclass
+3. **FASTA loader** (~line 276): gzip support, duplicate ID dedup, format validation
+4. **Project save/load** (~line 362): legacy full-JSON format (v1)
+5. **Annotation sidecar** (~line 514): lightweight JSON next to FASTA (v4)
+6. **Library registry** (~line 752): persistent transcriptome list (`~/.scriptoscope/library.json`)
+7. **GenBank transcriptome search** (~line 869): NCBI Entrez + RefSeq assembly search
+8. **BLAST runner** (~line 1318): local blast+ and NCBI remote blastp
+9. **HMMER runner** (~line 1586): pyhmmer hmmscan/hmmsearch + collection-wide scanning
+10. **ORF finder** (~line 1615): `ORFCoord` dataclass, `_six_frame_orf_coords` (Biopython), `_CODON_SCAN_RE` regex scanner (~line 1868), `find_best_orf` strand-aware selection (~line 1952)
+11. **PolyA/polyT strand detection** (~line 1872): strand-aware ORF selection for TSA transcripts
+12. **Prodigal integration** (~line 2007): bacterial/archaeal operon gene prediction
+13. **Gene prediction scoring** (~line 2225): hexamer, Kozak, CAI, confidence system
+14. **NCBI BLAST CDS confirmation** (~line 3216): remote blastp to confirm predicted CDS
+15. **Pfam database downloader** (~line 3234): auto-download Pfam-A.hmm if missing
+16. **Sequence viewer widget** (~line 3357): per-base coloring, annotated tracks, multi-gene rendering, `SequenceViewer` class (~line 4340)
+17. **StatsPanel widget** (~line 4866): statistics + CDS prediction display
+18. **File browser modal** (~line 5251): filesystem navigation for FASTA selection
+19. **BLAST panel widget** (~line 5834): local/remote BLAST search UI
+20. **HMMER panel widget** (~line 6203): scan form, ORF diagram, results table
+21. **Make BLAST DB modal** (~line 7030): `makeblastdb` wrapper
+22. **Main application** (~line 7069): `ScriptoScopeApp` — compose, key handling, workers
+23. **Entry point** (~line 8449): `__main__` guard, argument parsing
 
 ### Rendering pipeline
 
@@ -127,6 +134,26 @@ These are tested on every push and must never regress:
   - `_find_longest_orf`: < 10 ms
   - `_compute_stats` (1000 transcripts): < 2 s
 
+## Known pitfalls and lessons learned
+
+These are non-obvious issues encountered during development that future agents should be aware of:
+
+1. **Select.NULL vs Select.BLANK**: Textual 8.2+ fires `Select.NULL` (not `Select.BLANK`) on `set_options()`. Guard all `Select.Changed` handlers with `isinstance(event.value, str)` — never check specific sentinel identities.
+
+2. **Content.from_rich_text GIL contention**: Using the app's shared `Console` from a worker thread causes multi-second stalls. Always use a thread-local `Console` via `threading.local()` (see `_text_to_content()`).
+
+3. **Console() blocks on WSL2 worker threads**: `Console()` with default `color_system="auto"` blocks when there's no TTY. Create with `color_system="truecolor"`, `force_terminal=True`.
+
+4. **ORF sequences not stored in sidecar**: The sidecar stores ORF coordinates but not amino acid sequences. On load, re-translate from transcript DNA or `_build_aa_track` will crash with IndexError.
+
+5. **Textual 8.2 dismiss() is async-aware**: `dismiss()` in a timer callback context raises `ScreenError`. Wrap in try/except.
+
+6. **Library stale entries**: Tests that register `/tmp/` paths pollute the library. `register_transcriptome` skips `/tmp/` paths; library loader prunes non-existent files.
+
+7. **WSL2 terminal throughput**: ~10-30 KB/s for ANSI escape sequences. Minimize spans per frame. The multi-level render cache exists specifically for this constraint.
+
+8. **HMM scan speed**: Dominated by HMMER3 C code. Cap to top 6 longest ORFs per transcript (one per frame) — scanning all 24+ ORFs from a 5kb transcript takes ~50s vs ~18s for the same significant hits.
+
 ## How to extend
 
 ### Adding a new panel/tab
@@ -146,9 +173,17 @@ These are tested on every push and must never regress:
 5. Wire into the annotated sequence renderer if visual output is needed
 6. Add to `_auto_save_annotations()` for persistence
 
+### Adding a modal dialog
+
+1. Subclass `ModalScreen[ReturnType]` (see `GenBankSearchModal`, `FileBrowserModal`)
+2. Implement `compose()` with the form layout
+3. Call `self.dismiss(result)` to return a value
+4. Push the modal with `app.push_screen(MyModal(), callback=on_result)`
+5. Note: `dismiss()` can raise `ScreenError` in timer contexts — wrap in try/except
+
 ### Adding a new scoring method
 
-1. Add the scorer function in the Gene Prediction section (~line 1850)
+1. Add the scorer function in the Gene Prediction section (~line 2225)
 2. Add the score field to `CDSPrediction`
 3. Update `predict_cds()` to call the new scorer
 4. Update `save_annotations` / `load_annotations` for the new field
@@ -165,11 +200,29 @@ These are tested on every push and must never regress:
 
 Optional: BLAST+ CLI, HMMER3 CLI (`hmmsearch`), Prodigal
 
+### Key function locations
+
+| Function | Line | Purpose |
+|----------|------|---------|
+| `parse_fasta()` | ~280 | FASTA/gzip loader → list[Transcript] |
+| `save_annotations()` | ~520 | Sidecar write (atomic via tempfile+fsync+replace) |
+| `load_annotations()` | ~590 | Sidecar read + ORF re-translation |
+| `local_blast()` | ~1360 | Async subprocess blast runner |
+| `hmmscan()` | ~2996 | pyhmmer single-transcript scan |
+| `hmmsearch_all()` | ~3087 | pyhmmer collection-wide scan |
+| `_six_frame_orf_coords()` | ~1661 | Biopython 6-frame ORF finder |
+| `_find_longest_orf()` | ~1767 | Fast regex-based ORF finder |
+| `find_best_orf()` | ~1952 | Strand-aware ORF selection (polyA/TSA) |
+| `predict_cds()` | ~2530 | Gene prediction (hexamer+Kozak+CAI) |
+| `colorize_sequence()` | ~3393 | Plain per-base ACGT coloring |
+| `colorize_sequence_annotated()` | ~3938 | Full annotated render with features |
+| `_text_to_content()` | ~3448 | Thread-safe Rich Text → Textual Content |
+
 ## Rust port
 
 A parallel implementation exists at `/home/seb/scriptoscope-rs/` with:
-- 25 source files across `src/{app,data,bio,ui}/`
-- 7,200 lines of Rust, 122 tests
+- 26 source files across `src/{app,data,bio,ui}/`
+- 7,490 lines of Rust, 122 tests
 - 10x faster FASTA parsing, 8x faster sequence colorization
 - Ratatui differential rendering (no per-paint span resolution)
 - No GIL — true concurrent background scans + UI rendering
@@ -178,7 +231,7 @@ The Rust port shares the same visual design, keybindings, and annotation sidecar
 
 ## Commit history
 
-The project has 66+ commits documenting every design decision, performance optimization, and bug fix. Key commits:
+The project has 67+ commits documenting every design decision, performance optimization, and bug fix. Key commits:
 
 - `055d93e` — Pure-Python gene prediction scoring (hexamer, Kozak, CAI)
 - `e9548a8` — TSA-aware strand detection, multi-frame ORF display
