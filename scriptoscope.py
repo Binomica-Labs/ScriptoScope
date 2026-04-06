@@ -3881,7 +3881,16 @@ class SaveProjectModal(ModalScreen[str | None]):
                 )
                 app._set_status(f"[green]Project saved: {path}[/]")
                 app._refresh_library_table()
-                self.set_timer(1.2, lambda: self.dismiss(path))
+                # Dismiss after a short delay so the user sees the
+                # "Saved" message. Use call_later to avoid the
+                # "can't await dismiss from message handler" error
+                # that Textual 8.2 raises from set_timer callbacks.
+                def _do_dismiss() -> None:
+                    try:
+                        self.dismiss(path)
+                    except Exception:
+                        pass
+                self.set_timer(1.2, _do_dismiss)
 
             self.app.call_from_thread(_on_saved)
         except Exception as exc:
