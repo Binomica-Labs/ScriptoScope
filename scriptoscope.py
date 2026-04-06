@@ -226,16 +226,39 @@ class Transcript:
     def __post_init__(self) -> None:
         self.length = len(self.sequence)
 
+    def _ensure_gc(self) -> None:
+        """Compute GC% only — 4 C-level str.count() calls, no Counter."""
+        if self._gc is None:
+            if self.length == 0:
+                self._gc = 0.0
+            else:
+                s = self.sequence
+                gc = s.count("G") + s.count("g") + s.count("C") + s.count("c")
+                self._gc = gc / self.length * 100
+
     def _ensure_counts(self) -> None:
+        """Full ACGTN counts — 10 C-level str.count() calls.
+
+        Only called when the user clicks a transcript (composition legend
+        in the Sequence tab header). NOT called during bulk table load,
+        which only needs gc_content.
+        """
         if self._counts is None:
-            raw = Counter(self.sequence.upper())
-            self._counts = {b: raw.get(b, 0) for b in "ACGTN"}
-            gc = self._counts["G"] + self._counts["C"]
-            self._gc = (gc / self.length * 100) if self.length > 0 else 0.0
+            s = self.sequence
+            c_count = s.count("C") + s.count("c")
+            g_count = s.count("G") + s.count("g")
+            self._counts = {
+                "A": s.count("A") + s.count("a"),
+                "C": c_count,
+                "G": g_count,
+                "T": s.count("T") + s.count("t"),
+                "N": s.count("N") + s.count("n"),
+            }
+            self._gc = (g_count + c_count) / self.length * 100 if self.length > 0 else 0.0
 
     @property
     def gc_content(self) -> float:
-        self._ensure_counts()
+        self._ensure_gc()
         return self._gc  # type: ignore[return-value]
 
     @property
