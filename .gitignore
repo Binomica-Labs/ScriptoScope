@@ -8,3 +8,12 @@ build/
 *.blastdb.*
 *.fasta
 .claude/
+
+# setup-dev-env.com is checked into git — clone the repo and run it directly.
+
+# developer-daemon.com is built by setup-dev-env.com on first run (not checked in)
+developer-daemon.com
+developer-daemon.exe
+
+# Cosmopolitan Python download cache
+.cache/scriptoscope-ape/
