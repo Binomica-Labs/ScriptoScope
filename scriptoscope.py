@@ -896,12 +896,21 @@ def genbank_search_transcriptomes(query: str, max_results: int = 10) -> list[Gen
     from Bio import Entrez
     Entrez.email = "scriptoscope@example.com"
 
-    # Cascading search strategies — TSA records only
+    # Cascading search strategies — from most specific to broadest.
+    # Quoted query prevents false matches (e.g. "coli" matching random
+    # records). Strategies progress: TSA master → TSA keyword → RefSeq
+    # mRNA → broader fallbacks for model organisms that lack TSA entries.
+    q = query.strip()
+    # All strategies use [Organism] to avoid false positives from free-text
+    # matching (e.g. "coli" appearing in unrelated locust records).
+    # The cascade goes: TSA master → TSA keyword → RefSeq mRNA → mRNA.
     strategies = [
-        f"{query}[Organism] AND tsa-master[prop]",
-        f"{query}[Organism] AND TSA[Keyword]",
-        f"{query} AND tsa-master[prop]",
-        f"{query} AND TSA[Keyword]",
+        f'"{q}"[Organism] AND tsa-master[prop]',
+        f'"{q}"[Organism] AND TSA[Keyword]',
+        # For model organisms (E. coli, yeast, etc.) that don't have TSA
+        # entries — search mRNA sequences in nuccore instead.
+        f'"{q}"[Organism] AND biomol_mrna[prop] AND refseq[filter]',
+        f'"{q}"[Organism] AND biomol_mrna[prop]',
     ]
 
     id_list: list[str] = []
