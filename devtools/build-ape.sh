@@ -118,6 +118,7 @@ What it builds:
                           and automatically runs the correct rebuild/reinstall action:
                             scriptoscope.py           → pipx install . --force
                             pyproject.toml            → pipx install + inject requirements
+                            orf_core.c                → python devtools/build_orf_core.py
                             requirements.txt          → pipx install + inject requirements
                             devtools/__main__.py      → sh devtools/build-ape.sh
                             devtools/watch.py         → sh devtools/build-ape.sh

@@ -16,9 +16,10 @@ Changelog:
            NCBI RID cleanup on cancel, cache correctness fixes,
            translate() partial-codon warnings silenced
 """
+
 from __future__ import annotations
 
-__version__ = "0.6.0"
+__version__ = "0.6.1-a"
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
 import argparse
@@ -29,15 +30,15 @@ import json
 import logging
 import os
 import re
-import signal
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
 import time
 import urllib.request
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Generator, Optional
@@ -45,11 +46,13 @@ from typing import Callable, Generator, Optional
 import numpy as _np
 
 try:
-    from orf_core import scan_both_strands as _scan_both_strands_c
     from orf_core import scan_batch as _scan_batch_c
+    from orf_core import scan_batch_translate as _scan_batch_translate_c
+    from orf_core import scan_both_strands as _scan_both_strands_c
 except ImportError:
     _scan_both_strands_c = None
     _scan_batch_c = None
+    _scan_batch_translate_c = None
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 # Every session writes to a rotating log file. Default is /tmp/scriptoscope.log;
@@ -69,6 +72,7 @@ _SESSION_ID = _uuid.uuid4().hex[:8]
 
 class _SessionFilter(logging.Filter):
     """Inject the per-session ID into every log record."""
+
     def filter(self, record: logging.LogRecord) -> bool:
         record.session = _SESSION_ID
         return True
@@ -86,18 +90,20 @@ def _configure_logging() -> logging.Logger:
         handler: logging.Handler = RotatingFileHandler(
             _LOG_PATH,
             maxBytes=5 * 1024 * 1024,  # 5 MB per file
-            backupCount=3,              # keep 3 rotated copies
+            backupCount=3,  # keep 3 rotated copies
             encoding="utf-8",
         )
     except OSError:
         # Fallback: if we can't open the log file, write to stderr so at
         # least errors are visible somewhere.
         handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(
-        fmt="%(asctime)s [%(session)s] %(levelname)-5s "
+    handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s [%(session)s] %(levelname)-5s "
             "%(name)s.%(funcName)s:%(lineno)d %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
     handler.addFilter(_SessionFilter())
     root.addHandler(handler)
     root.propagate = False
@@ -110,7 +116,9 @@ _log = _configure_logging()
 def _log_startup_banner() -> None:
     """Log a clear, self-contained session header. Every bug report starts
     here — tell me the session ID and I can tell you exactly what was running."""
-    import platform, sys as _sys
+    import platform
+    import sys as _sys
+
     banner_lines = [
         "=" * 70,
         f"ScriptoScope session {_SESSION_ID} starting",
@@ -126,7 +134,8 @@ def _log_startup_banner() -> None:
     # any installed distribution; module.__version__ is unreliable (e.g.
     # rich doesn't expose it directly).
     try:
-        from importlib.metadata import version as _pkg_version, PackageNotFoundError
+        from importlib.metadata import PackageNotFoundError
+        from importlib.metadata import version as _pkg_version
     except ImportError:
         _pkg_version = None  # type: ignore
 
@@ -148,7 +157,9 @@ def _log_startup_banner() -> None:
         ("biopython", "biopython", "Bio"),
         ("pyhmmer", "pyhmmer", "pyhmmer"),
     ]:
-        banner_lines.append(f"  {pkg_name:<15} : {_safe_version(dist_name, import_name)}")
+        banner_lines.append(
+            f"  {pkg_name:<15} : {_safe_version(dist_name, import_name)}"
+        )
     banner_lines.append("=" * 70)
     for line in banner_lines:
         _log.info(line)
@@ -218,10 +229,10 @@ from textual.widgets import (
     TextArea,
 )
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Data model
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @dataclass
 class Transcript:
@@ -229,7 +240,9 @@ class Transcript:
     description: str
     sequence: str
     length: int = field(init=False, repr=False)
-    _counts: dict[str, int] | None = field(init=False, repr=False, compare=False, default=None)
+    _counts: dict[str, int] | None = field(
+        init=False, repr=False, compare=False, default=None
+    )
     _gc: float | None = field(init=False, repr=False, compare=False, default=None)
 
     def __post_init__(self) -> None:
@@ -259,6 +272,7 @@ class Transcript:
 # ══════════════════════════════════════════════════════════════════════════════
 # FASTA loader
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class FastaFormatError(ValueError):
     """Raised when a file does not look like a FASTA."""
@@ -293,8 +307,9 @@ def _parse_fasta(path: str | Path) -> Generator[Transcript, None, None]:
             if line.startswith(">"):
                 saw_header = True
                 if seq_id is not None:
-                    yield Transcript(id=seq_id, description=description,
-                                     sequence="".join(seq_parts))
+                    yield Transcript(
+                        id=seq_id, description=description, sequence="".join(seq_parts)
+                    )
                 header = line[1:]
                 parts = header.split(None, 1)
                 seq_id = parts[0]
@@ -309,8 +324,9 @@ def _parse_fasta(path: str | Path) -> Generator[Transcript, None, None]:
         )
 
     if seq_id is not None:
-        yield Transcript(id=seq_id, description=description,
-                         sequence="".join(seq_parts))
+        yield Transcript(
+            id=seq_id, description=description, sequence="".join(seq_parts)
+        )
 
 
 def load_all(path: str | Path) -> list[Transcript]:
@@ -337,7 +353,8 @@ def load_all(path: str | Path) -> list[Transcript]:
     if duplicate_count:
         _log.warning(
             "Loaded %s: %d duplicate transcript ID(s) renamed with __N suffix",
-            path, duplicate_count,
+            path,
+            duplicate_count,
         )
     return transcripts
 
@@ -368,25 +385,24 @@ def save_project(
     }
     if scan_cache:
         data["scan_cache"] = {
-            tid: [asdict(h) for h in hits]
-            for tid, hits in scan_cache.items()
+            tid: [asdict(h) for h in hits] for tid, hits in scan_cache.items()
         }
     if confirm_cache:
         data["confirm_cache"] = {
-            tid: asdict(conf)
-            for tid, conf in confirm_cache.items()
+            tid: asdict(conf) for tid, conf in confirm_cache.items()
         }
     if pfam_hits:
         data["pfam_hits"] = {
-            tid: sorted(families)
-            for tid, families in pfam_hits.items()
+            tid: sorted(families) for tid, families in pfam_hits.items()
         }
     # Atomic write: serialize to a sibling temp file, then rename.
     # Avoids leaving a half-written project file if the process dies mid-write.
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp_fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{dest.name}.", suffix=".tmp", dir=str(dest.parent),
+        prefix=f".{dest.name}.",
+        suffix=".tmp",
+        dir=str(dest.parent),
     )
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
@@ -413,6 +429,7 @@ def _coerce_dataclass(cls, raw: dict):
     """Build a dataclass from a dict, ignoring unknown keys and filling
     defaults for missing ones. Tolerates forward/backward-compat drift."""
     import dataclasses
+
     fields = {f.name for f in dataclasses.fields(cls)}
     kwargs = {k: v for k, v in raw.items() if k in fields}
     return cls(**kwargs)
@@ -455,11 +472,13 @@ def load_project(path: str | Path) -> dict:
     for i, t in enumerate(raw_transcripts):
         if not isinstance(t, dict) or "id" not in t or "sequence" not in t:
             raise ProjectFormatError(f"Transcript #{i} is missing id or sequence")
-        transcripts.append(Transcript(
-            id=str(t["id"]),
-            description=str(t.get("description", "")),
-            sequence=str(t["sequence"]),
-        ))
+        transcripts.append(
+            Transcript(
+                id=str(t["id"]),
+                description=str(t.get("description", "")),
+                sequence=str(t["sequence"]),
+            )
+        )
     result["transcripts"] = transcripts
 
     scan_cache: dict[str, list] = {}
@@ -482,7 +501,9 @@ def load_project(path: str | Path) -> dict:
             try:
                 confirm_cache[str(tid)] = _coerce_dataclass(BlastConfirmation, conf)
             except (TypeError, ValueError) as exc:
-                _log.warning("Skipping malformed BlastConfirmation for %s: %s", tid, exc)
+                _log.warning(
+                    "Skipping malformed BlastConfirmation for %s: %s", tid, exc
+                )
     result["confirm_cache"] = confirm_cache
 
     pfam_hits: dict[str, set[str]] = {}
@@ -498,9 +519,11 @@ def load_project(path: str | Path) -> dict:
 # GenBank transcriptome search
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class GenBankResult:
     """A single GenBank search result."""
+
     accession: str
     title: str
     organism: str
@@ -511,18 +534,22 @@ class GenBankResult:
 def _entrez_available() -> bool:
     try:
         from Bio import Entrez  # noqa: F401
+
         return True
     except ImportError:
         return False
 
 
-def genbank_search_transcriptomes(query: str, max_results: int = 10) -> list[GenBankResult]:
+def genbank_search_transcriptomes(
+    query: str, max_results: int = 10
+) -> list[GenBankResult]:
     """Search NCBI Nucleotide for TSA transcriptome assemblies by organism name.
 
     Uses a cascading search strategy: TSA master records first, then TSA keyword,
     then transcriptome in title, then free text. Returns up to max_results entries.
     """
     from Bio import Entrez
+
     Entrez.email = "scriptoscope@example.com"
 
     # Cascading search strategies — TSA records only
@@ -535,8 +562,13 @@ def genbank_search_transcriptomes(query: str, max_results: int = 10) -> list[Gen
 
     id_list: list[str] = []
     for search_term in strategies:
-        handle = Entrez.esearch(db="nuccore", term=search_term, retmax=max_results,
-                                sort="relevance", usehistory="n")
+        handle = Entrez.esearch(
+            db="nuccore",
+            term=search_term,
+            retmax=max_results,
+            sort="relevance",
+            usehistory="n",
+        )
         search_results = Entrez.read(handle)
         handle.close()
         if "ErrorList" in search_results:
@@ -562,10 +594,15 @@ def genbank_search_transcriptomes(query: str, max_results: int = 10) -> list[Gen
         organism = doc.get("Organism", "")
         length = int(doc.get("Length", 0))
         update = doc.get("UpdateDate", "")
-        results.append(GenBankResult(
-            accession=acc, title=title, organism=organism,
-            seq_count=length, update_date=update,
-        ))
+        results.append(
+            GenBankResult(
+                accession=acc,
+                title=title,
+                organism=organism,
+                seq_count=length,
+                update_date=update,
+            )
+        )
     return results
 
 
@@ -575,7 +612,9 @@ def _parse_tsa_range(accession: str) -> tuple[str, int, int, int] | None:
     Returns (prefix, first_num, last_num, num_width) or None if not a TSA master.
     """
     import re
+
     from Bio import Entrez
+
     Entrez.email = "scriptoscope@example.com"
 
     handle = Entrez.efetch(db="nuccore", id=accession, rettype="gb", retmode="text")
@@ -610,6 +649,7 @@ async def genbank_download_fasta(
     Returns the path to the downloaded FASTA file.
     """
     from Bio import Entrez
+
     Entrez.email = "scriptoscope@example.com"
 
     output_dir = Path(output_dir)
@@ -617,8 +657,8 @@ async def genbank_download_fasta(
     out_path = output_dir / f"{accession}.fasta"
 
     def _download() -> str:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         if progress_cb:
             progress_cb("Reading TSA master record…")
@@ -629,8 +669,9 @@ async def genbank_download_fasta(
             # Not a TSA master — try direct FASTA download
             if progress_cb:
                 progress_cb(f"Downloading {accession}…")
-            handle = Entrez.efetch(db="nuccore", id=accession,
-                                   rettype="fasta", retmode="text")
+            handle = Entrez.efetch(
+                db="nuccore", id=accession, rettype="fasta", retmode="text"
+            )
             data = handle.read()
             handle.close()
             if data.strip():
@@ -651,10 +692,9 @@ async def genbank_download_fasta(
         batches: list[list[str]] = []
         for start in range(first_num, last_num + 1, batch_size):
             end = min(start + batch_size - 1, last_num)
-            batches.append([
-                f"{prefix}{i:0{num_width}d}"
-                for i in range(start, end + 1)
-            ])
+            batches.append(
+                [f"{prefix}{i:0{num_width}d}" for i in range(start, end + 1)]
+            )
 
         fetched = [0]
         lock = threading.Lock()
@@ -663,8 +703,10 @@ async def genbank_download_fasta(
             for attempt in range(max_retries):
                 try:
                     h = Entrez.efetch(
-                        db="nuccore", id=",".join(accs),
-                        rettype="fasta", retmode="text",
+                        db="nuccore",
+                        id=",".join(accs),
+                        rettype="fasta",
+                        retmode="text",
                     )
                     data = h.read()
                     h.close()
@@ -691,8 +733,7 @@ async def genbank_download_fasta(
         results: dict[int, str] = {}
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futures = {
-                pool.submit(_fetch_batch, i, accs): i
-                for i, accs in enumerate(batches)
+                pool.submit(_fetch_batch, i, accs): i for i, accs in enumerate(batches)
             }
             for fut in as_completed(futures):
                 idx, data = fut.result()
@@ -711,6 +752,7 @@ async def genbank_download_fasta(
 # ══════════════════════════════════════════════════════════════════════════════
 # BLAST runner
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @dataclass
 class BlastHit:
@@ -738,14 +780,22 @@ def _parse_blast_tabular(output: str) -> list[BlastHit]:
         if len(cols) < 12:
             continue
         try:
-            hits.append(BlastHit(
-                query_id=cols[0], subject_id=cols[1],
-                pct_identity=float(cols[2]), alignment_length=int(cols[3]),
-                mismatches=int(cols[4]), gap_opens=int(cols[5]),
-                query_start=int(cols[6]), query_end=int(cols[7]),
-                subject_start=int(cols[8]), subject_end=int(cols[9]),
-                evalue=float(cols[10]), bit_score=float(cols[11]),
-            ))
+            hits.append(
+                BlastHit(
+                    query_id=cols[0],
+                    subject_id=cols[1],
+                    pct_identity=float(cols[2]),
+                    alignment_length=int(cols[3]),
+                    mismatches=int(cols[4]),
+                    gap_opens=int(cols[5]),
+                    query_start=int(cols[6]),
+                    query_end=int(cols[7]),
+                    subject_start=int(cols[8]),
+                    subject_end=int(cols[9]),
+                    evalue=float(cols[10]),
+                    bit_score=float(cols[11]),
+                )
+            )
         except (ValueError, IndexError):
             continue
     return hits
@@ -767,12 +817,18 @@ async def local_blast(
             fh.write(f">{safe_id}\n{query_seq}\n")
         cmd = [
             program,
-            "-query", query_file,
-            "-db", db_path,
-            "-evalue", str(evalue),
-            "-max_target_seqs", str(max_hits),
-            "-outfmt", "6",
-            "-num_threads", str(num_threads),
+            "-query",
+            query_file,
+            "-db",
+            db_path,
+            "-evalue",
+            str(evalue),
+            "-max_target_seqs",
+            str(max_hits),
+            "-outfmt",
+            "6",
+            "-num_threads",
+            str(num_threads),
         ]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -782,7 +838,9 @@ async def local_blast(
         stdout, stderr = await proc.communicate()
         raw = stdout.decode()
         if proc.returncode != 0:
-            raise RuntimeError(f"BLAST failed (exit {proc.returncode}):\n{stderr.decode()}")
+            raise RuntimeError(
+                f"BLAST failed (exit {proc.returncode}):\n{stderr.decode()}"
+            )
         return _parse_blast_tabular(raw), raw
     finally:
         Path(query_file).unlink(missing_ok=True)
@@ -818,24 +876,30 @@ def ncbi_blastp(
             return urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, socket.timeout):
-                raise RuntimeError("Connection to NCBI timed out — check your internet connection") from exc
+                raise RuntimeError(
+                    "Connection to NCBI timed out — check your internet connection"
+                ) from exc
             raise RuntimeError(f"Cannot reach NCBI: {exc.reason}") from exc
         except socket.timeout:
-            raise RuntimeError("Connection to NCBI timed out — check your internet connection")
+            raise RuntimeError(
+                "Connection to NCBI timed out — check your internet connection"
+            )
 
     # ── Submit ────────────────────────────────────────────────────────────
     if progress_cb:
         progress_cb("Submitting BlastP to NCBI…")
 
-    params = urlencode({
-        "CMD": "Put",
-        "PROGRAM": "blastp",
-        "DATABASE": database,
-        "QUERY": query_seq,
-        "EXPECT": str(evalue),
-        "HITLIST_SIZE": str(max_hits),
-        "FORMAT_TYPE": "XML",
-    }).encode()
+    params = urlencode(
+        {
+            "CMD": "Put",
+            "PROGRAM": "blastp",
+            "DATABASE": database,
+            "QUERY": query_seq,
+            "EXPECT": str(evalue),
+            "HITLIST_SIZE": str(max_hits),
+            "FORMAT_TYPE": "XML",
+        }
+    ).encode()
 
     req = urllib.request.Request(_BLAST_URL, data=params)
     with _ncbi_urlopen(req, timeout=30) as resp:
@@ -874,11 +938,13 @@ def ncbi_blastp(
             if progress_cb:
                 progress_cb(f"Waiting for NCBI BlastP results… ({elapsed}s)")
 
-            check_params = urlencode({
-                "CMD": "Get",
-                "FORMAT_OBJECT": "SearchInfo",
-                "RID": rid,
-            }).encode()
+            check_params = urlencode(
+                {
+                    "CMD": "Get",
+                    "FORMAT_OBJECT": "SearchInfo",
+                    "RID": rid,
+                }
+            ).encode()
             req = urllib.request.Request(_BLAST_URL, data=check_params)
             with _ncbi_urlopen(req, timeout=30) as resp:
                 status_text = resp.read().decode()
@@ -900,11 +966,13 @@ def ncbi_blastp(
     if progress_cb:
         progress_cb("Downloading NCBI BlastP results…")
 
-    get_params = urlencode({
-        "CMD": "Get",
-        "FORMAT_TYPE": "XML",
-        "RID": rid,
-    }).encode()
+    get_params = urlencode(
+        {
+            "CMD": "Get",
+            "FORMAT_TYPE": "XML",
+            "RID": rid,
+        }
+    ).encode()
     req = urllib.request.Request(_BLAST_URL, data=get_params)
     with _ncbi_urlopen(req, timeout=60) as resp:
         xml_data = resp.read().decode()
@@ -928,21 +996,23 @@ def ncbi_blastp(
                     identity = int(hsp.findtext("Hsp_identity", "0"))
                     align_len = int(hsp.findtext("Hsp_align-len", "1"))
                     pct_id = (identity / align_len * 100) if align_len else 0.0
-                    hits.append(BlastHit(
-                        query_id=query_id,
-                        subject_id=subject_label,
-                        pct_identity=pct_id,
-                        alignment_length=align_len,
-                        mismatches=int(hsp.findtext("Hsp_gaps", "0")),
-                        gap_opens=0,
-                        query_start=int(hsp.findtext("Hsp_query-from", "0")),
-                        query_end=int(hsp.findtext("Hsp_query-to", "0")),
-                        subject_start=int(hsp.findtext("Hsp_hit-from", "0")),
-                        subject_end=int(hsp.findtext("Hsp_hit-to", "0")),
-                        evalue=float(hsp.findtext("Hsp_evalue", "999")),
-                        bit_score=float(hsp.findtext("Hsp_bit-score", "0")),
-                        subject_description=hit_def,
-                    ))
+                    hits.append(
+                        BlastHit(
+                            query_id=query_id,
+                            subject_id=subject_label,
+                            pct_identity=pct_id,
+                            alignment_length=align_len,
+                            mismatches=int(hsp.findtext("Hsp_gaps", "0")),
+                            gap_opens=0,
+                            query_start=int(hsp.findtext("Hsp_query-from", "0")),
+                            query_end=int(hsp.findtext("Hsp_query-to", "0")),
+                            subject_start=int(hsp.findtext("Hsp_hit-from", "0")),
+                            subject_end=int(hsp.findtext("Hsp_hit-to", "0")),
+                            evalue=float(hsp.findtext("Hsp_evalue", "999")),
+                            bit_score=float(hsp.findtext("Hsp_bit-score", "0")),
+                            subject_description=hit_def,
+                        )
+                    )
                 except (ValueError, TypeError):
                     continue
                 break  # only first HSP per hit
@@ -954,8 +1024,16 @@ def ncbi_blastp(
 
 async def make_blast_db(fasta_path: str, db_type: str = "nucl") -> str:
     db_prefix = fasta_path + ".blastdb"
-    cmd = ["makeblastdb", "-in", fasta_path, "-dbtype", db_type,
-           "-out", db_prefix, "-parse_seqids"]
+    cmd = [
+        "makeblastdb",
+        "-in",
+        fasta_path,
+        "-dbtype",
+        db_type,
+        "-out",
+        db_prefix,
+        "-parse_seqids",
+    ]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -980,6 +1058,7 @@ def blast_available() -> bool:
 # HMMER runner
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class HmmerHit:
     target_name: str
@@ -1000,6 +1079,7 @@ class HmmerHit:
 def hmmer_available() -> bool:
     try:
         import pyhmmer  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -1008,13 +1088,14 @@ def hmmer_available() -> bool:
 @dataclass
 class ORFCoord:
     """An ORF with its nucleotide-space coordinates."""
+
     orf_id: str
-    strand: str          # "+" or "-"
-    frame: int           # 1, 2, or 3
-    nt_start: int        # 0-based nucleotide start on the original sequence
-    nt_end: int          # 0-based nucleotide end (exclusive) on the original sequence
+    strand: str  # "+" or "-"
+    frame: int  # 1, 2, or 3
+    nt_start: int  # 0-based nucleotide start on the original sequence
+    nt_end: int  # 0-based nucleotide end (exclusive) on the original sequence
     aa_length: int
-    sequence: str        # amino-acid sequence
+    sequence: str  # amino-acid sequence
     stop_count: int = 1  # number of consecutive in-frame stop codons
 
 
@@ -1022,6 +1103,7 @@ def _six_frame_proteins(nucleotide: str, seq_id: str) -> list[tuple[str, str]]:
     """Return (id, protein_seq) for all ORFs that start with M and end at a
     stop codon, with length >= 30 aa."""
     from Bio.Seq import Seq
+
     seq = Seq(nucleotide.upper())
     results = []
     for strand, nuc in (("+", seq), ("-", seq.reverse_complement())):
@@ -1029,7 +1111,7 @@ def _six_frame_proteins(nucleotide: str, seq_id: str) -> list[tuple[str, str]]:
             # Trim to a codon boundary so translate() doesn't warn about
             # partial codons.
             frame_len = (len(nuc) - frame) // 3 * 3
-            trans = str(nuc[frame:frame + frame_len].translate(to_stop=False))
+            trans = str(nuc[frame : frame + frame_len].translate(to_stop=False))
             segments = trans.split("*")
             aa_offset = 0
             for i, seg in enumerate(segments):
@@ -1042,27 +1124,32 @@ def _six_frame_proteins(nucleotide: str, seq_id: str) -> list[tuple[str, str]]:
                     while m_pos != -1:
                         cand_len = seg_len - m_pos
                         if cand_len >= 30:
-                            results.append((
-                                f"{seq_id}_{strand}f{frame+1}_orf{i}m{orf_idx}",
-                                seg[m_pos:],
-                            ))
+                            results.append(
+                                (
+                                    f"{seq_id}_{strand}f{frame + 1}_orf{i}m{orf_idx}",
+                                    seg[m_pos:],
+                                )
+                            )
                             orf_idx += 1
                         m_pos = seg.find("M", m_pos + 1)
                 aa_offset += len(seg) + 1
     return results
 
 
-def _six_frame_orf_coords(nucleotide: str, seq_id: str, min_aa: int = 30) -> list[ORFCoord]:
+def _six_frame_orf_coords(
+    nucleotide: str, seq_id: str, min_aa: int = 30
+) -> list[ORFCoord]:
     """Return ORFs that start with ATG (M) and end at a stop codon,
     with their nucleotide-space coordinates on the original sequence."""
     from Bio.Seq import Seq
+
     seq = Seq(nucleotide.upper())
     seq_len = len(seq)
     coords: list[ORFCoord] = []
     for strand, nuc in (("+", seq), ("-", seq.reverse_complement())):
         for frame_idx in range(3):
             frame_len = (len(nuc) - frame_idx) // 3 * 3
-            trans = str(nuc[frame_idx:frame_idx + frame_len].translate(to_stop=False))
+            trans = str(nuc[frame_idx : frame_idx + frame_len].translate(to_stop=False))
             segments = trans.split("*")
             aa_offset = 0
             for i, seg in enumerate(segments):
@@ -1084,7 +1171,9 @@ def _six_frame_orf_coords(nucleotide: str, seq_id: str, min_aa: int = 30) -> lis
                             cand_aa_offset = aa_offset + m_pos
                             strand_nt_start = frame_idx + cand_aa_offset * 3
                             # +3 per stop codon to include consecutive stops
-                            strand_nt_end = strand_nt_start + len(candidate) * 3 + 3 * n_stops
+                            strand_nt_end = (
+                                strand_nt_start + len(candidate) * 3 + 3 * n_stops
+                            )
                             strand_nt_end = min(strand_nt_end, len(nuc))
                             if strand == "+":
                                 nt_start = strand_nt_start
@@ -1092,13 +1181,21 @@ def _six_frame_orf_coords(nucleotide: str, seq_id: str, min_aa: int = 30) -> lis
                             else:
                                 nt_start = seq_len - strand_nt_end
                                 nt_end = seq_len - strand_nt_start
-                            orf_id = f"{seq_id}_{strand}f{frame_idx+1}_orf{i}m{orf_idx}"
-                            coords.append(ORFCoord(
-                                orf_id=orf_id, strand=strand, frame=frame_idx + 1,
-                                nt_start=nt_start, nt_end=nt_end,
-                                aa_length=len(candidate), sequence=candidate,
-                                stop_count=n_stops,
-                            ))
+                            orf_id = (
+                                f"{seq_id}_{strand}f{frame_idx + 1}_orf{i}m{orf_idx}"
+                            )
+                            coords.append(
+                                ORFCoord(
+                                    orf_id=orf_id,
+                                    strand=strand,
+                                    frame=frame_idx + 1,
+                                    nt_start=nt_start,
+                                    nt_end=nt_end,
+                                    aa_length=len(candidate),
+                                    sequence=candidate,
+                                    stop_count=n_stops,
+                                )
+                            )
                             orf_idx += 1
                         m_pos = seg.find("M", m_pos + 1)
                 aa_offset += len(seg) + 1
@@ -1118,28 +1215,76 @@ def _seq_fingerprint(seq: str) -> int:
     if n <= 192:
         return hash(seq)
     mid = n // 2
-    return hash((seq[:64], seq[mid:mid + 64], seq[-64:]))
+    return hash((seq[:64], seq[mid : mid + 64], seq[-64:]))
 
 
 # Minimal codon table for translating a single winning ORF after the regex
 # scanner has picked it. Kept small and local — no general-purpose translator.
 _ORF_CODON_TABLE: dict[str, str] = {
-    "TTT": "F", "TTC": "F", "TTA": "L", "TTG": "L",
-    "CTT": "L", "CTC": "L", "CTA": "L", "CTG": "L",
-    "ATT": "I", "ATC": "I", "ATA": "I", "ATG": "M",
-    "GTT": "V", "GTC": "V", "GTA": "V", "GTG": "V",
-    "TCT": "S", "TCC": "S", "TCA": "S", "TCG": "S",
-    "CCT": "P", "CCC": "P", "CCA": "P", "CCG": "P",
-    "ACT": "T", "ACC": "T", "ACA": "T", "ACG": "T",
-    "GCT": "A", "GCC": "A", "GCA": "A", "GCG": "A",
-    "TAT": "Y", "TAC": "Y", "TAA": "*", "TAG": "*",
-    "CAT": "H", "CAC": "H", "CAA": "Q", "CAG": "Q",
-    "AAT": "N", "AAC": "N", "AAA": "K", "AAG": "K",
-    "GAT": "D", "GAC": "D", "GAA": "E", "GAG": "E",
-    "TGT": "C", "TGC": "C", "TGA": "*", "TGG": "W",
-    "CGT": "R", "CGC": "R", "CGA": "R", "CGG": "R",
-    "AGT": "S", "AGC": "S", "AGA": "R", "AGG": "R",
-    "GGT": "G", "GGC": "G", "GGA": "G", "GGG": "G",
+    "TTT": "F",
+    "TTC": "F",
+    "TTA": "L",
+    "TTG": "L",
+    "CTT": "L",
+    "CTC": "L",
+    "CTA": "L",
+    "CTG": "L",
+    "ATT": "I",
+    "ATC": "I",
+    "ATA": "I",
+    "ATG": "M",
+    "GTT": "V",
+    "GTC": "V",
+    "GTA": "V",
+    "GTG": "V",
+    "TCT": "S",
+    "TCC": "S",
+    "TCA": "S",
+    "TCG": "S",
+    "CCT": "P",
+    "CCC": "P",
+    "CCA": "P",
+    "CCG": "P",
+    "ACT": "T",
+    "ACC": "T",
+    "ACA": "T",
+    "ACG": "T",
+    "GCT": "A",
+    "GCC": "A",
+    "GCA": "A",
+    "GCG": "A",
+    "TAT": "Y",
+    "TAC": "Y",
+    "TAA": "*",
+    "TAG": "*",
+    "CAT": "H",
+    "CAC": "H",
+    "CAA": "Q",
+    "CAG": "Q",
+    "AAT": "N",
+    "AAC": "N",
+    "AAA": "K",
+    "AAG": "K",
+    "GAT": "D",
+    "GAC": "D",
+    "GAA": "E",
+    "GAG": "E",
+    "TGT": "C",
+    "TGC": "C",
+    "TGA": "*",
+    "TGG": "W",
+    "CGT": "R",
+    "CGC": "R",
+    "CGA": "R",
+    "CGG": "R",
+    "AGT": "S",
+    "AGC": "S",
+    "AGA": "R",
+    "AGG": "R",
+    "GGT": "G",
+    "GGC": "G",
+    "GGA": "G",
+    "GGG": "G",
 }
 
 
@@ -1150,7 +1295,7 @@ def _translate_orf_dna(dna: str) -> str:
     table = _ORF_CODON_TABLE
     aa: list[str] = []
     for i in range(0, len(dna) - 2, 3):
-        codon = dna[i:i + 3]
+        codon = dna[i : i + 3]
         letter = table.get(codon, "X")
         if letter == "*":
             break
@@ -1248,7 +1393,7 @@ def _find_longest_orf(nucleotide: str, seq_id: str) -> ORFCoord | None:
     n_stops = 1
     probe = best_strand_stop + 3
     strand_stops = (b"TAA", b"TAG", b"TGA")
-    while probe + 3 <= len(strand_b) and strand_b[probe:probe + 3] in strand_stops:
+    while probe + 3 <= len(strand_b) and strand_b[probe : probe + 3] in strand_stops:
         n_stops += 1
         probe += 3
 
@@ -1290,7 +1435,7 @@ def _find_longest_orfs_batch(
     nthreads:  worker threads (0 = auto-detect from os.cpu_count()).
     Returns:   list of ORFCoord | None, one per input sequence.
     """
-    if _scan_batch_c is None:
+    if _scan_batch_translate_c is None and _scan_batch_c is None:
         return [_find_longest_orf(nuc, sid) for sid, nuc in sequences]
 
     if nthreads <= 0:
@@ -1299,59 +1444,109 @@ def _find_longest_orfs_batch(
     n = len(sequences)
     nucleotides = [nuc for _, nuc in sequences]
 
-    # One C call: scan all sequences in parallel (GIL released internally).
-    raw_results = _scan_batch_c(nucleotides, nthreads)
-
-    # Post-process each result in Python (translation, coords, caching).
     out: list[ORFCoord | None] = []
-    for i in range(n):
-        seq_id, nucleotide = sequences[i]
-        strand_idx, frame, atg_pos, stop_pos, length = raw_results[i]
 
-        if length < 30:
-            out.append(None)
-            continue
+    if _scan_batch_translate_c is not None:
+        # Fast path: single C call does uppercasing, scanning, AND translation.
+        # No per-sequence O(seq_len) Python work after this point.
+        raw_results = _scan_batch_translate_c(nucleotides, nthreads)
+        for i in range(n):
+            seq_id, nucleotide = sequences[i]
+            strand_idx, frame, atg_pos, stop_pos, length, aa_bytes, stop_count = (
+                raw_results[i]
+            )
+            if length < 30:
+                out.append(None)
+                continue
+            seq_len = len(nucleotide)
+            best_strand = "+" if strand_idx == 0 else "-"
+            aa_sequence = aa_bytes.decode("ascii")
+            strand_nt_start = atg_pos
+            strand_nt_end = stop_pos + 3 * stop_count
+            strand_nt_end = min(strand_nt_end, seq_len)
+            if best_strand == "+":
+                nt_start = strand_nt_start
+                nt_end = strand_nt_end
+            else:
+                nt_start = seq_len - strand_nt_end
+                nt_end = seq_len - strand_nt_start
+            orf_id = f"{seq_id}_{best_strand}f{frame + 1}_m{atg_pos}"
+            result = ORFCoord(
+                orf_id=orf_id,
+                strand=best_strand,
+                frame=frame + 1,
+                nt_start=nt_start,
+                nt_end=nt_end,
+                aa_length=length,
+                sequence=aa_sequence,
+                stop_count=stop_count,
+            )
+            key = (seq_id, len(nucleotide), _seq_fingerprint(nucleotide))
+            _longest_orf_cache[key] = result
+            if len(_longest_orf_cache) > _LONGEST_ORF_CACHE_MAX:
+                _longest_orf_cache.popitem(last=False)
+            out.append(result)
+    else:
+        # Fallback: C scans, Python translates (1835 ms bottleneck path).
+        # _scan_batch_c must be non-None here: the early-return at the top of
+        # this function already handled the both-None case, and we only reach
+        # this branch when _scan_batch_translate_c is None.
+        assert _scan_batch_c is not None
+        # One C call: scan all sequences in parallel (GIL released internally).
+        raw_results = _scan_batch_c(nucleotides, nthreads)
 
-        seq_len = len(nucleotide)
-        best_strand = "+" if strand_idx == 0 else "-"
+        # Post-process each result in Python (translation, coords, caching).
+        for i in range(n):
+            seq_id, nucleotide = sequences[i]
+            strand_idx, frame, atg_pos, stop_pos, length = raw_results[i]
 
-        upper_b = nucleotide.upper().encode("ascii")
-        if best_strand == "-":
-            strand_b = upper_b.translate(_RC_TABLE_B)[::-1]
-        else:
-            strand_b = upper_b
-        orf_dna = strand_b[atg_pos:stop_pos].decode("ascii")
-        aa_sequence = _translate_orf_dna(orf_dna)
+            if length < 30:
+                out.append(None)
+                continue
 
-        n_stops = 1
-        probe = stop_pos + 3
-        strand_stops = (b"TAA", b"TAG", b"TGA")
-        while probe + 3 <= len(strand_b) and strand_b[probe:probe + 3] in strand_stops:
-            n_stops += 1
-            probe += 3
+            seq_len = len(nucleotide)
+            best_strand = "+" if strand_idx == 0 else "-"
 
-        strand_nt_start = atg_pos
-        strand_nt_end = stop_pos + 3 * n_stops
-        strand_nt_end = min(strand_nt_end, len(strand_b))
-        if best_strand == "+":
-            nt_start = strand_nt_start
-            nt_end = strand_nt_end
-        else:
-            nt_start = seq_len - strand_nt_end
-            nt_end = seq_len - strand_nt_start
+            upper_b = nucleotide.upper().encode("ascii")
+            if best_strand == "-":
+                strand_b = upper_b.translate(_RC_TABLE_B)[::-1]
+            else:
+                strand_b = upper_b
+            orf_dna = strand_b[atg_pos:stop_pos].decode("ascii")
+            aa_sequence = _translate_orf_dna(orf_dna)
 
-        orf_id = f"{seq_id}_{best_strand}f{frame + 1}_m{atg_pos}"
-        result = ORFCoord(
-            orf_id=orf_id,
-            strand=best_strand,
-            frame=frame + 1,
-            nt_start=nt_start,
-            nt_end=nt_end,
-            aa_length=length,
-            sequence=aa_sequence,
-            stop_count=n_stops,
-        )
-        out.append(result)
+            n_stops = 1
+            probe = stop_pos + 3
+            strand_stops = (b"TAA", b"TAG", b"TGA")
+            while (
+                probe + 3 <= len(strand_b)
+                and strand_b[probe : probe + 3] in strand_stops
+            ):
+                n_stops += 1
+                probe += 3
+
+            strand_nt_start = atg_pos
+            strand_nt_end = stop_pos + 3 * n_stops
+            strand_nt_end = min(strand_nt_end, len(strand_b))
+            if best_strand == "+":
+                nt_start = strand_nt_start
+                nt_end = strand_nt_end
+            else:
+                nt_start = seq_len - strand_nt_end
+                nt_end = seq_len - strand_nt_start
+
+            orf_id = f"{seq_id}_{best_strand}f{frame + 1}_m{atg_pos}"
+            result = ORFCoord(
+                orf_id=orf_id,
+                strand=best_strand,
+                frame=frame + 1,
+                nt_start=nt_start,
+                nt_end=nt_end,
+                aa_length=length,
+                sequence=aa_sequence,
+                stop_count=n_stops,
+            )
+            out.append(result)
 
     return out
 
@@ -1413,9 +1608,15 @@ _FRAME_COLORS = {
 }
 
 _DOMAIN_PALETTE = [
-    "bright_magenta", "bright_cyan", "bright_yellow",
-    "magenta", "cyan", "yellow",
-    "bright_white", "bright_red", "bright_green",
+    "bright_magenta",
+    "bright_cyan",
+    "bright_yellow",
+    "magenta",
+    "cyan",
+    "yellow",
+    "bright_white",
+    "bright_red",
+    "bright_green",
 ]
 
 
@@ -1567,12 +1768,20 @@ def render_orf_diagram(
         for h in orf_hits:
             family = h.target_name
             if family not in domain_color_map:
-                domain_color_map[family] = _DOMAIN_PALETTE[color_idx % len(_DOMAIN_PALETTE)]
+                domain_color_map[family] = _DOMAIN_PALETTE[
+                    color_idx % len(_DOMAIN_PALETTE)
+                ]
                 color_idx += 1
-            domain_info.append((
-                h.ali_from, h.ali_to, family, h.accession,
-                domain_color_map[family], h.evalue,
-            ))
+            domain_info.append(
+                (
+                    h.ali_from,
+                    h.ali_to,
+                    family,
+                    h.accession,
+                    domain_color_map[family],
+                    h.evalue,
+                )
+            )
 
         # Combined protein track
         prot_line = Text()
@@ -1602,7 +1811,12 @@ def render_orf_diagram(
             ch = track[ci]
             cur_color = col_color[ci] if ch == "█" else "bright_black"
             run_end = ci + 1
-            while run_end < len(track) and track[run_end] == ch and (col_color[run_end] if track[run_end] == "█" else "bright_black") == cur_color:
+            while (
+                run_end < len(track)
+                and track[run_end] == ch
+                and (col_color[run_end] if track[run_end] == "█" else "bright_black")
+                == cur_color
+            ):
                 run_end += 1
             prot_line.append("".join(track[ci:run_end]), style=cur_color)
             ci = run_end
@@ -1619,7 +1833,7 @@ def render_orf_diagram(
             c_end = min(c_end, track_w)
 
             block_w = c_end - c_start + 1
-            name_display = family[:block_w - 2] if block_w >= 6 else ("▓" * block_w)
+            name_display = family[: block_w - 2] if block_w >= 6 else ("▓" * block_w)
             pad_total = block_w - len(name_display)
             pad_left = pad_total // 2
             pad_right = pad_total - pad_left
@@ -1702,6 +1916,7 @@ class HMMCancelled(Exception):
 # ── HMM database cache ──────────────────────────────────────────────────────
 # Avoids reloading ~20k Pfam HMMs on every scan.
 
+
 class _HMMCache:
     """Cache pressed/loaded HMMs so repeated scans skip the file-loading step."""
 
@@ -1717,6 +1932,7 @@ class _HMMCache:
         # Load outside the lock to avoid blocking concurrent callers
         _log.info("Loading HMM database %s …", db_path)
         import pyhmmer
+
         with pyhmmer.plan7.HMMFile(db_path) as hmm_file:
             hmms = list(hmm_file)
         with self._lock:
@@ -1785,22 +2001,26 @@ async def hmmscan(
                 for hit in top_hits:
                     if not use_gathering and hit.evalue > evalue_threshold:
                         continue
-                    best_dom = max(hit.domains.included, key=lambda d: d.score, default=None)
-                    results.append(HmmerHit(
-                        target_name=str(query.name or ""),
-                        accession=str(query.accession or ""),
-                        query_name=str(hit.name or ""),
-                        evalue=hit.evalue,
-                        score=hit.score,
-                        bias=hit.bias,
-                        description=str(query.description or ""),
-                        dom_evalue=best_dom.c_evalue if best_dom else 0.0,
-                        dom_score=best_dom.score if best_dom else 0.0,
-                        hmm_from=best_dom.alignment.hmm_from if best_dom else 0,
-                        hmm_to=best_dom.alignment.hmm_to if best_dom else 0,
-                        ali_from=best_dom.alignment.target_from if best_dom else 0,
-                        ali_to=best_dom.alignment.target_to if best_dom else 0,
-                    ))
+                    best_dom = max(
+                        hit.domains.included, key=lambda d: d.score, default=None
+                    )
+                    results.append(
+                        HmmerHit(
+                            target_name=str(query.name or ""),
+                            accession=str(query.accession or ""),
+                            query_name=str(hit.name or ""),
+                            evalue=hit.evalue,
+                            score=hit.score,
+                            bias=hit.bias,
+                            description=str(query.description or ""),
+                            dom_evalue=best_dom.c_evalue if best_dom else 0.0,
+                            dom_score=best_dom.score if best_dom else 0.0,
+                            hmm_from=best_dom.alignment.hmm_from if best_dom else 0,
+                            hmm_to=best_dom.alignment.hmm_to if best_dom else 0,
+                            ali_from=best_dom.alignment.target_from if best_dom else 0,
+                            ali_to=best_dom.alignment.target_to if best_dom else 0,
+                        )
+                    )
         except ValueError as exc:
             if "cutoff" in str(exc).lower() or "gathering" in str(exc).lower():
                 raise RuntimeError(
@@ -1847,7 +2067,9 @@ async def hmmsearch_all(
                 best = _find_longest_orf(t.sequence, t.id)
                 if best is None:
                     continue
-                ts = pyhmmer.easel.TextSequence(name=best.orf_id, sequence=best.sequence)
+                ts = pyhmmer.easel.TextSequence(
+                    name=best.orf_id, sequence=best.sequence
+                )
                 digital_seqs.append(ts.digitize(alpha))
                 orf_to_parent[best.orf_id] = t.id
             else:
@@ -1868,9 +2090,7 @@ async def hmmsearch_all(
         search_kwargs: dict = {"cpus": _hmm_cpus}
         if use_gathering:
             search_kwargs["bit_cutoffs"] = "gathering"
-            _log.info(
-                "hmmsearch_all: using gathering cutoffs (fast Pfam mode)"
-            )
+            _log.info("hmmsearch_all: using gathering cutoffs (fast Pfam mode)")
         else:
             search_kwargs["E"] = evalue_threshold
             _log.info(
@@ -1928,6 +2148,7 @@ async def hmmsearch_all(
 @dataclass
 class BlastConfirmation:
     """Result of confirming a putative CDS via NCBI BLAST."""
+
     confirmed: bool
     top_hit_name: str = ""
     top_hit_acc: str = ""
@@ -1949,7 +2170,8 @@ _PFAM_DEFAULT_DIR = Path.home() / ".scriptoscope" / "pfam"
 
 
 def _download_file(
-    url: str, dest: Path,
+    url: str,
+    dest: Path,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> None:
     """Download a file from *url* to *dest* with optional progress callback."""
@@ -1977,6 +2199,7 @@ def _decompress_gz(src: Path, dest: Path) -> None:
 def _press_hmm(hmm_path: Path) -> None:
     """Press an HMM file using pyhmmer for fast access."""
     import pyhmmer
+
     with pyhmmer.plan7.HMMFile(str(hmm_path)) as hmm_file:
         hmms = list(hmm_file)
     pyhmmer.hmmpress(hmms, str(hmm_path))
@@ -1992,7 +2215,13 @@ def load_pfam_descriptions(clans_tsv: Path) -> dict[str, tuple[str, str]]:
             parts = line.rstrip("\n").split("\t")
             if len(parts) < 5:
                 continue
-            acc, _clan_id, _clan_name, name, desc = parts[0], parts[1], parts[2], parts[3], parts[4]
+            acc, _clan_id, _clan_name, name, desc = (
+                parts[0],
+                parts[1],
+                parts[2],
+                parts[3],
+                parts[4],
+            )
             entry = (name, desc)
             mapping[acc.lower()] = entry
             mapping[name.lower()] = entry
@@ -2026,7 +2255,9 @@ async def download_pfam(
                 pct = downloaded * 100 // total
                 mb = downloaded / 1_048_576
                 total_mb = total / 1_048_576
-                progress_cb(f"Downloading Pfam-A.hmm.gz… {mb:.0f}/{total_mb:.0f} MB ({pct}%)")
+                progress_cb(
+                    f"Downloading Pfam-A.hmm.gz… {mb:.0f}/{total_mb:.0f} MB ({pct}%)"
+                )
 
         if progress_cb:
             progress_cb("Downloading Pfam-A.hmm.gz (≈367 MB)…")
@@ -2055,7 +2286,10 @@ def pfam_db_exists(dest_dir: Path = _PFAM_DEFAULT_DIR) -> str | None:
     if hmm_path.exists():
         # Pfam-A.hmm is typically >1 GB; a tiny file means interrupted download
         if hmm_path.stat().st_size < 1_000_000:
-            _log.warning("Pfam HMM file appears truncated (%d bytes), ignoring", hmm_path.stat().st_size)
+            _log.warning(
+                "Pfam HMM file appears truncated (%d bytes), ignoring",
+                hmm_path.stat().st_size,
+            )
             return None
         return str(hmm_path)
     return None
@@ -2108,6 +2342,7 @@ def colorize_sequence(seq: str, width: int = 60) -> Text:
     validation — the dominant cost on plain unscanned clicks.
     """
     from rich.text import Span
+
     truncated = len(seq) > _MAX_DISPLAY_BASES
     display_seq = seq[:_MAX_DISPLAY_BASES] if truncated else seq
     n = len(display_seq)
@@ -2174,29 +2409,33 @@ def _text_to_content(text: "Text"):
     which manifests as multi-second stalls after HMM scans.
     """
     from textual.content import Content
+
     return Content.from_rich_text(text, console=None)
 
 
 @dataclass
 class SeqLineInfo:
     """Metadata for one rendered line in the annotated sequence view."""
-    line_type: str        # "header", "feat", "pfam", "dna", "aa", "blank"
-    chunk_start: int      # nucleotide offset of the chunk this line belongs to
-    chunk_len: int        # number of nucleotides in the chunk
+
+    line_type: str  # "header", "feat", "pfam", "dna", "aa", "blank"
+    chunk_start: int  # nucleotide offset of the chunk this line belongs to
+    chunk_len: int  # number of nucleotides in the chunk
 
 
 @dataclass
 class SeqFeatureRegion:
     """A clickable feature region in nucleotide space."""
+
     name: str
     nt_start: int
-    nt_end: int           # exclusive
-    aa_seq: str = ""      # amino acid sequence for this feature (N-term to C-term)
+    nt_end: int  # exclusive
+    aa_seq: str = ""  # amino acid sequence for this feature (N-term to C-term)
 
 
 @dataclass
 class SeqRenderResult:
     """Result of colorize_sequence_annotated."""
+
     text: Text
     line_map: list[SeqLineInfo]
     features: list[SeqFeatureRegion]
@@ -2210,8 +2449,10 @@ def _aa_codon_start(orf: ORFCoord, aa_idx: int) -> int:
 
 
 def _build_aa_track(
-    orf: ORFCoord, n: int,
-    aa_at: list[str | None], aa_color: list[str],
+    orf: ORFCoord,
+    n: int,
+    aa_at: list[str | None],
+    aa_color: list[str],
     base_override: list[str | None],
 ) -> None:
     """Fill amino acid and start/stop codon arrays for the CDS."""
@@ -2233,7 +2474,11 @@ def _build_aa_track(
 
     # Stop codons
     for si in range(orf.stop_count):
-        stop_pos = (orf.nt_end - (orf.stop_count - si) * 3) if orf.strand == "+" else (orf.nt_start + si * 3)
+        stop_pos = (
+            (orf.nt_end - (orf.stop_count - si) * 3)
+            if orf.strand == "+"
+            else (orf.nt_start + si * 3)
+        )
         if 0 <= stop_pos and stop_pos + 2 < n:
             for k in range(3):
                 base_override[stop_pos + k] = "bold bright_white on red"
@@ -2243,8 +2488,10 @@ def _build_aa_track(
 
 
 def _build_feature_track(
-    orf: ORFCoord, n: int,
-    feat_ch: list[str | None], feat_color: list[str],
+    orf: ORFCoord,
+    n: int,
+    feat_ch: list[str | None],
+    feat_color: list[str],
 ) -> None:
     """Fill CDS arrow track arrays (SnapGene-style)."""
     cds_color = _FRAME_COLORS.get((orf.strand, orf.frame), "bright_cyan")
@@ -2278,8 +2525,11 @@ def _build_feature_track(
 
 
 def _build_pfam_track(
-    orf: ORFCoord, hits: list[HmmerHit], n: int,
-    pfam_label: list[str | None], pfam_color: list[str],
+    orf: ORFCoord,
+    hits: list[HmmerHit],
+    n: int,
+    pfam_label: list[str | None],
+    pfam_color: list[str],
 ) -> tuple[list[HmmerHit], dict[str, str]]:
     """Fill Pfam domain annotation arrays. Returns (sorted_hits, domain_colors)."""
     sorted_hits = sorted(hits, key=lambda h: h.evalue)
@@ -2302,7 +2552,9 @@ def _build_pfam_track(
         nt_dom_start = max(0, nt_dom_start)
         nt_dom_end = min(n, nt_dom_end)
 
-        has_unclaimed = any(not pfam_claimed[p] for p in range(nt_dom_start, nt_dom_end))
+        has_unclaimed = any(
+            not pfam_claimed[p] for p in range(nt_dom_start, nt_dom_end)
+        )
         if not has_unclaimed:
             continue
 
@@ -2379,7 +2631,9 @@ def colorize_sequence_annotated(
         _build_aa_track(orf, n, aa_at, aa_color, base_override)
         _build_feature_track(orf, n, feat_ch, feat_color)
         if hits:
-            sorted_hits, domain_colors = _build_pfam_track(orf, hits, n, pfam_label, pfam_color)
+            sorted_hits, domain_colors = _build_pfam_track(
+                orf, hits, n, pfam_label, pfam_color
+            )
 
     # ── Assemble output ──────────────────────────────────────────────────
     # Build the entire output as a single plain string with pre-offset spans,
@@ -2387,6 +2641,7 @@ def colorize_sequence_annotated(
     # Text.append calls (each of which invokes Rich's strip_control_codes
     # validation) — benchmarks show ~2-3x speedup on the assembly phase.
     from rich.text import Span
+
     plain_parts: list[str] = []
     spans: list[Span] = []
     offset = 0
@@ -2454,7 +2709,7 @@ def colorize_sequence_annotated(
     if orf:
         cds_color = _FRAME_COLORS.get((orf.strand, orf.frame), "bright_cyan")
         _emit("  CDS: ", "dim")
-        _emit(f"{orf.nt_start+1}–{orf.nt_end}", f"bold {cds_color}")
+        _emit(f"{orf.nt_start + 1}–{orf.nt_end}", f"bold {cds_color}")
         _emit(f" ({orf.aa_length} aa, {orf.strand}f{orf.frame})", f"dim {cds_color}")
         _emit("  ", "dim")
         _emit(" ATG ", "bold bright_white on green")
@@ -2468,18 +2723,35 @@ def colorize_sequence_annotated(
         line_map.append(SeqLineInfo("header", 0, 0))
         line_map.append(SeqLineInfo("header", 0, 0))
         cur_line += 2
-        features.append(SeqFeatureRegion("CDS", orf.nt_start, orf.nt_end, aa_seq=orf.sequence))
+        features.append(
+            SeqFeatureRegion("CDS", orf.nt_start, orf.nt_end, aa_seq=orf.sequence)
+        )
 
     if orf and hits:
         for h in sorted_hits:
             aa_start = h.ali_from - 1
             aa_end = h.ali_to
-            nt_dom_start = orf.nt_start + aa_start * 3 if orf.strand == "+" else orf.nt_end - aa_end * 3
-            nt_dom_end = orf.nt_start + aa_end * 3 if orf.strand == "+" else orf.nt_end - aa_start * 3
+            nt_dom_start = (
+                orf.nt_start + aa_start * 3
+                if orf.strand == "+"
+                else orf.nt_end - aa_end * 3
+            )
+            nt_dom_end = (
+                orf.nt_start + aa_end * 3
+                if orf.strand == "+"
+                else orf.nt_end - aa_start * 3
+            )
             if nt_dom_start > nt_dom_end:
                 nt_dom_start, nt_dom_end = nt_dom_end, nt_dom_start
             dom_aa = orf.sequence[aa_start:aa_end]
-            features.append(SeqFeatureRegion(h.target_name, max(0, nt_dom_start), min(n, nt_dom_end), aa_seq=dom_aa))
+            features.append(
+                SeqFeatureRegion(
+                    h.target_name,
+                    max(0, nt_dom_start),
+                    min(n, nt_dom_end),
+                    aa_seq=dom_aa,
+                )
+            )
 
     # Precompute flat per-position style arrays ONCE for each line type.
     # The chunk loop then just slices these arrays instead of rebuilding
@@ -2660,10 +2932,12 @@ class SequenceViewer(ScrollableContainer):
     _cds_dna: str = ""  # raw CDS DNA for clipboard copy
     _line_map: list[SeqLineInfo] = []
     _features: list[SeqFeatureRegion] = []
-    _highlight: tuple[int, int] | None = None      # strong BLAST nav highlight
-    _aa_highlight: tuple[int, int] | None = None   # AA line highlight
-    _aa_highlight_seq: str = ""                    # for clipboard (N→C)
-    _focus_range: tuple[int, int] | None = None    # soft focus — dim bases outside this range
+    _highlight: tuple[int, int] | None = None  # strong BLAST nav highlight
+    _aa_highlight: tuple[int, int] | None = None  # AA line highlight
+    _aa_highlight_seq: str = ""  # for clipboard (N→C)
+    _focus_range: tuple[int, int] | None = (
+        None  # soft focus — dim bases outside this range
+    )
     _last_orf: ORFCoord | None = None
     _last_hits: list[HmmerHit] = []
     _last_width: int = 60
@@ -2682,7 +2956,9 @@ class SequenceViewer(ScrollableContainer):
         if t:
             self.show_transcript(t)
         else:
-            self.query_one("#seq-info", Static).update("Select a transcript from the list.")
+            self.query_one("#seq-info", Static).update(
+                "Select a transcript from the list."
+            )
             self.query_one("#seq-body", Static).update("")
             self._cds_dna = ""
             self.query_one("#seq-cds-btn", Static).add_class("hidden")
@@ -2741,7 +3017,10 @@ class SequenceViewer(ScrollableContainer):
         # Find the line in line_map that contains this position
         target_line = 0
         for idx, info in enumerate(self._line_map):
-            if info.line_type == "dna" and info.chunk_start <= pos < info.chunk_start + info.chunk_len:
+            if (
+                info.line_type == "dna"
+                and info.chunk_start <= pos < info.chunk_start + info.chunk_len
+            ):
                 target_line = idx
                 break
         # Each line is roughly 1 row in the Static; scroll the parent container
@@ -2828,12 +3107,17 @@ class SequenceViewer(ScrollableContainer):
             body.update("")
 
     @work(exclusive=True, thread=True, group="seq-render")
-    def _render_sequence_bg(self, t: Transcript, seq_width: int, scan_cache: dict | None) -> None:
+    def _render_sequence_bg(
+        self, t: Transcript, seq_width: int, scan_cache: dict | None
+    ) -> None:
         """Heavy sequence rendering on a background thread."""
         scanned = scan_cache is not None and t.id in scan_cache
         _log.debug(
             "render_sequence_bg start id=%s length=%d width=%d scanned=%s",
-            t.id, t.length, seq_width, scanned,
+            t.id,
+            t.length,
+            seq_width,
+            scanned,
         )
         # Gather inputs
         orf = None
@@ -2850,24 +3134,34 @@ class SequenceViewer(ScrollableContainer):
         cds_dna = ""
         if orf:
             if orf.strand == "+":
-                cds_dna = t.sequence[orf.nt_start:orf.nt_end]
+                cds_dna = t.sequence[orf.nt_start : orf.nt_end]
             else:
                 from Bio.Seq import Seq
-                cds_dna = str(Seq(t.sequence[orf.nt_start:orf.nt_end]).reverse_complement())
+
+                cds_dna = str(
+                    Seq(t.sequence[orf.nt_start : orf.nt_end]).reverse_complement()
+                )
 
         # Render (expensive)
         if orf:
             hit_key = tuple((h.target_name, h.ali_from, h.ali_to) for h in hits)
             cache_key = (
-                t.id, seq_width, self._highlight, self._aa_highlight,
-                self._focus_range, hit_key,
+                t.id,
+                seq_width,
+                self._highlight,
+                self._aa_highlight,
+                self._focus_range,
+                hit_key,
             )
             render = self._seq_render_cache.get(cache_key)
             if render is not None:
                 self._seq_render_cache.move_to_end(cache_key)
             else:
                 render = colorize_sequence_annotated(
-                    t.sequence, orf=orf, hits=hits, width=seq_width,
+                    t.sequence,
+                    orf=orf,
+                    hits=hits,
+                    width=seq_width,
                     highlight_range=self._highlight,
                     aa_highlight_range=self._aa_highlight,
                     focus_range=self._focus_range,
@@ -2909,10 +3203,7 @@ class SequenceViewer(ScrollableContainer):
         # toggle (focus_range, aa_highlight) on the same transcript. We
         # DON'T want to scroll to top every time the user clicks a feature
         # arrow or AA line.  We DO want to scroll to top on a new transcript.
-        preserve_scroll = (
-            self._render_seq_id == t.id
-            and self._last_width == seq_width
-        )
+        preserve_scroll = self._render_seq_id == t.id and self._last_width == seq_width
 
         # Apply results on main thread — bail if user already switched transcripts
         def _apply() -> None:
@@ -2944,7 +3235,9 @@ class SequenceViewer(ScrollableContainer):
         """Copy the CDS DNA sequence to the system clipboard."""
         if self._cds_dna:
             self.app.copy_to_clipboard(self._cds_dna)
-            self.app.notify(f"CDS DNA copied ({len(self._cds_dna)} bp)", severity="information")
+            self.app.notify(
+                f"CDS DNA copied ({len(self._cds_dna)} bp)", severity="information"
+            )
         else:
             self.app.notify("No CDS detected for this transcript", severity="warning")
 
@@ -2964,10 +3257,10 @@ class SequenceViewer(ScrollableContainer):
     @on(events.Click, "#seq-body")
     def _on_seq_body_click(self, event: events.Click) -> None:
         """Click behavior in the sequence body:
-          - feat/pfam line click on a feature → focus the feature (dim bases
-            outside the feature range, keep per-base colors inside)
-          - AA line click on a feature → focus + copy the feature's aa seq
-          - DNA/blank/header click → clear focus, restore full per-base coloring
+        - feat/pfam line click on a feature → focus the feature (dim bases
+          outside the feature range, keep per-base colors inside)
+        - AA line click on a feature → focus + copy the feature's aa seq
+        - DNA/blank/header click → clear focus, restore full per-base coloring
         """
         if not self._line_map or not self._features:
             return
@@ -3035,20 +3328,31 @@ class SequenceViewer(ScrollableContainer):
             cds_area.select_all()
             cds_area.focus()
             self.app.copy_to_clipboard(self._cds_dna)
-            self.app.notify(f"CDS DNA copied ({len(self._cds_dna)} bp)", severity="information")
+            self.app.notify(
+                f"CDS DNA copied ({len(self._cds_dna)} bp)", severity="information"
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Statistics panel widget
 # ══════════════════════════════════════════════════════════════════════════════
 
-_BUCKET_LABELS = ["<200 bp", "200–500 bp", "500–1k bp", "1k–2k bp", "2k–5k bp", ">5k bp"]
+_BUCKET_LABELS = [
+    "<200 bp",
+    "200–500 bp",
+    "500–1k bp",
+    "1k–2k bp",
+    "2k–5k bp",
+    ">5k bp",
+]
 
 _FILTER_RE = re.compile(r"(len|gc)\s*([<>]=?)\s*([\d.]+)", re.IGNORECASE)
 
 
 def _filter_transcripts(
-    transcripts: list[Transcript], query: str, bookmarks: set[str] | None = None,
+    transcripts: list[Transcript],
+    query: str,
+    bookmarks: set[str] | None = None,
 ) -> list[Transcript]:
     """Filter transcripts by text + optional len/gc numeric predicates.
 
@@ -3078,17 +3382,24 @@ def _filter_transcripts(
         results = [t for t in results if t.id in bookmarks]
     if text_query:
         results = [
-            t for t in results
+            t
+            for t in results
             if text_query in t.id.lower() or text_query in t.description.lower()
         ]
     for field, op, val in predicates:
+
         def _check(t: Transcript, f=field, o=op, v=val) -> bool:
             actual = float(t.length) if f == "len" else t.gc_content
-            if o == ">": return actual > v
-            if o == ">=": return actual >= v
-            if o == "<": return actual < v
-            if o == "<=": return actual <= v
+            if o == ">":
+                return actual > v
+            if o == ">=":
+                return actual >= v
+            if o == "<":
+                return actual < v
+            if o == "<=":
+                return actual <= v
             return True
+
         results = [t for t in results if _check(t)]
     return results
 
@@ -3099,12 +3410,17 @@ def _compute_basic_stats(transcripts: list[Transcript]) -> dict:
     n = len(lengths)
     if n == 0:
         return {
-            "n": 0, "total_bases": 0,
-            "shortest": 0, "longest": 0,
-            "mean_len": 0, "median_len": 0,
-            "n50": 0, "mean_gc": 0,
+            "n": 0,
+            "total_bases": 0,
+            "shortest": 0,
+            "longest": 0,
+            "mean_len": 0,
+            "median_len": 0,
+            "n50": 0,
+            "mean_gc": 0,
             "bucket_counts": [0] * 6,
-            "orf_count": 0, "orf_lengths": [],
+            "orf_count": 0,
+            "orf_lengths": [],
             "orfs_pending": True,
         }
     total_bases = sum(lengths)
@@ -3134,29 +3450,58 @@ def _compute_basic_stats(transcripts: list[Transcript]) -> dict:
         else:
             bucket_counts[5] += 1
     return {
-        "n": n, "total_bases": total_bases,
-        "shortest": lengths[0], "longest": lengths[-1],
-        "mean_len": mean_len, "median_len": median_len,
-        "n50": n50, "mean_gc": mean_gc,
+        "n": n,
+        "total_bases": total_bases,
+        "shortest": lengths[0],
+        "longest": lengths[-1],
+        "mean_len": mean_len,
+        "median_len": median_len,
+        "n50": n50,
+        "mean_gc": mean_gc,
         "bucket_counts": bucket_counts,
-        "orf_count": 0, "orf_lengths": [],
+        "orf_count": 0,
+        "orf_lengths": [],
         "orfs_pending": True,
     }
 
 
 def _compute_orf_stats(transcripts: list[Transcript]) -> dict:
-    """ORF-only stats — the expensive pass. Merge into a basic-stats dict."""
+    """ORF-only stats — the expensive pass. Merge into a basic-stats dict.
+
+    Calls _scan_batch_c directly to get lengths only, skipping ORFCoord
+    construction, AA translation, and cache writes.  Cache warming via
+    _find_longest_orfs_batch is intentionally omitted here: the cache holds
+    only 4096 entries, so for large transcriptomes (100k+) nearly every write
+    would be immediately evicted, making warming during stats computation
+    almost entirely wasteful.  Results are cached on demand when the user
+    clicks individual transcripts in the sequence viewer.
+    """
     orf_count = 0
     orf_lengths: list[int] = []
-    for t in transcripts:
-        aa = _longest_orf_aa_length(t.sequence)
-        if aa:
-            orf_count += 1
-            orf_lengths.append(aa)
+
+    if _scan_batch_c is not None:
+        nthreads = os.cpu_count() or 1
+        nucleotides = [t.sequence for t in transcripts]
+        raw_results = _scan_batch_c(nucleotides, nthreads)
+        for _strand, _frame, _atg, _stop, length in raw_results:
+            if length >= 30:
+                orf_count += 1
+                orf_lengths.append(length)
+        orf_backend = f"orf_core C extension ({nthreads} thread{'s' if nthreads != 1 else ''}, SIMD)"
+    else:
+        # Pure-Python fallback (no C extension available).
+        for t in transcripts:
+            aa = _longest_orf_aa_length(t.sequence)
+            if aa:
+                orf_count += 1
+                orf_lengths.append(aa)
+        orf_backend = "pure Python (C extension not built)"
+
     return {
         "orf_count": orf_count,
         "orf_lengths": sorted(orf_lengths),
         "orfs_pending": False,
+        "orf_backend": orf_backend,
     }
 
 
@@ -3191,7 +3536,9 @@ class StatsPanel(ScrollableContainer):
     def compose(self) -> ComposeResult:
         with Horizontal(id="stats-buttons"):
             yield Button("Compute Statistics", id="stats-compute", variant="primary")
-            yield Button("Export Stats CSV", id="stats-export", variant="default", disabled=True)
+            yield Button(
+                "Export Stats CSV", id="stats-export", variant="default", disabled=True
+            )
         yield Static("No transcriptome loaded.", id="stats-content")
 
     _last_shown_id: str = ""
@@ -3284,13 +3631,17 @@ class StatsPanel(ScrollableContainer):
         elements.append(Text(""))
 
         dist = Table(
-            "Length range", "Count", "%",
+            "Length range",
+            "Count",
+            "%",
             title="Length Distribution",
             title_style="bold magenta",
             header_style="bold magenta",
         )
         for label, count in zip(_BUCKET_LABELS, s["bucket_counts"]):
-            dist.add_row(label, f"{count:,}", f"{count / n * 100:.1f}%" if n else "0.0%")
+            dist.add_row(
+                label, f"{count:,}", f"{count / n * 100:.1f}%" if n else "0.0%"
+            )
         elements.append(dist)
 
         orf_count = s.get("orf_count", 0)
@@ -3298,17 +3649,30 @@ class StatsPanel(ScrollableContainer):
         orfs_pending = s.get("orfs_pending", False)
         elements.append(Text(""))
         if orfs_pending:
-            elements.append(Text(
-                "  ORF Statistics: scanning 6 frames…",
-                style="dim italic",
-            ))
+            elements.append(
+                Text(
+                    "  ORF Statistics: scanning 6 frames…",
+                    style="dim italic",
+                )
+            )
         elif orf_count > 0 and orf_lengths:
             orf_grid = Table.grid(padding=(0, 3))
             orf_grid.add_column(style="bold cyan", no_wrap=True)
             orf_grid.add_column(no_wrap=True)
-            orf_grid.title = "ORF Statistics (longest M-initiated ORF per transcript, ≥30 aa)"
+            orf_grid.title = (
+                "ORF Statistics (longest M-initiated ORF per transcript, ≥30 aa)"
+            )
             orf_grid.title_style = "bold magenta"
-            orf_grid.add_row("Transcripts with ORF", f"{orf_count:,} / {n:,} ({orf_count / n * 100:.1f}%)")
+            orf_grid.add_row(
+                "Transcripts with ORF",
+                f"{orf_count:,} / {n:,} ({orf_count / n * 100:.1f}%)",
+            )
+            orf_backend = s.get("orf_backend", "")
+            if orf_backend:
+                backend_style = (
+                    "yellow" if orf_backend.startswith("pure Python") else "dim"
+                )
+                orf_grid.add_row("Backend", Text(orf_backend, style=backend_style))
             orf_grid.add_row("Shortest ORF", f"{orf_lengths[0]:,} aa")
             orf_grid.add_row("Longest ORF", f"{orf_lengths[-1]:,} aa")
             mean_orf = sum(orf_lengths) / len(orf_lengths)
@@ -3385,7 +3749,9 @@ class StatsPanel(ScrollableContainer):
         for label, count in zip(_BUCKET_LABELS, s["bucket_counts"]):
             rows.append([f"Bucket {label}", str(count)])
         _export_csv(path, headers, rows)
-        self.app.query_one("#app-status", Static).update(f"[green]Exported stats to {path}[/]")
+        self.app.query_one("#app-status", Static).update(
+            f"[green]Exported stats to {path}[/]"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3431,6 +3797,7 @@ def _export_csv(path: str, headers: list[str], rows: list[list[str]]) -> None:
 
 class HelpModal(ModalScreen[None]):
     """Help screen showing keyboard shortcuts and features."""
+
     DEFAULT_CSS = """
     HelpModal { align: center middle; }
     HelpModal #help-dialog {
@@ -3441,7 +3808,10 @@ class HelpModal(ModalScreen[None]):
     HelpModal #help-body { height: auto; padding: 1 0; }
     HelpModal Button { margin: 1 0 0 0; width: 100%; }
     """
-    BINDINGS = [Binding("escape", "close", "Close"), Binding("question_mark", "close", "Close")]
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("question_mark", "close", "Close"),
+    ]
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="help-dialog"):
@@ -3488,6 +3858,7 @@ class HelpModal(ModalScreen[None]):
 
 class ConfirmModal(ModalScreen[bool]):
     """Simple yes/no confirmation dialog."""
+
     DEFAULT_CSS = """
     ConfirmModal { align: center middle; }
     ConfirmModal #confirm-dialog {
@@ -3525,6 +3896,7 @@ class ConfirmModal(ModalScreen[bool]):
 
 class SaveProjectModal(ModalScreen[str | None]):
     """Simple modal to confirm save path."""
+
     DEFAULT_CSS = """
     SaveProjectModal { align: center middle; }
     SaveProjectModal #save-dialog {
@@ -3548,7 +3920,9 @@ class SaveProjectModal(ModalScreen[str | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="save-dialog"):
             yield Label("Save Project", id="save-title")
-            yield Input(self._default, id="save-path", placeholder="Path to save project…")
+            yield Input(
+                self._default, id="save-path", placeholder="Path to save project…"
+            )
             yield Static("", id="save-status")
             with Horizontal(id="save-buttons"):
                 yield Button("Save", id="save-ok", variant="primary")
@@ -3580,7 +3954,9 @@ class SaveProjectModal(ModalScreen[str | None]):
             except Exception:
                 pass
             save_project(
-                path, app._transcripts, app._fasta_path,
+                path,
+                app._transcripts,
+                app._fasta_path,
                 scan_cache=scan_cache,
                 confirm_cache=confirm_cache,
                 pfam_hits=app._pfam_hits,
@@ -3620,6 +3996,7 @@ class SaveProjectModal(ModalScreen[str | None]):
 
 class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
     """Modal for searching and downloading GenBank transcriptomes."""
+
     DEFAULT_CSS = """
     GenBankSearchModal { align: center middle; }
     GenBankSearchModal #gb-dialog {
@@ -3657,9 +4034,13 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
                 yield Input(placeholder="e.g. Epipremnum aureum", id="gb-search-input")
                 yield Button("Search", id="gb-search-btn", variant="primary")
             yield DataTable(id="gb-table", zebra_stripes=True, cursor_type="row")
-            yield Static("Enter a species or genus name and press Search.", id="gb-status")
+            yield Static(
+                "Enter a species or genus name and press Search.", id="gb-status"
+            )
             with Horizontal(id="gb-buttons"):
-                yield Button("Download Selected", id="gb-download-btn", variant="success")
+                yield Button(
+                    "Download Selected", id="gb-download-btn", variant="success"
+                )
                 yield Button("Cancel", id="gb-cancel-btn")
 
     def on_mount(self) -> None:
@@ -3670,7 +4051,9 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
     def _do_search(self, event: Button.Pressed) -> None:
         query = self.query_one("#gb-search-input", Input).value.strip()
         if not query:
-            self.query_one("#gb-status", Static).update("[yellow]Enter an organism name.[/]")
+            self.query_one("#gb-status", Static).update(
+                "[yellow]Enter an organism name.[/]"
+            )
             return
         if not _entrez_available():
             self.query_one("#gb-status", Static).update(
@@ -3684,6 +4067,7 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
     def _run_search(self, query: str) -> None:
         try:
             results = genbank_search_transcriptomes(query, max_results=10)
+
             def _apply() -> None:
                 self._results = results
                 table = self.query_one("#gb-table", DataTable)
@@ -3705,6 +4089,7 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
                 self.query_one("#gb-status", Static).update(
                     f"[green]{len(results)} results. Select one and click Download.[/]"
                 )
+
             self.app.call_from_thread(_apply)
         except Exception as exc:
             self.app.call_from_thread(
@@ -3716,26 +4101,28 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
     def _do_download(self, event: Button.Pressed) -> None:
         table = self.query_one("#gb-table", DataTable)
         if not self._results or table.cursor_row is None:
-            self.query_one("#gb-status", Static).update("[yellow]Select a result first.[/]")
+            self.query_one("#gb-status", Static).update(
+                "[yellow]Select a result first.[/]"
+            )
             return
         idx = table.cursor_row
         if idx < 0 or idx >= len(self._results):
             return
         result = self._results[idx]
-        self.query_one("#gb-status", Static).update(
-            f"Downloading {result.accession}…"
-        )
+        self.query_one("#gb-status", Static).update(f"Downloading {result.accession}…")
         self._run_download(result)
 
     @work(exclusive=True, thread=True, group="gb-download")
     def _run_download(self, result: GenBankResult) -> None:
         try:
             import asyncio
+
             dl_dir = Path.home() / ".scriptoscope" / "downloads"
 
             def _progress(msg: str) -> None:
                 self.app.call_from_thread(
-                    self.query_one("#gb-status", Static).update, msg,
+                    self.query_one("#gb-status", Static).update,
+                    msg,
                 )
 
             fasta_path = asyncio.run(
@@ -3743,13 +4130,20 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
             )
             # Save metadata for dropdown label
             meta_path = Path(fasta_path).with_suffix(".meta.json")
-            meta_path.write_text(json.dumps({
-                "accession": result.accession,
-                "organism": result.organism,
-                "title": result.title,
-            }), encoding="utf-8")
+            meta_path.write_text(
+                json.dumps(
+                    {
+                        "accession": result.accession,
+                        "organism": result.organism,
+                        "title": result.title,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
             def _done() -> None:
                 self.dismiss((result.accession, fasta_path))
+
             self.app.call_from_thread(_done)
         except Exception as exc:
             self.app.call_from_thread(
@@ -3802,7 +4196,9 @@ class FileBrowserModal(ModalScreen[str | None]):
 
     def __init__(self, start_path: str | None = None) -> None:
         super().__init__()
-        candidate = Path(start_path).expanduser().resolve() if start_path else Path.home()
+        candidate = (
+            Path(start_path).expanduser().resolve() if start_path else Path.home()
+        )
         self._cwd = candidate if candidate.is_dir() else candidate.parent
         self._filter = ""
         self._row_paths: list[Path | None] = []
@@ -4026,7 +4422,9 @@ class BlastPanel(Vertical):
             with Horizontal(classes="blast-row"):
                 yield Label("Query:", classes="blast-label")
                 with RadioSet(id="blast-query-source"):
-                    yield RadioButton("Custom sequence", value=True, id="blast-src-custom")
+                    yield RadioButton(
+                        "Custom sequence", value=True, id="blast-src-custom"
+                    )
                     yield RadioButton("Selected transcript", id="blast-src-transcript")
             with Vertical(id="blast-query-area"):
                 yield SelectableTextArea(
@@ -4036,7 +4434,10 @@ class BlastPanel(Vertical):
                     show_line_numbers=False,
                     soft_wrap=True,
                 )
-                yield Static("Paste DNA or protein sequence (FASTA headers are stripped automatically)", id="blast-query-type")
+                yield Static(
+                    "Paste DNA or protein sequence (FASTA headers are stripped automatically)",
+                    id="blast-query-type",
+                )
             with Horizontal(classes="blast-row"):
                 yield Label("DB path:", classes="blast-label")
                 yield Input(placeholder="/path/to/blast/db", id="blast-db-input")
@@ -4044,7 +4445,8 @@ class BlastPanel(Vertical):
                 yield Label("Program:", classes="blast-label")
                 yield Select(
                     [(p, p) for p in _BLAST_PROGRAMS],
-                    id="blast-program", value="blastn",
+                    id="blast-program",
+                    value="blastn",
                 )
                 yield Label("E-value:", classes="blast-label")
                 yield Input(value="1e-5", id="blast-evalue")
@@ -4062,8 +4464,15 @@ class BlastPanel(Vertical):
 
     def on_mount(self) -> None:
         self.query_one("#blast-table", DataTable).add_columns(
-            "Subject", "% ID", "Aln Len", "E-value", "Bit Score",
-            "Q Start", "Q End", "S Start", "S End",
+            "Subject",
+            "% ID",
+            "Aln Len",
+            "E-value",
+            "Bit Score",
+            "Q Start",
+            "Q End",
+            "S Start",
+            "S End",
         )
         if not blast_available():
             self.query_one("#blast-status", Static).update(
@@ -4124,8 +4533,17 @@ class BlastPanel(Vertical):
             self._set_status("[yellow]No BLAST results to export.[/]")
             return
         path = str(Path.home() / "blast_results.csv")
-        headers = ["Subject", "% ID", "Aln Len", "E-value", "Bit Score",
-                    "Q Start", "Q End", "S Start", "S End"]
+        headers = [
+            "Subject",
+            "% ID",
+            "Aln Len",
+            "E-value",
+            "Bit Score",
+            "Q Start",
+            "Q End",
+            "S Start",
+            "S End",
+        ]
         rows = []
         for row_key in table.rows:
             row = table.get_row(row_key)
@@ -4157,7 +4575,9 @@ class BlastPanel(Vertical):
             if orf and orf.sequence:
                 protein_seq = orf.sequence
             else:
-                self._set_status("[yellow]No ORF found — paste a protein sequence or use a transcript with an ORF.[/]")
+                self._set_status(
+                    "[yellow]No ORF found — paste a protein sequence or use a transcript with an ORF.[/]"
+                )
                 return
         else:
             protein_seq = query_seq
@@ -4176,6 +4596,7 @@ class BlastPanel(Vertical):
     @work(exclusive=True, thread=True, group="ncbi-blast")
     def _ncbi_blastp_worker(self, protein_seq: str) -> None:
         try:
+
             def _progress(msg: str) -> None:
                 self.app.call_from_thread(self._set_status, msg)
 
@@ -4190,10 +4611,15 @@ class BlastPanel(Vertical):
                     self._row_to_subject[row_key] = h.subject_id
                     self._row_to_hit[row_key] = h
                     table.add_row(
-                        h.subject_id[:60], f"{h.pct_identity:.1f}",
-                        str(h.alignment_length), f"{h.evalue:.2e}", f"{h.bit_score:.1f}",
-                        str(h.query_start), str(h.query_end),
-                        str(h.subject_start), str(h.subject_end),
+                        h.subject_id[:60],
+                        f"{h.pct_identity:.1f}",
+                        str(h.alignment_length),
+                        f"{h.evalue:.2e}",
+                        f"{h.bit_score:.1f}",
+                        str(h.query_start),
+                        str(h.query_end),
+                        str(h.subject_start),
+                        str(h.subject_end),
                         key=row_key,
                     )
                 self._set_status(f"[green]{len(hits)} NCBI BlastP hits found.[/]")
@@ -4204,20 +4630,24 @@ class BlastPanel(Vertical):
 
             self.app.call_from_thread(_apply)
         except NCBIBlastCancelled:
+
             def _cancelled() -> None:
                 self._set_status("[yellow]NCBI BlastP search cancelled.[/]")
                 btn = self.query_one("#blast-ncbi", Button)
                 btn.remove_class("running-ncbi")
                 btn.label = "NCBI BlastP"
                 btn.variant = "default"
+
             self.app.call_from_thread(_cancelled)
         except Exception as exc:
+
             def _err() -> None:
                 self._set_status(f"[red]NCBI BlastP error: {exc}[/]")
                 btn = self.query_one("#blast-ncbi", Button)
                 btn.remove_class("running-ncbi")
                 btn.label = "NCBI BlastP"
                 btn.variant = "default"
+
             self.app.call_from_thread(_err)
             _log.exception("NCBI BlastP failed: %s", exc)
 
@@ -4267,12 +4697,19 @@ class BlastPanel(Vertical):
         except ValueError:
             self._set_status("[red]Invalid e-value or max hits.[/]")
             return
-        self._run_blast_worker(query_id, query_seq, db, str(program_val), evalue, maxhits)
+        self._run_blast_worker(
+            query_id, query_seq, db, str(program_val), evalue, maxhits
+        )
 
     @work(exclusive=True, thread=False)
     async def _run_blast_worker(
-        self, query_id: str, query_seq: str, db: str,
-        program: str, evalue: float, maxhits: int,
+        self,
+        query_id: str,
+        query_seq: str,
+        db: str,
+        program: str,
+        evalue: float,
+        maxhits: int,
     ) -> None:
         loading = self.query_one("#blast-loading", LoadingIndicator)
         loading.add_class("running")
@@ -4282,18 +4719,27 @@ class BlastPanel(Vertical):
         self._row_to_subject = {}
         try:
             hits, _ = await local_blast(
-                query_seq=query_seq, query_id=query_id, db_path=db,
-                program=program, evalue=evalue, max_hits=maxhits,
+                query_seq=query_seq,
+                query_id=query_id,
+                db_path=db,
+                program=program,
+                evalue=evalue,
+                max_hits=maxhits,
             )
             for i, h in enumerate(hits):
                 row_key = f"{h.subject_id}_{i}"
                 self._row_to_subject[row_key] = h.subject_id
                 self._row_to_hit[row_key] = h
                 table.add_row(
-                    h.subject_id[:40], f"{h.pct_identity:.1f}",
-                    str(h.alignment_length), f"{h.evalue:.2e}", f"{h.bit_score:.1f}",
-                    str(h.query_start), str(h.query_end),
-                    str(h.subject_start), str(h.subject_end),
+                    h.subject_id[:40],
+                    f"{h.pct_identity:.1f}",
+                    str(h.alignment_length),
+                    f"{h.evalue:.2e}",
+                    f"{h.bit_score:.1f}",
+                    str(h.query_start),
+                    str(h.query_end),
+                    str(h.subject_start),
+                    str(h.subject_end),
                     key=row_key,
                 )
             self._set_status(f"[green]{len(hits)} hits found.[/]")
@@ -4310,6 +4756,7 @@ class BlastPanel(Vertical):
 # ══════════════════════════════════════════════════════════════════════════════
 # HMMER panel widget
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class HmmerPanel(Vertical):
     DEFAULT_CSS = """
@@ -4377,7 +4824,9 @@ class HmmerPanel(Vertical):
                 if conf:
                     tag = "CONFIRMED" if conf.confirmed else "UNCONFIRMED"
                     color = "green" if conf.confirmed else "yellow"
-                    self._set_status(f"[green]{len(hits)} Pfam hits (cached).[/] [{color}]CDS {tag}[/{color}]")
+                    self._set_status(
+                        f"[green]{len(hits)} Pfam hits (cached).[/] [{color}]CDS {tag}[/{color}]"
+                    )
                 else:
                     self._set_status(f"[green]{len(hits)} domain hits (cached).[/]")
                 # Already scanned — show as complete
@@ -4394,7 +4843,11 @@ class HmmerPanel(Vertical):
             pass
 
     def _display_hits(
-        self, t: Transcript, hits: list[HmmerHit], *, refresh_seq: bool = True,
+        self,
+        t: Transcript,
+        hits: list[HmmerHit],
+        *,
+        refresh_seq: bool = True,
     ) -> None:
         """Populate table and diagram from a list of hits.
 
@@ -4408,10 +4861,15 @@ class HmmerPanel(Vertical):
         for h in hits:
             desc = self._lookup_desc(h)
             table.add_row(
-                h.target_name[:30], h.accession[:12],
-                f"{h.evalue:.2e}", f"{h.score:.1f}", f"{h.bias:.1f}",
-                str(h.hmm_from), str(h.hmm_to),
-                str(h.ali_from), str(h.ali_to),
+                h.target_name[:30],
+                h.accession[:12],
+                f"{h.evalue:.2e}",
+                f"{h.score:.1f}",
+                f"{h.bias:.1f}",
+                str(h.hmm_from),
+                str(h.hmm_to),
+                str(h.ali_from),
+                str(h.ali_to),
                 desc[:60],
             )
         try:
@@ -4482,8 +4940,16 @@ class HmmerPanel(Vertical):
 
     def on_mount(self) -> None:
         self.query_one("#hmmer-table", DataTable).add_columns(
-            "Family", "Accession", "E-value", "Score", "Bias",
-            "HMM From", "HMM To", "Ali From", "Ali To", "Description",
+            "Family",
+            "Accession",
+            "E-value",
+            "Score",
+            "Bias",
+            "HMM From",
+            "HMM To",
+            "Ali From",
+            "Ali To",
+            "Description",
         )
         if not hmmer_available():
             self.query_one("#hmmer-status", Static).update(
@@ -4503,9 +4969,11 @@ class HmmerPanel(Vertical):
     @work(exclusive=False, thread=True, group="pfam-desc")
     def _do_load_descriptions(self, clans_tsv: Path) -> None:
         desc = load_pfam_descriptions(clans_tsv)
+
         def _apply() -> None:
             self._pfam_desc = desc
             _log.info("Loaded %d Pfam descriptions", len(desc))
+
         self.app.call_from_thread(_apply)
 
     def _show_progress(self, current: int, total: int) -> None:
@@ -4520,8 +4988,18 @@ class HmmerPanel(Vertical):
             self._set_status("[yellow]No HMMER results to export.[/]")
             return
         path = str(Path.home() / "hmmer_results.csv")
-        headers = ["Family", "Accession", "E-value", "Score", "Bias",
-                    "HMM From", "HMM To", "Ali From", "Ali To", "Description"]
+        headers = [
+            "Family",
+            "Accession",
+            "E-value",
+            "Score",
+            "Bias",
+            "HMM From",
+            "HMM To",
+            "Ali From",
+            "Ali To",
+            "Description",
+        ]
         rows = []
         for row_key in table.rows:
             row = table.get_row(row_key)
@@ -4547,8 +5025,11 @@ class HmmerPanel(Vertical):
             self.app.call_from_thread(self._set_status, msg)
             self.app.call_from_thread(self.app.clear_notifications)
             self.app.call_from_thread(
-                self.app.notify, msg, title="Pfam Download",
-                severity="information", timeout=120,
+                self.app.notify,
+                msg,
+                title="Pfam Download",
+                severity="information",
+                timeout=120,
             )
 
         try:
@@ -4561,14 +5042,18 @@ class HmmerPanel(Vertical):
             )
             self.app.notify(
                 f"Pfam database ready — {len(descriptions):,} families",
-                title="Pfam Download", severity="information", timeout=5,
+                title="Pfam Download",
+                severity="information",
+                timeout=5,
             )
         except Exception as exc:
             self.app.clear_notifications()
             self._set_status(f"[red]Download failed: {exc}[/]")
             self.app.notify(
-                f"Download failed: {exc}", title="Pfam Download",
-                severity="error", timeout=8,
+                f"Download failed: {exc}",
+                title="Pfam Download",
+                severity="error",
+                timeout=8,
             )
             _log.exception("Pfam download failed: %s", exc)
         finally:
@@ -4593,7 +5078,9 @@ class HmmerPanel(Vertical):
             if conf:
                 tag = "CONFIRMED" if conf.confirmed else "UNCONFIRMED"
                 color = "green" if conf.confirmed else "yellow"
-                self._set_status(f"[green]{len(hits)} domain hits (cached).[/] [{color}]CDS {tag}[/{color}]")
+                self._set_status(
+                    f"[green]{len(hits)} domain hits (cached).[/] [{color}]CDS {tag}[/{color}]"
+                )
             else:
                 self._set_status(f"[green]{len(hits)} domain hits (cached).[/]")
             btn.label = "Scan Complete"
@@ -4622,7 +5109,11 @@ class HmmerPanel(Vertical):
 
     @work(exclusive=True, thread=False)
     async def _run_hmmer_worker(
-        self, t: Transcript, db: str, evalue: float, translate: bool,
+        self,
+        t: Transcript,
+        db: str,
+        evalue: float,
+        translate: bool,
         use_gathering: bool = True,
     ) -> None:
         progress = self.query_one("#hmmer-progress", ProgressBar)
@@ -4636,8 +5127,11 @@ class HmmerPanel(Vertical):
         try:
             _hmm_cancel.clear()
             hits = await hmmscan(
-                sequence=t.sequence, seq_id=t.id, hmm_db_path=db,
-                evalue_threshold=evalue, translate=translate,
+                sequence=t.sequence,
+                seq_id=t.id,
+                hmm_db_path=db,
+                evalue_threshold=evalue,
+                translate=translate,
                 use_gathering=use_gathering,
                 progress_cb=_on_progress,
             )
@@ -4691,8 +5185,10 @@ class HmmerPanel(Vertical):
         _log.info("confirm-cds worker started for %s (%d aa)", t.id, orf.aa_length)
         loading = self.query_one("#hmmer-loading", LoadingIndicator)
         _ui(loading.add_class, "running")
-        _ui(self._set_status,
-            f"NCBI blastp vs swissprot: {orf.aa_length} aa CDS… (may take 10–30 s)")
+        _ui(
+            self._set_status,
+            f"NCBI blastp vs swissprot: {orf.aa_length} aa CDS… (may take 10–30 s)",
+        )
 
         try:
             from Bio.Blast import NCBIWWW, NCBIXML
@@ -4700,7 +5196,9 @@ class HmmerPanel(Vertical):
             t0 = time.monotonic()
             _log.info("Submitting qblast to swissprot…")
             result_handle = NCBIWWW.qblast(
-                "blastp", "swissprot", orf.sequence,
+                "blastp",
+                "swissprot",
+                orf.sequence,
                 hitlist_size=3,
                 expect=1e-5,
             )
@@ -4718,16 +5216,18 @@ class HmmerPanel(Vertical):
                 best = record.alignments[0]
                 hsp = best.hsps[0]
                 query_len = record.query_length or orf.aa_length
-                identity_pct = (hsp.identities / hsp.align_length) * 100 if hsp.align_length else 0
+                identity_pct = (
+                    (hsp.identities / hsp.align_length) * 100 if hsp.align_length else 0
+                )
                 coverage_pct = (hsp.align_length / query_len) * 100 if query_len else 0
                 confirmed = (
-                    hsp.expect <= 1e-5
-                    and identity_pct >= 40.0
-                    and coverage_pct >= 50.0
+                    hsp.expect <= 1e-5 and identity_pct >= 40.0 and coverage_pct >= 50.0
                 )
                 conf = BlastConfirmation(
                     confirmed=confirmed,
-                    top_hit_name=(best.hit_def[:80] if best.hit_def else best.title[:80]),
+                    top_hit_name=(
+                        best.hit_def[:80] if best.hit_def else best.title[:80]
+                    ),
                     top_hit_acc=best.accession or "",
                     identity_pct=identity_pct,
                     coverage_pct=coverage_pct,
@@ -4748,6 +5248,7 @@ class HmmerPanel(Vertical):
                 if conf.top_hit_acc:
                     msg += f" — [dim]{conf.top_hit_acc} ({conf.identity_pct:.1f}% id, {conf.coverage_pct:.1f}% cov)[/dim]"
                 self._set_status(msg)
+
             _ui(_final)
 
         except Exception as exc:
@@ -4804,13 +5305,21 @@ class HmmerPanel(Vertical):
             timeout=10,
         )
         self._run_scan_all_worker(
-            self.app._transcripts, db, evalue, translate, use_gathering,
+            self.app._transcripts,
+            db,
+            evalue,
+            translate,
+            use_gathering,
         )
 
     @work(exclusive=True, thread=False)
     async def _run_scan_all_worker(
-        self, transcripts: list[Transcript], db: str, evalue: float,
-        translate: bool, use_gathering: bool = True,
+        self,
+        transcripts: list[Transcript],
+        db: str,
+        evalue: float,
+        translate: bool,
+        use_gathering: bool = True,
     ) -> None:
         import time
 
@@ -4842,8 +5351,10 @@ class HmmerPanel(Vertical):
         try:
             _hmm_cancel.clear()
             mapping = await hmmsearch_all(
-                transcripts=transcripts, hmm_db_path=db,
-                evalue_threshold=evalue, translate=translate,
+                transcripts=transcripts,
+                hmm_db_path=db,
+                evalue_threshold=evalue,
+                translate=translate,
                 use_gathering=use_gathering,
                 progress_cb=_on_progress,
             )
@@ -4870,7 +5381,9 @@ class HmmerPanel(Vertical):
             orf = _find_longest_orf(t.sequence, t.id)
             top_hits = sorted(hits, key=lambda h: h.evalue)[:5]
             if orf:
-                body.update(colorize_sequence_annotated(t.sequence, orf=orf, hits=top_hits).text)
+                body.update(
+                    colorize_sequence_annotated(t.sequence, orf=orf, hits=top_hits).text
+                )
                 _log.info("Updated Sequence tab with annotations for %s", t.id)
             else:
                 _log.info("No ORF found for %s, skipping sequence annotation", t.id)
@@ -4884,6 +5397,7 @@ class HmmerPanel(Vertical):
 # ══════════════════════════════════════════════════════════════════════════════
 # Make BLAST DB modal
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class MakeDbModal(ModalScreen[Optional[str]]):
     DEFAULT_CSS = """
@@ -5009,6 +5523,7 @@ class ScriptoScopeApp(App):
         """Copy reverse complement of highlighted DNA 5'→3' (Ctrl+Shift+C)."""
         try:
             from Bio.Seq import Seq
+
             viewer = self.query_one("#seq-viewer", SequenceViewer)
             if viewer._highlight and viewer.transcript:
                 lo, hi = viewer._highlight
@@ -5053,7 +5568,9 @@ class ScriptoScopeApp(App):
                 # Fall back to full rebuild if the cell API mismatches
                 self._populate_table(self._filtered, auto_select=False)
                 try:
-                    new_idx = next(i for i, k in enumerate(table.rows) if k.value == tid)
+                    new_idx = next(
+                        i for i, k in enumerate(table.rows) if k.value == tid
+                    )
                     table.move_cursor(row=new_idx, animate=False)
                 except StopIteration:
                     pass
@@ -5063,7 +5580,9 @@ class ScriptoScopeApp(App):
     def action_export_fasta(self) -> None:
         """Export bookmarked transcripts as FASTA (Ctrl+E)."""
         if not self._bookmarks:
-            self.notify("No bookmarked transcripts. Use Ctrl+D to bookmark.", severity="warning")
+            self.notify(
+                "No bookmarked transcripts. Use Ctrl+D to bookmark.", severity="warning"
+            )
             return
         base = Path.home() / "bookmarked_transcripts.fasta"
         # Avoid silently overwriting: add numeric suffix if file exists.
@@ -5083,7 +5602,7 @@ class ScriptoScopeApp(App):
                 chunks.append(f">{t.id} {t.description}\n")
                 seq = t.sequence
                 for i in range(0, len(seq), 80):
-                    chunks.append(seq[i:i+80])
+                    chunks.append(seq[i : i + 80])
                     chunks.append("\n")
                 count += 1
             f.write("".join(chunks))
@@ -5127,7 +5646,9 @@ class ScriptoScopeApp(App):
             self.call_from_thread(
                 self.notify,
                 f"{msg}\nThe entry may be stale — dropdown will refresh.",
-                title="File not found", severity="error", timeout=5,
+                title="File not found",
+                severity="error",
+                timeout=5,
             )
             self.call_from_thread(self._refresh_transcriptome_select)
             return
@@ -5141,25 +5662,35 @@ class ScriptoScopeApp(App):
         except ProjectFormatError as exc:
             self.call_from_thread(self._set_status, f"[red]Invalid project: {exc}[/]")
             self.call_from_thread(
-                self.notify, str(exc), title="Invalid project", severity="error",
+                self.notify,
+                str(exc),
+                title="Invalid project",
+                severity="error",
             )
             return
         except FileNotFoundError:
             msg = f"Project file disappeared during load: {path}"
             self.call_from_thread(self._set_status, f"[red]{msg}[/]")
             self.call_from_thread(
-                self.notify, msg, title="File not found", severity="error",
+                self.notify,
+                msg,
+                title="File not found",
+                severity="error",
             )
             return
         except PermissionError as exc:
             self.call_from_thread(self._set_status, f"[red]Permission denied: {exc}[/]")
             self.call_from_thread(
-                self.notify, f"Permission denied: {path}",
-                title="Load error", severity="error",
+                self.notify,
+                f"Permission denied: {path}",
+                title="Load error",
+                severity="error",
             )
             return
         except OSError as exc:
-            self.call_from_thread(self._set_status, f"[red]Cannot read project: {exc}[/]")
+            self.call_from_thread(
+                self._set_status, f"[red]Cannot read project: {exc}[/]"
+            )
             return
         except Exception as exc:
             _log.exception("Load project failed: %s", exc)
@@ -5169,14 +5700,14 @@ class ScriptoScopeApp(App):
         transcripts = proj["transcripts"]
         if not transcripts:
             self.call_from_thread(
-                self._set_status, "[yellow]Project contains no transcripts.[/]",
+                self._set_status,
+                "[yellow]Project contains no transcripts.[/]",
             )
             return
         by_id = {t.id: t for t in transcripts}
         visible = transcripts[:_MAX_TABLE_ROWS]
         row_data = [
-            (t.short_id, f"{t.length:,}", f"{t.gc_content:.1f}", t.id)
-            for t in visible
+            (t.short_id, f"{t.length:,}", f"{t.gc_content:.1f}", t.id) for t in visible
         ]
 
         def _apply() -> None:
@@ -5206,13 +5737,16 @@ class ScriptoScopeApp(App):
             )
             self.notify(
                 f"Project loaded: {len(transcripts):,} transcripts",
-                title="Project", severity="information", timeout=3,
+                title="Project",
+                severity="information",
+                timeout=3,
             )
             # Stats are no longer auto-computed — user triggers via button
             try:
                 self.query_one("#stats-panel", StatsPanel).reset_for_new_dataset()
             except Exception:
                 pass
+
         self.call_from_thread(_apply)
 
     def action_genbank_search(self) -> None:
@@ -5236,7 +5770,7 @@ class ScriptoScopeApp(App):
         self._pfam_hits: dict[str, set[str]] = {}
         self._filter_timer: Timer | None = None
         self._navigating_to: str | None = None
-        self._sort_column: str = ""   # "", "id", "length", "gc"
+        self._sort_column: str = ""  # "", "id", "length", "gc"
         self._sort_reverse: bool = False
         self._bookmarks: set[str] = set()  # transcript IDs
 
@@ -5248,10 +5782,14 @@ class ScriptoScopeApp(App):
                     yield Label("[bold]Transcripts[/]")
                     yield Static("0 loaded", id="transcript-count")
                 with Vertical(id="sidebar-filters"):
-                    yield Input(placeholder="Filter: text  len>500  gc>40 …", id="filter-input")
+                    yield Input(
+                        placeholder="Filter: text  len>500  gc>40 …", id="filter-input"
+                    )
                     yield Select(
-                        [], prompt="Recent transcriptomes…",
-                        id="transcriptome-select", allow_blank=True,
+                        [],
+                        prompt="Recent transcriptomes…",
+                        id="transcriptome-select",
+                        allow_blank=True,
                     )
                 yield DataTable(
                     id="transcript-table",
@@ -5268,7 +5806,9 @@ class ScriptoScopeApp(App):
                     yield HmmerPanel(id="hmmer-panel")
                 with TabPane("Statistics", id="tab-stats"):
                     yield StatsPanel(id="stats-panel")
-        yield Static("No file loaded. Press Ctrl+O to open a FASTA file.", id="app-status")
+        yield Static(
+            "No file loaded. Press Ctrl+O to open a FASTA file.", id="app-status"
+        )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -5378,7 +5918,8 @@ class ScriptoScopeApp(App):
         if not isinstance(event.value, str):
             _log.debug(
                 "Ignoring non-string Select value: %r (type=%s)",
-                event.value, type(event.value).__name__,
+                event.value,
+                type(event.value).__name__,
             )
             return
         path = event.value
@@ -5424,7 +5965,9 @@ class ScriptoScopeApp(App):
         p = Path(path).expanduser()
         _log.info(
             "_load_fasta pre-flight: resolved=%r exists=%s is_file=%s",
-            str(p), p.exists(), p.is_file() if p.exists() else False,
+            str(p),
+            p.exists(),
+            p.is_file() if p.exists() else False,
         )
         if not p.exists():
             msg = f"File not found: {path}"
@@ -5433,7 +5976,9 @@ class ScriptoScopeApp(App):
             self.call_from_thread(
                 self.notify,
                 f"{msg}\nThe entry may be stale — dropdown will refresh.",
-                title="File not found", severity="error", timeout=5,
+                title="File not found",
+                severity="error",
+                timeout=5,
             )
             # Refresh the dropdown to drop any stale entries.
             self.call_from_thread(self._refresh_transcriptome_select)
@@ -5441,28 +5986,38 @@ class ScriptoScopeApp(App):
         if not p.is_file():
             self.call_from_thread(self.clear_notifications)
             self.call_from_thread(
-                self._set_status, f"[red]Not a file: {path}[/]",
+                self._set_status,
+                f"[red]Not a file: {path}[/]",
             )
             self.call_from_thread(
-                self.notify, f"Not a regular file: {path}",
-                title="Load error", severity="error",
+                self.notify,
+                f"Not a regular file: {path}",
+                title="Load error",
+                severity="error",
             )
             return
 
         self.call_from_thread(self._set_status, f"Loading {path}…")
         self.call_from_thread(
-            self.notify, f"Loading {Path(path).name}…",
-            title="Transcriptome", severity="information", timeout=60,
+            self.notify,
+            f"Loading {Path(path).name}…",
+            title="Transcriptome",
+            severity="information",
+            timeout=60,
         )
         try:
             transcripts = load_all(path)
         except FastaFormatError as exc:
             self.call_from_thread(self.clear_notifications)
             self.call_from_thread(
-                self._set_status, f"[red]Invalid FASTA: {exc}[/]",
+                self._set_status,
+                f"[red]Invalid FASTA: {exc}[/]",
             )
             self.call_from_thread(
-                self.notify, str(exc), title="Invalid FASTA", severity="error",
+                self.notify,
+                str(exc),
+                title="Invalid FASTA",
+                severity="error",
             )
             return
         except FileNotFoundError:
@@ -5471,31 +6026,41 @@ class ScriptoScopeApp(App):
             self.call_from_thread(self.clear_notifications)
             self.call_from_thread(self._set_status, f"[red]{msg}[/]")
             self.call_from_thread(
-                self.notify, msg, title="File not found", severity="error",
+                self.notify,
+                msg,
+                title="File not found",
+                severity="error",
             )
             return
         except PermissionError as exc:
             self.call_from_thread(self.clear_notifications)
             self.call_from_thread(self._set_status, f"[red]Permission denied: {exc}[/]")
             self.call_from_thread(
-                self.notify, f"Permission denied: {path}",
-                title="Load error", severity="error",
+                self.notify,
+                f"Permission denied: {path}",
+                title="Load error",
+                severity="error",
             )
             return
         except Exception as exc:
             _log.exception("Load fasta failed for %s", path)
             self.call_from_thread(self.clear_notifications)
-            self.call_from_thread(self._set_status, f"[red]Error loading file: {exc}[/]")
             self.call_from_thread(
-                self.notify, f"Failed to load: {exc}",
-                title="Load error", severity="error",
+                self._set_status, f"[red]Error loading file: {exc}[/]"
+            )
+            self.call_from_thread(
+                self.notify,
+                f"Failed to load: {exc}",
+                title="Load error",
+                severity="error",
             )
             return
 
         if not transcripts:
             self.call_from_thread(self.clear_notifications)
             self.call_from_thread(
-                self._set_status, "[yellow]No transcripts found in file.[/]",
+                self._set_status,
+                "[yellow]No transcripts found in file.[/]",
             )
             return
 
@@ -5506,18 +6071,24 @@ class ScriptoScopeApp(App):
         # Pre-compute table row data on background thread
         visible = transcripts[:_MAX_TABLE_ROWS]
         row_data = [
-            (t.short_id, f"{t.length:,}", f"{t.gc_content:.1f}", t.id)
-            for t in visible
+            (t.short_id, f"{t.length:,}", f"{t.gc_content:.1f}", t.id) for t in visible
         ]
 
         def _apply() -> None:
             try:
                 self._apply_loaded_transcripts(
-                    path, transcripts, by_id, row_data, visible, dup_shortfall,
+                    path,
+                    transcripts,
+                    by_id,
+                    row_data,
+                    visible,
+                    dup_shortfall,
                 )
             except Exception:
                 _log.exception("_apply_loaded_transcripts raised for %s", path)
-                self._set_status(f"[red]Load succeeded but UI update failed (see log)[/]")
+                self._set_status(
+                    f"[red]Load succeeded but UI update failed (see log)[/]"
+                )
 
         self.call_from_thread(_apply)
 
@@ -5567,7 +6138,9 @@ class ScriptoScopeApp(App):
         self._set_status(status_msg)
         self.notify(
             f"{len(transcripts):,} transcripts loaded",
-            title="Transcriptome", severity="information", timeout=3,
+            title="Transcriptome",
+            severity="information",
+            timeout=3,
         )
         # Stats are no longer auto-computed — user triggers via the
         # "Compute Statistics" button in the Statistics tab.
@@ -5614,19 +6187,22 @@ class ScriptoScopeApp(App):
             label = f"* {short_id}" if tid in self._bookmarks else short_id
             table.add_row(label, length, gc, key=tid)
         shown = len(row_data)
-        count_text = f"{shown:,} of {total:,} shown" if shown < total else f"{total:,} shown"
+        count_text = (
+            f"{shown:,} of {total:,} shown" if shown < total else f"{total:,} shown"
+        )
         self.query_one("#transcript-count", Static).update(count_text)
         if visible and auto_select:
             table.focus()
             table.move_cursor(row=0)
             self._show_transcript(visible[0])
 
-    def _populate_table(self, transcripts: list[Transcript], *, auto_select: bool = True) -> None:
+    def _populate_table(
+        self, transcripts: list[Transcript], *, auto_select: bool = True
+    ) -> None:
         _log.debug("_populate_table: %d transcripts", len(transcripts))
         visible = transcripts[:_MAX_TABLE_ROWS]
         row_data = [
-            (t.short_id, f"{t.length:,}", f"{t.gc_content:.1f}", t.id)
-            for t in visible
+            (t.short_id, f"{t.length:,}", f"{t.gc_content:.1f}", t.id) for t in visible
         ]
         self._populate_table_fast(row_data, len(transcripts), visible, auto_select)
 
@@ -5636,9 +6212,7 @@ class ScriptoScopeApp(App):
     def filter_transcripts(self, event: Input.Changed) -> None:
         if self._filter_timer is not None:
             self._filter_timer.stop()
-        self._filter_timer = self.set_timer(
-            _FILTER_DEBOUNCE, self._apply_filter
-        )
+        self._filter_timer = self.set_timer(_FILTER_DEBOUNCE, self._apply_filter)
 
     def _apply_filter(self) -> None:
         # Skip if we're navigating to a BLAST hit — the table was already
@@ -5655,7 +6229,9 @@ class ScriptoScopeApp(App):
             return
         if len(self._transcripts) < 5000:
             self._filtered = _filter_transcripts(
-                self._transcripts, raw, self._bookmarks,
+                self._transcripts,
+                raw,
+                self._bookmarks,
             )
             self._populate_table(self._filtered)
         else:
@@ -5663,14 +6239,16 @@ class ScriptoScopeApp(App):
 
     @work(exclusive=True, thread=True, group="filter")
     def _apply_filter_bg(
-        self, raw: str, transcripts: list[Transcript], bookmarks: set[str],
+        self,
+        raw: str,
+        transcripts: list[Transcript],
+        bookmarks: set[str],
     ) -> None:
         """Filter large transcriptomes off the main thread."""
         results = _filter_transcripts(transcripts, raw, bookmarks)
         visible = results[:_MAX_TABLE_ROWS]
         row_data = [
-            (t.short_id, f"{t.length:,}", f"{t.gc_content:.1f}", t.id)
-            for t in visible
+            (t.short_id, f"{t.length:,}", f"{t.gc_content:.1f}", t.id) for t in visible
         ]
 
         def _apply() -> None:
@@ -5714,7 +6292,8 @@ class ScriptoScopeApp(App):
         if self._selection_timer is not None:
             self._selection_timer.stop()
         self._selection_timer = self.set_timer(
-            self._SELECTION_DEBOUNCE, self._apply_pending_transcript,
+            self._SELECTION_DEBOUNCE,
+            self._apply_pending_transcript,
         )
 
     def _apply_pending_transcript(self) -> None:
@@ -5736,7 +6315,9 @@ class ScriptoScopeApp(App):
         if row_key is None:
             return
         t = self._by_id.get(str(row_key.value))
-        _log.debug("_select_by_row_key: key=%r -> found=%s", row_key.value, t is not None)
+        _log.debug(
+            "_select_by_row_key: key=%r -> found=%s", row_key.value, t is not None
+        )
         if t is not None:
             self._show_transcript(t)
 
@@ -5786,7 +6367,9 @@ class ScriptoScopeApp(App):
         subject_id = blast_panel._row_to_subject.get(raw, raw)
         t = self._by_id.get(subject_id)
         if t is None:
-            self._set_status(f"[yellow]'{subject_id}' not found in loaded transcriptome[/]")
+            self._set_status(
+                f"[yellow]'{subject_id}' not found in loaded transcriptome[/]"
+            )
             return
         # Set the navigation guard — this makes on_data_table_row_highlighted
         # ignore all highlight events until the target row is reached.
@@ -5797,7 +6380,9 @@ class ScriptoScopeApp(App):
             self._filter_timer = None
         # Clear filter so the transcript is visible in the full table
         filter_input = self.query_one("#filter-input", Input)
-        needs_rebuild = filter_input.value.strip() != "" or self._filtered is not self._transcripts
+        needs_rebuild = (
+            filter_input.value.strip() != "" or self._filtered is not self._transcripts
+        )
         filter_input.value = ""
         if needs_rebuild:
             self._filtered = self._transcripts
@@ -5826,16 +6411,22 @@ class ScriptoScopeApp(App):
         # Switch to sequence tab to show the hit
         self.query_one("#content-area", TabbedContent).active = "tab-sequence"
 
-    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+    def on_tabbed_content_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
         if event.pane.id == "tab-blast" and self._blast_db:
-            self.query_one("#blast-panel", BlastPanel).set_transcriptome_db(self._blast_db)
+            self.query_one("#blast-panel", BlastPanel).set_transcriptome_db(
+                self._blast_db
+            )
         elif event.pane.id == "tab-hmmer" and self._fasta_path:
             # Check for .hmm or .h3m next to FASTA
             base = Path(self._fasta_path).with_suffix("")
             for ext in [".hmm", ".h3m"]:
                 hmm_path = base.with_suffix(ext)
                 if hmm_path.exists():
-                    self.query_one("#hmmer-panel", HmmerPanel).set_db_path(str(hmm_path))
+                    self.query_one("#hmmer-panel", HmmerPanel).set_db_path(
+                        str(hmm_path)
+                    )
                     break
 
     # ── Tab shortcuts ─────────────────────────────────────────────────────────
@@ -5868,8 +6459,10 @@ class ScriptoScopeApp(App):
     async def _build_db_worker(self, fasta_path: str) -> None:
         self._set_status("Building BLAST database…")
         self.notify(
-            "Building BLAST database…", title="BLAST",
-            severity="information", timeout=120,
+            "Building BLAST database…",
+            title="BLAST",
+            severity="information",
+            timeout=120,
         )
 
         def _reset_build_btn(success: bool = False) -> None:
@@ -5892,16 +6485,20 @@ class ScriptoScopeApp(App):
             self.clear_notifications()
             self._set_status(f"[green]BLAST DB ready: {db_path}[/]")
             self.notify(
-                "BLAST database ready", title="BLAST",
-                severity="information", timeout=3,
+                "BLAST database ready",
+                title="BLAST",
+                severity="information",
+                timeout=3,
             )
             _reset_build_btn(success=True)
         except RuntimeError as exc:
             self.clear_notifications()
             self._set_status(f"[red]makeblastdb error: {exc}[/]")
             self.notify(
-                f"makeblastdb error: {exc}", title="BLAST",
-                severity="error", timeout=5,
+                f"makeblastdb error: {exc}",
+                title="BLAST",
+                severity="error",
+                timeout=5,
             )
             _reset_build_btn(success=False)
 
@@ -5915,9 +6512,11 @@ class ScriptoScopeApp(App):
 # Entry point
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def _restore_terminal() -> None:
     """Reset terminal to a sane state before force-exiting."""
     import sys
+
     # Silence other threads immediately by redirecting Python-level IO
     devnull = open(os.devnull, "w")
     try:
@@ -5930,15 +6529,15 @@ def _restore_terminal() -> None:
 
     # Write reset sequences directly to the terminal fd
     reset = (
-        "\x1b[?1000l"   # disable mouse click tracking
-        "\x1b[?1002l"   # disable mouse drag tracking
-        "\x1b[?1003l"   # disable mouse move tracking
-        "\x1b[?1006l"   # disable SGR mouse mode
-        "\x1b[?1015l"   # disable urxvt mouse mode
-        "\x1b[?2004l"   # disable bracketed paste
-        "\x1b[?1l"      # reset cursor keys to normal
-        "\x1b[?25h"     # show cursor
-        "\x1b[?1049l"   # leave alternate screen
+        "\x1b[?1000l"  # disable mouse click tracking
+        "\x1b[?1002l"  # disable mouse drag tracking
+        "\x1b[?1003l"  # disable mouse move tracking
+        "\x1b[?1006l"  # disable SGR mouse mode
+        "\x1b[?1015l"  # disable urxvt mouse mode
+        "\x1b[?2004l"  # disable bracketed paste
+        "\x1b[?1l"  # reset cursor keys to normal
+        "\x1b[?25h"  # show cursor
+        "\x1b[?1049l"  # leave alternate screen
     )
     try:
         fd = os.open("/dev/tty", os.O_WRONLY)

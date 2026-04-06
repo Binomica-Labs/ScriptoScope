@@ -6,13 +6,16 @@ Usage:
     python devtools/bench_orf_compare.py [OPTIONS]
 
 Options:
-    --count N      Number of sequences (default: 100000)
-    --max-len N    Max nucleotide length (default: 35000)
-    --min-len N    Min nucleotide length (default: 200)
+    --fasta PATH   Use a real FASTA file instead of random sequences
+                   (supports .gz; e.g. benchmark_data/GFBP01.fsa_nt.gz)
+    --count N      Number of random sequences (default: 100000, ignored with --fasta)
+    --max-len N    Max nucleotide length (default: 35000, ignored with --fasta)
+    --min-len N    Min nucleotide length (default: 200, ignored with --fasta)
     --rounds N     Timed rounds per engine (default: 3)
     --threads N    Threads for scriptoscope batch (default: 0 = auto)
     --validate     Cross-validate results between engines (slower)
 """
+
 from __future__ import annotations
 
 import math
@@ -29,6 +32,17 @@ sys.path.insert(0, str(ROOT))
 # ---------------------------------------------------------------------------
 # Sequence generation (same as bench_orf.py)
 # ---------------------------------------------------------------------------
+
+
+def _load_fasta(path: str | Path) -> list[tuple[str, str]]:
+    """Load sequences from a FASTA file (supports .gz)."""
+    import scriptoscope as mod
+
+    seqs = []
+    for t in mod._parse_fasta(path):
+        seqs.append((t.id, t.sequence))
+    return seqs
+
 
 def _generate_sequences(
     seed: int = 42,
@@ -51,9 +65,11 @@ def _generate_sequences(
 # Engines
 # ---------------------------------------------------------------------------
 
+
 def _bench_scriptoscope_single(sequences, rounds):
     """ScriptoScope _find_longest_orf, one at a time (C or fallback)."""
     import scriptoscope as mod
+
     fn = mod._find_longest_orf
     cache = mod._longest_orf_cache
 
@@ -75,6 +91,7 @@ def _bench_scriptoscope_single(sequences, rounds):
 def _bench_scriptoscope_batch(sequences, rounds, nthreads):
     """ScriptoScope _find_longest_orfs_batch (parallel C)."""
     import scriptoscope as mod
+
     batch_fn = mod._find_longest_orfs_batch
     cache = mod._longest_orf_cache
 
@@ -107,7 +124,9 @@ def _bench_orfipy(sequences, rounds):
     for _ in range(rounds):
         t0 = time.perf_counter()
         for _, nuc in sequences:
-            orfs = oc.orfs(nuc, minlen=_minlen, starts=_starts, stops=_stops, strand="b")
+            orfs = oc.orfs(
+                nuc, minlen=_minlen, starts=_starts, stops=_stops, strand="b"
+            )
             # Pick longest to match our "find longest ORF" behavior.
             if orfs:
                 max(orfs, key=lambda o: o[1] - o[0])
@@ -119,10 +138,12 @@ def _bench_orfipy(sequences, rounds):
 # Validation
 # ---------------------------------------------------------------------------
 
+
 def _validate(sequences, sample=2000):
     """Cross-validate: do both engines agree on the longest ORF length?"""
-    import scriptoscope as mod
     import orfipy_core as oc
+
+    import scriptoscope as mod
 
     rng = random.Random(99)
     indices = rng.sample(range(len(sequences)), min(sample, len(sequences)))
@@ -134,7 +155,9 @@ def _validate(sequences, sample=2000):
         ours = mod._find_longest_orf(nuc, sid)
         our_len = ours.aa_length if ours else 0
 
-        orfs = oc.orfs(nuc, minlen=90, starts=["ATG"], stops=["TAA", "TAG", "TGA"], strand="b")
+        orfs = oc.orfs(
+            nuc, minlen=90, starts=["ATG"], stops=["TAA", "TAG", "TGA"], strand="b"
+        )
         if orfs:
             longest = max(orfs, key=lambda o: o[1] - o[0])
             their_len = (longest[1] - longest[0]) // 3
@@ -144,7 +167,9 @@ def _validate(sequences, sample=2000):
         if our_len != their_len:
             mismatches += 1
             if mismatches <= 5:
-                print(f"  [{idx}] ours={our_len}aa  orfipy={their_len}aa  len={len(nuc)}")
+                print(
+                    f"  [{idx}] ours={our_len}aa  orfipy={their_len}aa  len={len(nuc)}"
+                )
 
     return mismatches, len(indices)
 
@@ -153,22 +178,33 @@ def _validate(sequences, sample=2000):
 # Display
 # ---------------------------------------------------------------------------
 
-def _fmt_ms(s): return f"{s * 1000:.0f} ms"
-def _fmt_s(s):  return f"{s:.2f}s"
+
+def _fmt_ms(s):
+    return f"{s * 1000:.0f} ms"
+
+
+def _fmt_s(s):
+    return f"{s:.2f}s"
+
 
 def _fmt_bases(n):
-    if n >= 1_000_000: return f"{n / 1_000_000:.1f} Mb"
-    if n >= 1_000: return f"{n / 1_000:.1f} kb"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f} Mb"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f} kb"
     return f"{n} b"
 
 
-def _print_comparison(results: dict, total_bases: int, count: int):
+def _print_comparison(results: dict, total_bases: int, count: int, source: str = ""):
     print()
     print(f"{'=' * 72}")
-    print(f"  {count:,} sequences, {_fmt_bases(total_bases)} total")
+    label = f"  {count:,} sequences, {_fmt_bases(total_bases)} total"
+    if source:
+        label += f"  ({source})"
+    print(label)
     print(f"{'=' * 72}")
     print(f"  {'Engine':<35s} {'Median':>10s} {'Throughput':>14s} {'Speedup':>10s}")
-    print(f"  {'-'*35} {'-'*10} {'-'*14} {'-'*10}")
+    print(f"  {'-' * 35} {'-' * 10} {'-' * 14} {'-' * 10}")
 
     # Sort by median time
     sorted_engines = sorted(results.items(), key=lambda kv: kv[1]["median"])
@@ -180,10 +216,12 @@ def _print_comparison(results: dict, total_bases: int, count: int):
         speedup = med / fastest if fastest > 0 else 0
         mark = " <-- fastest" if med == fastest else ""
         if speedup > 1.01:
-            speed_str = f"{1/speedup:.2f}x"
+            speed_str = f"{1 / speedup:.2f}x"
         else:
             speed_str = "1.00x"
-        print(f"  {name:<35s} {_fmt_ms(med):>10s} {_fmt_bases(int(thru))}/s{' ':>4s} {speed_str:>10s}{mark}")
+        print(
+            f"  {name:<35s} {_fmt_ms(med):>10s} {_fmt_bases(int(thru))}/s{' ':>4s} {speed_str:>10s}{mark}"
+        )
 
     print(f"{'=' * 72}")
     print()
@@ -193,6 +231,7 @@ def _print_comparison(results: dict, total_bases: int, count: int):
 # Main
 # ---------------------------------------------------------------------------
 
+
 def _parse_int_flag(name, default):
     for i, arg in enumerate(sys.argv):
         if arg == name and i + 1 < len(sys.argv):
@@ -200,28 +239,51 @@ def _parse_int_flag(name, default):
     return default
 
 
+def _parse_str_flag(name, default=None):
+    for i, arg in enumerate(sys.argv):
+        if arg == name and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return default
+
+
 def main():
-    count    = _parse_int_flag("--count", 100_000)
-    min_len  = _parse_int_flag("--min-len", 200)
-    max_len  = _parse_int_flag("--max-len", 35_000)
-    rounds   = _parse_int_flag("--rounds", 3)
+    fasta = _parse_str_flag("--fasta")
+    count = _parse_int_flag("--count", 100_000)
+    min_len = _parse_int_flag("--min-len", 200)
+    max_len = _parse_int_flag("--max-len", 35_000)
+    rounds = _parse_int_flag("--rounds", 3)
     nthreads = _parse_int_flag("--threads", 0)
     validate = "--validate" in sys.argv
 
     if nthreads <= 0:
         nthreads = os.cpu_count() or 1
 
-    print(f"Generating {count:,} sequences ({min_len}–{max_len} nt, log-uniform)...")
-    sequences = _generate_sequences(count=count, min_len=min_len, max_len=max_len)
+    if fasta:
+        fasta_path = Path(fasta)
+        if not fasta_path.exists():
+            fasta_path = ROOT / fasta
+        print(f"Loading {fasta_path.name}...")
+        sequences = _load_fasta(fasta_path)
+        print(f"  Loaded {len(sequences):,} sequences from {fasta_path.name}")
+    else:
+        print(
+            f"Generating {count:,} sequences ({min_len}–{max_len} nt, log-uniform)..."
+        )
+        sequences = _generate_sequences(count=count, min_len=min_len, max_len=max_len)
+
     total_bases = sum(len(nuc) for _, nuc in sequences)
-    print(f"  Total: {_fmt_bases(total_bases)}  —  avg {total_bases // count:,} nt/seq")
+    print(
+        f"  Total: {_fmt_bases(total_bases)}  —  avg {total_bases // len(sequences):,} nt/seq"
+    )
     print()
 
     if validate:
         print("Cross-validating on 2000 random sequences...")
         mismatches, checked = _validate(sequences)
         if mismatches:
-            print(f"  WARNING: {mismatches}/{checked} mismatches (may differ on tie-breaking)\n")
+            print(
+                f"  WARNING: {mismatches}/{checked} mismatches (may differ on tie-breaking)\n"
+            )
         else:
             print(f"  OK: {checked} sequences agree.\n")
 
@@ -260,7 +322,8 @@ def main():
     except Exception as e:
         print(f"  SKIPPED ({e})")
 
-    _print_comparison(results, total_bases, count)
+    source = fasta_path.name if fasta else ""
+    _print_comparison(results, total_bases, len(sequences), source=source)
 
 
 if __name__ == "__main__":

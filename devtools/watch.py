@@ -20,6 +20,9 @@ Watched files → actions
   requirements.txt                pipx inject scriptoscope -r requirements.txt --force
                                    (reinstall + sync deps when either manifest changes)
 
+  orf_core.c                   →  python devtools/build_orf_core.py
+                                   (recompile the SIMD C extension in-place)
+
   devtools/__main__.py         →  sh devtools/build-ape.sh
   devtools/watch.py               (rebuild both APE binaries with the new source)
   devtools/build-ape.sh
@@ -87,6 +90,7 @@ WATCHED_FILES = [
     "scriptoscope.py",
     "pyproject.toml",
     "requirements.txt",
+    "orf_core.c",
     "devtools/__main__.py",
     "devtools/watch.py",
     "devtools/build-ape.sh",
@@ -262,6 +266,17 @@ def _venv_python(repo: Path) -> str | None:
     return str(p) if p.exists() else None
 
 
+def _action_build_orf_core(repo: Path, args: argparse.Namespace) -> list[list[str]]:
+    """Recompile the orf_core C extension in-place using the pipx venv Python."""
+    build_script = repo / "devtools" / "build_orf_core.py"
+    # Prefer the pipx venv Python so the .so matches the interpreter that runs
+    # the app.  Fall back to sys.executable if the venv isn't found yet.
+    pipx_home = Path(os.environ.get("PIPX_HOME", str(Path.home() / ".local" / "pipx")))
+    venv_py = pipx_home / "venvs" / "scriptoscope" / "bin" / "python"
+    python = str(venv_py) if venv_py.exists() else sys.executable
+    return [[python, str(build_script)]]
+
+
 def _action_reinstall_app(repo: Path, args: argparse.Namespace) -> list[list[str]]:
     """pipx install . --force"""
     pipx = _pipx_cmd()
@@ -296,6 +311,11 @@ ACTION_MAP: dict[str, Action] = {
         name="reinstall app",
         description="scriptoscope.py changed → reinstalling via pipx",
         command_fn=_action_reinstall_app,
+    ),
+    "orf_core.c": Action(
+        name="build C extension",
+        description="orf_core.c changed → recompiling orf_core C extension",
+        command_fn=_action_build_orf_core,
     ),
     "pyproject.toml": Action(
         name="reinstall + sync deps",

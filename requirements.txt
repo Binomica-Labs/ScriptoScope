@@ -2,3 +2,4 @@ textual>=8.2.2
 biopython>=1.87
 pyhmmer>=0.12.0
 rich>=14.3.3
+setuptools>=68

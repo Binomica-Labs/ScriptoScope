@@ -1765,6 +1765,36 @@ def inject_requirements(repo: Path) -> None:
     ok("requirements.txt dependencies injected")
 
 
+def build_orf_core(repo: Path) -> bool:
+    """Build the orf_core C extension in-place using the pipx venv Python.
+
+    Returns True on success, False if the build was skipped or failed.
+    The app falls back to the pure-Python ORF scanner when this returns False.
+    """
+    step("Building orf_core C extension (SIMD · parallel ORF scanner)")
+    vpy = venv_python()
+    if not vpy or not vpy.exists():
+        warn(
+            "Cannot locate venv Python — orf_core C extension not built.\n"
+            "  The app will fall back to the pure-Python ORF scanner."
+        )
+        return False
+    build_script = repo / "devtools" / "build_orf_core.py"
+    if not build_script.exists():
+        warn(f"Build script not found: {build_script}")
+        return False
+    try:
+        run([str(vpy), str(build_script)])
+        ok("orf_core C extension built (SIMD + parallel scanning active).")
+        return True
+    except SystemExit:
+        warn(
+            "orf_core build failed — the app will use the pure-Python ORF scanner.\n"
+            "  Ensure a C compiler (clang or gcc) is installed and try again."
+        )
+        return False
+
+
 def inject_test_deps() -> None:
     step("Injecting test dependencies (pytest, pytest-asyncio)")
     pipx = _pipx_cmd()
@@ -1992,6 +2022,7 @@ def print_summary(
     system_python: str,
     blast_installed: bool = False,
     daemon_built: bool = False,
+    orf_core_built: bool = False,
 ) -> None:
     vpy = venv_python()
     venv = vpy.parent.parent if vpy else Path("~/.local/pipx/venvs/scriptoscope")
@@ -2029,6 +2060,12 @@ def print_summary(
         "",
         f"{_B}Run the tests:{_R}",
         f"  {_CY}{pytest_cmd}{_R}",
+        "",
+        f"{_B}orf_core C extension:{_R}",
+        f"  {_GR}built — SIMD · parallel ORF scanner active{_R}"
+        if orf_core_built
+        else f"  {_YL}not built — using pure-Python fallback{_R}",
+        f"  Rebuild manually: {_CY}python devtools/build_orf_core.py{_R}",
         "",
         f"{_B}BLAST+ binaries:{_R}",
         f"  {_CY}{blast_status}{_R}",
@@ -2107,7 +2144,10 @@ def main() -> None:
     # ── Step 7: Inject test deps ──────────────────────────────────────────────
     inject_test_deps()
 
-    # ── Step 8: Install BLAST+ ───────────────────────────────────────────────
+    # ── Step 8: Build orf_core C extension ───────────────────────────────────
+    orf_core_built = build_orf_core(repo)
+
+    # ── Step 9: Install BLAST+ ───────────────────────────────────────────────
     blast_installed = False
     if not args.no_blast:
         install_blast(no_path=args.no_path)
@@ -2117,10 +2157,10 @@ def main() -> None:
             "Skipping BLAST+ installation (--no-blast). Local BLAST searches will be unavailable."
         )
 
-    # ── Step 9: Run tests ────────────────────────────────────────────────────
+    # ── Step 10: Run tests ───────────────────────────────────────────────────
     run_tests(repo, skip=args.no_tests)
 
-    # ── Step 10: Build developer-daemon.com ──────────────────────────────────
+    # ── Step 11: Build developer-daemon.com ──────────────────────────────────
     daemon_built = False
     if not args.no_daemon:
         daemon_built = build_developer_daemon(repo)
@@ -2132,7 +2172,11 @@ def main() -> None:
 
     # ── Done ──────────────────────────────────────────────────────────────────
     print_summary(
-        repo, system_python, blast_installed=blast_installed, daemon_built=daemon_built
+        repo,
+        system_python,
+        blast_installed=blast_installed,
+        daemon_built=daemon_built,
+        orf_core_built=orf_core_built,
     )
 
 
