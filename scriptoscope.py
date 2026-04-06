@@ -1637,6 +1637,19 @@ async def hmmscan(
         seqs_to_search = _six_frame_proteins(sequence, seq_id)
         if not seqs_to_search:
             return []
+        # Cap to the top 6 longest ORFs (roughly one per reading frame).
+        # A 1868 bp transcript produces ~24 ORFs across 6 frames; scanning
+        # all of them against 27k Pfam HMMs is 24x the work of scanning
+        # just the longest. Top 6 gives good frame coverage without the
+        # combinatorial blowup that made single-transcript scans take 50s.
+        orig_count = len(seqs_to_search)
+        if orig_count > 6:
+            seqs_to_search.sort(key=lambda x: len(x[1]), reverse=True)
+            seqs_to_search = seqs_to_search[:6]
+            _log.info(
+                "hmmscan: trimmed to top 6 ORFs (was %d) for %s",
+                orig_count, seq_id,
+            )
     else:
         seqs_to_search = [(seq_id, sequence)]
 
@@ -2705,7 +2718,19 @@ class SequenceViewer(ScrollableContainer):
             scrollbar_w = 2
             container_w = self.size.width or 0
             overhead = body_padding + scrollbar_w
-            seq_width = (container_w - overhead) if container_w > overhead else 60
+
+            # If the Sequence tab is hidden (user is on another tab), skip
+            # the render entirely. The render would use a fallback width (60)
+            # that doesn't match the real display width, wasting ~50-100 ms
+            # of worker time + Content conversion AND polluting the render
+            # cache with a wrong-width entry. on_resize will trigger the
+            # render at the correct width when the tab becomes visible.
+            if container_w <= overhead:
+                self._render_seq_id = t.id
+                self._needs_annotation_refresh = True
+                return
+
+            seq_width = container_w - overhead
 
             scan_cache: dict | None = None
             try:
@@ -2730,6 +2755,8 @@ class SequenceViewer(ScrollableContainer):
     @work(exclusive=True, thread=True, group="seq-render")
     def _render_sequence_bg(self, t: Transcript, seq_width: int, scan_cache: dict | None) -> None:
         """Heavy sequence rendering on a background thread."""
+        import time as _time
+        _t0 = _time.monotonic()
         scanned = scan_cache is not None and t.id in scan_cache
         _log.debug(
             "render_sequence_bg start id=%s length=%d width=%d scanned=%s",
@@ -2804,6 +2831,12 @@ class SequenceViewer(ScrollableContainer):
             content = _text_to_content(render.text)
         else:
             content = _text_to_content(plain_text)
+
+        _render_dt = (_time.monotonic() - _t0) * 1000
+        _log.debug(
+            "render_sequence_bg done id=%s %.0fms (scanned=%s)",
+            t.id, _render_dt, scanned,
+        )
 
         # Preserve scroll position when the render is just a highlight
         # toggle (focus_range, aa_highlight) on the same transcript. We
