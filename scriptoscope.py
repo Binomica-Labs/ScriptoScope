@@ -6018,8 +6018,8 @@ class HmmerPanel(Vertical):
                     self._set_status(f"[green]{len(hits)} domain hits (cached).[/]")
                 # Already scanned — show as complete
                 btn = self.query_one("#hmmer-run", Button)
-                btn.label = "Scan Complete"
-                btn.disabled = True
+                btn.label = "Rescan"
+                btn.disabled = False
                 btn.variant = "default"
                 btn.remove_class("scanning")
             else:
@@ -6230,8 +6230,10 @@ class HmmerPanel(Vertical):
             self._set_status("[yellow]Select a transcript first.[/]")
             return
         bacterial = self.query_one("#hmmer-bacterial", Switch).value
-        # Check cache first — instant result
-        if t.id in self._scan_cache:
+        # Check cache first — but allow rescan if the button says "Rescan"
+        # (user may have toggled bacterial mode or changed settings)
+        is_rescan = btn.label == "Rescan"
+        if t.id in self._scan_cache and not is_rescan:
             hits = self._scan_cache[t.id]
             self._display_hits(t, hits)
             conf = self._confirm_cache.get(t.id)
@@ -7113,11 +7115,17 @@ class ScriptoScopeApp(App):
             _log.exception("_auto_save_annotations failed")
 
     def _register_current_transcriptome(self) -> None:
-        """Register the currently loaded FASTA in the library."""
+        """Register the currently loaded FASTA in the library.
+
+        Uses the organism/species name as the display name (not the
+        accession number). Extracts from .meta.json or from the first
+        transcript's description (TSA descriptions contain the species).
+        Falls back to the filename stem if no organism can be determined.
+        """
         if not self._fasta_path:
             return
-        # Try to read organism from .meta.json if available
         organism = ""
+        # Source 1: .meta.json (from GenBank download)
         meta_path = Path(self._fasta_path).with_suffix(".meta.json")
         if meta_path.is_file():
             try:
@@ -7125,7 +7133,21 @@ class ScriptoScopeApp(App):
                 organism = meta.get("organism", "")
             except Exception:
                 pass
-        name = Path(self._fasta_path).stem
+        # Source 2: first transcript description (TSA format: "TSA: Genus species ...")
+        if not organism and self._transcripts:
+            desc = self._transcripts[0].description
+            if desc:
+                # TSA descriptions: "TSA: Fopius arisanus c23080_g1_i1 transcribed RNA sequence"
+                import re
+                m = re.match(r"TSA:\s+(.+?)(?:\s+\w+_\w+_\w+|\s+transcribed|\s+mRNA|,)", desc)
+                if m:
+                    organism = m.group(1).strip()
+                elif "TSA:" in desc:
+                    # Simpler fallback: take everything between "TSA: " and the first comma
+                    parts = desc.split("TSA:")[-1].strip().split(",")
+                    organism = parts[0].strip()
+        # Display name: organism if found, otherwise filename
+        name = organism if organism else Path(self._fasta_path).stem
         register_transcriptome(
             fasta_path=self._fasta_path,
             name=name,
@@ -7305,9 +7327,22 @@ class ScriptoScopeApp(App):
                                 organism = meta.get("organism", "")
                             except Exception:
                                 pass
+                        # Try to get organism from first FASTA header if no meta
+                        if not organism:
+                            try:
+                                import re as _re
+                                with open(f, "r") as fh:
+                                    first_line = fh.readline().strip()
+                                if first_line.startswith(">"):
+                                    m = _re.search(r"TSA:\s+(.+?)(?:\s+\w+_\w+|\s+transcribed|,)", first_line)
+                                    if m:
+                                        organism = m.group(1).strip()
+                            except Exception:
+                                pass
+                        display_name = organism if organism else f.stem
                         entries.append({
                             "fasta_path": str(f),
-                            "name": f.stem,
+                            "name": display_name,
                             "organism": organism,
                             "transcript_count": 0,
                             "scanned_count": 0,
