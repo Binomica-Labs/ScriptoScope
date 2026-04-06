@@ -42,6 +42,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Generator, Optional
 
+import numpy as _np
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 # Every session writes to a rotating log file. Default is /tmp/scriptoscope.log;
 # override with the SCRIPTOSCOPE_LOG env var. Each session gets a unique 8-char
@@ -1152,49 +1154,63 @@ def _translate_orf_dna(dna: str) -> str:
 def _find_longest_orf(nucleotide: str, seq_id: str) -> ORFCoord | None:
     """Find the single longest M-initiated ORF across all 6 frames.
 
-    Uses the regex codon scanner (~10x faster than `_six_frame_orf_coords`
-    which routes every codon through Biopython's `Seq.translate`). The
-    ground-truth implementation is retained in `_six_frame_orf_coords`;
-    `tests/test_dna_sanity.py` cross-validates this fast path against it
-    on hundreds of random sequences per run.
+    Scans each reading frame for stop codons using str.find (stepping by 3),
+    then only searches for ATG in gaps long enough to beat the current best.
+    Cross-validated against `_six_frame_orf_coords` in tests/test_dna_sanity.py.
     """
     key = (seq_id, len(nucleotide), _seq_fingerprint(nucleotide))
     if key in _longest_orf_cache:
         _longest_orf_cache.move_to_end(key)
         return _longest_orf_cache[key]
 
-    upper = nucleotide.upper()
-    rc = upper.translate(_RC_TABLE)[::-1]
-    seq_len = len(upper)
+    upper_b = nucleotide.upper().encode("ascii")
+    rc_b = upper_b.translate(_RC_TABLE_B)[::-1]
+    seq_len = len(upper_b)
 
     best_strand = ""
     best_frame = -1
     best_strand_m = -1
     best_strand_stop = -1  # position of the terminating stop on the strand
     best_length = 0
+    _atg = b"ATG"
 
-    for strand_label, strand_seq in (("+", upper), ("-", rc)):
-        # Partition matches into reading frames in a single pass.
-        frames: list[list[tuple[int, str]]] = [[], [], []]
-        for m in _CODON_SCAN_RE.finditer(strand_seq):
-            p = m.start()
-            frames[p % 3].append((p, m.group(1)))
-        for frame_idx, frame_hits in enumerate(frames):
-            first_atg = -1
-            for p, codon in frame_hits:
-                if codon == "ATG":
-                    if first_atg == -1:
-                        first_atg = p
-                else:  # stop codon
-                    if first_atg != -1:
-                        length = (p - first_atg) // 3
-                        if length > best_length:
-                            best_length = length
-                            best_strand = strand_label
-                            best_frame = frame_idx
-                            best_strand_m = first_atg
-                            best_strand_stop = p
-                        first_atg = -1
+    for strand_label, strand_b in (("+", upper_b), ("-", rc_b)):
+        # Vectorised stop-codon detection: numpy boolean ops in C, no match
+        # objects.  Returns a sorted int32 array of all stop positions.
+        arr = _np.frombuffer(strand_b, dtype=_np.uint8)
+        n = len(arr)
+        if n < 3:
+            continue
+        is_T = arr[:-2] == _ORD_T
+        b1 = arr[1:-1]
+        b2 = arr[2:]
+        is_stop = is_T & (
+            ((b1 == _ORD_A) & ((b2 == _ORD_A) | (b2 == _ORD_G)))
+            | ((b1 == _ORD_G) & (b2 == _ORD_A))
+        )
+        all_stops = _np.flatnonzero(is_stop)
+        frames_arr = all_stops % 3
+
+        min_gap_nt = (best_length + 1) * 3
+
+        for fi in range(3):
+            gs = fi
+            for p in all_stops[frames_arr == fi].tolist():
+                if p - gs >= min_gap_nt:
+                    atg_pos = strand_b.find(_atg, gs, p)
+                    while atg_pos != -1:
+                        if (atg_pos - fi) % 3 == 0:
+                            length = (p - atg_pos) // 3
+                            if length > best_length:
+                                best_length = length
+                                best_strand = strand_label
+                                best_frame = fi
+                                best_strand_m = atg_pos
+                                best_strand_stop = p
+                                min_gap_nt = (best_length + 1) * 3
+                            break
+                        atg_pos = strand_b.find(_atg, atg_pos + 1, p)
+                gs = p + 3
 
     if best_length < 30:
         _longest_orf_cache[key] = None
@@ -1203,22 +1219,22 @@ def _find_longest_orf(nucleotide: str, seq_id: str) -> ORFCoord | None:
         return None
 
     # Extract the ORF's DNA (M through stop, not including stop) and translate.
-    strand_seq = upper if best_strand == "+" else rc
-    orf_dna = strand_seq[best_strand_m:best_strand_stop]
+    strand_b = upper_b if best_strand == "+" else rc_b
+    orf_dna = strand_b[best_strand_m:best_strand_stop].decode("ascii")
     aa_sequence = _translate_orf_dna(orf_dna)
 
     # Count consecutive in-frame stop codons immediately after the first stop.
     n_stops = 1
     probe = best_strand_stop + 3
-    strand_stops = ("TAA", "TAG", "TGA")
-    while probe + 3 <= len(strand_seq) and strand_seq[probe:probe + 3] in strand_stops:
+    strand_stops = (b"TAA", b"TAG", b"TGA")
+    while probe + 3 <= len(strand_b) and strand_b[probe:probe + 3] in strand_stops:
         n_stops += 1
         probe += 3
 
     # Convert strand-local coordinates to the original sequence.
     strand_nt_start = best_strand_m
     strand_nt_end = best_strand_stop + 3 * n_stops
-    strand_nt_end = min(strand_nt_end, len(strand_seq))
+    strand_nt_end = min(strand_nt_end, len(strand_b))
     if best_strand == "+":
         nt_start = strand_nt_start
         nt_end = strand_nt_end
@@ -1245,6 +1261,8 @@ def _find_longest_orf(nucleotide: str, seq_id: str) -> ORFCoord | None:
 
 _RC_TABLE = str.maketrans("ACGTN", "TGCAN")
 
+_RC_TABLE_B = bytes.maketrans(b"ACGTN", b"TGCAN")
+_ORD_T, _ORD_A, _ORD_G = 84, 65, 71
 
 # Regex that finds every start and stop codon position in both strands.
 # The lookahead `(?=...)` is required so overlapping matches across frames
