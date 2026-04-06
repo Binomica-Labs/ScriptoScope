@@ -6222,8 +6222,12 @@ class HmmerPanel(Vertical):
     @on(Button.Pressed, "#hmmer-run")
     def run_scan(self) -> None:
         btn = self.query_one("#hmmer-run", Button)
-        # Ignore presses while scanning
+        # If currently scanning, pressing the button cancels the scan
         if btn.has_class("scanning"):
+            _hmm_cancel.set()
+            self._set_status("[yellow]Cancelling scan…[/]")
+            btn.label = "Cancelling…"
+            btn.disabled = True
             return
         t = self.transcript
         if t is None:
@@ -6280,16 +6284,34 @@ class HmmerPanel(Vertical):
         progress.update(total=100, progress=0)
         progress.add_class("running")
         mode = "gathering" if use_gathering else f"E={evalue:g}"
-        self._set_status(f"Scanning {t.short_id} for Pfam domains ({mode})…")
+        self._set_status(f"Scanning {t.short_id} for Pfam domains ({mode})… UI stays responsive")
+        btn = self.query_one("#hmmer-run", Button)
+        btn.label = "Cancel (0%)"
+        btn.variant = "error"
         _log.info(
             "HMM scan start: id=%s length=%d mode=%s",
             t.id, t.length, mode,
         )
 
+        scan_t0 = _time.monotonic()
+
         def _on_progress(current: int, total: int) -> None:
             self.app.call_from_thread(self._show_progress, current, total)
+            pct = current * 100 // total if total else 0
+            elapsed = _time.monotonic() - scan_t0
+            if pct > 0:
+                eta = elapsed / pct * (100 - pct)
+                eta_str = f"{int(eta)}s" if eta < 120 else f"{eta / 60:.1f}m"
+            else:
+                eta_str = "…"
+            def _update_btn():
+                try:
+                    b = self.query_one("#hmmer-run", Button)
+                    b.label = f"Cancel ({pct}% ~{eta_str})"
+                except Exception:
+                    pass
+            self.app.call_from_thread(_update_btn)
 
-        scan_t0 = _time.monotonic()
         try:
             _hmm_cancel.clear()
             hits = await hmmscan(
@@ -6308,19 +6330,17 @@ class HmmerPanel(Vertical):
             self._set_status(
                 f"[green]{len(hits)} Pfam domain hits found ({scan_dt:.1f}s).[/]"
             )
-            # Auto-save annotations after scan
             try:
                 self.app._auto_save_annotations()
             except Exception:
                 _log.exception("Auto-save after HMM scan failed")
-            # Disable button after successful scan
             btn = self.query_one("#hmmer-run", Button)
-            btn.label = "Scan Complete"
-            btn.disabled = True
+            btn.label = "Rescan"
+            btn.disabled = False
             btn.variant = "default"
             btn.remove_class("scanning")
         except HMMCancelled:
-            self._set_status("[dim]Scan cancelled.[/]")
+            self._set_status("[dim]Scan cancelled — no partial results saved.[/]")
             self._reset_scan_button()
         except Exception as exc:
             self._set_status(f"[red]Error: {exc}[/]")
@@ -6339,15 +6359,21 @@ class HmmerPanel(Vertical):
         progress = self.query_one("#hmmer-progress", ProgressBar)
         progress.update(total=100, progress=0)
         progress.add_class("running")
-        self._set_status(f"Running Prodigal on {t.short_id}…")
+        self._set_status(f"Running Prodigal on {t.short_id}… (UI stays responsive)")
+        btn = self.query_one("#hmmer-run", Button)
+        btn.label = "Cancel"
+        btn.variant = "error"
 
         scan_t0 = _time.monotonic()
         try:
             # Step 1: Run Prodigal in a thread
+            _hmm_cancel.clear()
             loop = asyncio.get_running_loop()
             genes = await loop.run_in_executor(
                 None, run_prodigal_single, t.sequence, t.id, True,
             )
+            if _hmm_cancel.is_set():
+                raise HMMCancelled()
             if not genes:
                 self._set_status("[yellow]Prodigal found no genes in this transcript.[/]")
                 self._reset_scan_button()
@@ -6356,9 +6382,11 @@ class HmmerPanel(Vertical):
             # Cache Prodigal results
             self.app._prodigal_cache[t.id] = genes
             n_genes = len(genes)
+            prodigal_dt = _time.monotonic() - scan_t0
             self._set_status(
-                f"Prodigal found {n_genes} gene(s) — scanning against Pfam…"
+                f"Prodigal found {n_genes} gene(s) in {prodigal_dt:.1f}s — scanning against Pfam…"
             )
+            btn.label = f"Cancel (0%)"
 
             # Step 2: Write gene proteins to multi-FASTA and run hmmsearch
             import pyhmmer
@@ -6382,8 +6410,20 @@ class HmmerPanel(Vertical):
 
             def _on_progress(current: int, total: int) -> None:
                 self.app.call_from_thread(self._show_progress, current, total)
-
-            _hmm_cancel.clear()
+                pct = current * 100 // total if total else 0
+                elapsed = _time.monotonic() - scan_t0
+                if pct > 0:
+                    eta = elapsed / pct * (100 - pct)
+                    eta_str = f"{int(eta)}s" if eta < 120 else f"{eta / 60:.1f}m"
+                else:
+                    eta_str = "…"
+                def _update_btn():
+                    try:
+                        b = self.query_one("#hmmer-run", Button)
+                        b.label = f"Cancel ({pct}% ~{eta_str})"
+                    except Exception:
+                        pass
+                self.app.call_from_thread(_update_btn)
 
             def _run_hmm() -> list[HmmerHit]:
                 hmms = _hmm_cache.get(db)
@@ -6447,12 +6487,12 @@ class HmmerPanel(Vertical):
             except Exception:
                 _log.exception("Auto-save after bacterial scan failed")
             btn = self.query_one("#hmmer-run", Button)
-            btn.label = "Scan Complete"
-            btn.disabled = True
+            btn.label = "Rescan"
+            btn.disabled = False
             btn.variant = "default"
             btn.remove_class("scanning")
         except HMMCancelled:
-            self._set_status("[dim]Scan cancelled.[/]")
+            self._set_status("[dim]Scan cancelled — partial results discarded.[/]")
             self._reset_scan_button()
         except Exception as exc:
             self._set_status(f"[red]Error: {exc}[/]")
