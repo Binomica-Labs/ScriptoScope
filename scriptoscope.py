@@ -2016,7 +2016,7 @@ _BASE_COLORS = {
     "G": "bold red1",
     "N": "dim white",
 }
-_MAX_DISPLAY_BASES = 3_000
+_MAX_DISPLAY_BASES = 100_000
 
 
 def colorize_sequence(seq: str, width: int = 60) -> Text:
