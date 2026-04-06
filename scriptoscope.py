@@ -248,16 +248,39 @@ class Transcript:
     def __post_init__(self) -> None:
         self.length = len(self.sequence)
 
+    def _ensure_gc(self) -> None:
+        """Compute GC% only — 4 C-level str.count() calls, no Counter."""
+        if self._gc is None:
+            if self.length == 0:
+                self._gc = 0.0
+            else:
+                s = self.sequence
+                gc = s.count("G") + s.count("g") + s.count("C") + s.count("c")
+                self._gc = gc / self.length * 100
+
     def _ensure_counts(self) -> None:
+        """Full ACGTN counts — 10 C-level str.count() calls.
+
+        Only called when the user clicks a transcript (composition legend
+        in the Sequence tab header). NOT called during bulk table load,
+        which only needs gc_content.
+        """
         if self._counts is None:
-            raw = Counter(self.sequence.upper())
-            self._counts = {b: raw.get(b, 0) for b in "ACGTN"}
-            gc = self._counts["G"] + self._counts["C"]
-            self._gc = (gc / self.length * 100) if self.length > 0 else 0.0
+            s = self.sequence
+            c_count = s.count("C") + s.count("c")
+            g_count = s.count("G") + s.count("g")
+            self._counts = {
+                "A": s.count("A") + s.count("a"),
+                "C": c_count,
+                "G": g_count,
+                "T": s.count("T") + s.count("t"),
+                "N": s.count("N") + s.count("n"),
+            }
+            self._gc = (g_count + c_count) / self.length * 100 if self.length > 0 else 0.0
 
     @property
     def gc_content(self) -> float:
-        self._ensure_counts()
+        self._ensure_gc()
         return self._gc  # type: ignore[return-value]
 
     @property
@@ -1959,7 +1982,7 @@ async def hmmscan(
     hmm_db_path: str,
     evalue_threshold: float = 1e-5,
     translate: bool = True,
-    use_gathering: bool = True,
+    use_gathering: bool = False,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> list[HmmerHit]:
     import pyhmmer
@@ -1968,6 +1991,19 @@ async def hmmscan(
         seqs_to_search = _six_frame_proteins(sequence, seq_id)
         if not seqs_to_search:
             return []
+        # Cap to the top 6 longest ORFs (roughly one per reading frame).
+        # A 1868 bp transcript produces ~24 ORFs across 6 frames; scanning
+        # all of them against 27k Pfam HMMs is 24x the work of scanning
+        # just the longest. Top 6 gives good frame coverage without the
+        # combinatorial blowup that made single-transcript scans take 50s.
+        orig_count = len(seqs_to_search)
+        if orig_count > 6:
+            seqs_to_search.sort(key=lambda x: len(x[1]), reverse=True)
+            seqs_to_search = seqs_to_search[:6]
+            _log.info(
+                "hmmscan: trimmed to top 6 ORFs (was %d) for %s",
+                orig_count, seq_id,
+            )
     else:
         seqs_to_search = [(seq_id, sequence)]
 
@@ -2329,7 +2365,7 @@ _BASE_COLORS = {
     "G": "bold red1",
     "N": "dim white",
 }
-_MAX_DISPLAY_BASES = 10_000
+_MAX_DISPLAY_BASES = 100_000
 
 
 def colorize_sequence(seq: str, width: int = 60) -> Text:
@@ -2365,7 +2401,7 @@ def colorize_sequence(seq: str, width: int = 60) -> Text:
         chunk = display_seq[i:chunk_end]
         chunk_len = chunk_end - i
         plain_parts.append(chunk)
-        # RLE the chunk by base-color bucket and emit spans.
+        # Per-base ACGT coloring with RLE
         k = 0
         while k < chunk_len:
             run_base_upper = chunk[k].upper()
@@ -2402,15 +2438,29 @@ def _text_to_content(text: "Text"):
     already a Visual and returns it as-is with zero extra work, so body.update
     is essentially free and subsequent paints use Content's fast native path.
 
-    CRITICAL: we pass console=None so Content.from_rich_text creates a
-    fresh temporary Console internally. Using the app's shared console
-    (active_app.get().console) from a worker thread causes lock contention
-    with the main-thread paint cycle — Rich's Console isn't thread-safe —
-    which manifests as multi-second stalls after HMM scans.
+    CRITICAL: we use a thread-local Console with explicit settings.
+    - Using the app's shared console → lock contention with paint cycle.
+    - Using console=None → Rich creates Console() with color_system="auto"
+      which runs terminal capability detection that blocks on worker threads
+      (no TTY access, especially on WSL2).
+    - Using a thread-local Console with force_terminal=True avoids both.
     """
     from textual.content import Content
+    tl = _render_console_local
+    console = getattr(tl, "console", None)
+    if console is None:
+        from rich.console import Console as RichConsole
+        console = RichConsole(
+            color_system="truecolor",
+            force_terminal=True,
+            width=200,      # oversize — Content rewraps on paint anyway
+            no_color=False,
+        )
+        tl.console = console
+    return Content.from_rich_text(text, console=console)
 
-    return Content.from_rich_text(text, console=None)
+
+_render_console_local = threading.local()
 
 
 @dataclass
@@ -2900,9 +2950,19 @@ def colorize_sequence_annotated(
             line_map.append(SeqLineInfo("aa", i, chunk_len))
             cur_line += 1
 
-        _emit("\n")
-        line_map.append(SeqLineInfo("blank", i, chunk_len))
-        cur_line += 1
+        # Blank separator only between annotated chunks (feat/pfam/aa
+        # tracks visible). Plain DNA-only chunks don't need spacing —
+        # removing blanks cuts ~30% of lines in the annotated view,
+        # directly reducing scroll/paint cost.
+        has_tracks = (
+            (orf and chunk_idx in feat_chunks)
+            or (hits and orf and chunk_idx in pfam_chunks)
+            or (orf and chunk_idx in aa_chunks)
+        )
+        if has_tracks:
+            _emit("\n")
+            line_map.append(SeqLineInfo("blank", i, chunk_len))
+            cur_line += 1
 
     if truncated:
         _emit(
@@ -2966,11 +3026,11 @@ class SequenceViewer(ScrollableContainer):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        # Stores both annotated (SeqRenderResult) and plain (Text) renders,
-        # disambiguated by the cache key shape. Plain-render keys are
-        # ("plain", id, length, width); annotated keys are the longer tuple
-        # that includes orf/hits/highlight state.
+        # Level 1: render cache (Rich Text / SeqRenderResult).
         self._seq_render_cache: OrderedDict[tuple, object] = OrderedDict()
+        # Level 2: content cache (Textual Content — pre-converted from Text).
+        # Avoids the ~40-90ms _text_to_content call on cache hits.
+        self._content_cache: OrderedDict[tuple, object] = OrderedDict()
 
     def compose(self) -> ComposeResult:
         yield Static("Select a transcript from the list.", id="seq-info")
@@ -3084,7 +3144,19 @@ class SequenceViewer(ScrollableContainer):
             scrollbar_w = 2
             container_w = self.size.width or 0
             overhead = body_padding + scrollbar_w
-            seq_width = (container_w - overhead) if container_w > overhead else 60
+
+            # If the Sequence tab is hidden (user is on another tab), skip
+            # the render entirely. The render would use a fallback width (60)
+            # that doesn't match the real display width, wasting ~50-100 ms
+            # of worker time + Content conversion AND polluting the render
+            # cache with a wrong-width entry. on_resize will trigger the
+            # render at the correct width when the tab becomes visible.
+            if container_w <= overhead:
+                self._render_seq_id = t.id
+                self._needs_annotation_refresh = True
+                return
+
+            seq_width = container_w - overhead
 
             scan_cache: dict | None = None
             try:
@@ -3111,6 +3183,8 @@ class SequenceViewer(ScrollableContainer):
         self, t: Transcript, seq_width: int, scan_cache: dict | None
     ) -> None:
         """Heavy sequence rendering on a background thread."""
+        import time as _time
+        _t0 = _time.monotonic()
         scanned = scan_cache is not None and t.id in scan_cache
         _log.debug(
             "render_sequence_bg start id=%s length=%d width=%d scanned=%s",
@@ -3142,7 +3216,10 @@ class SequenceViewer(ScrollableContainer):
                     Seq(t.sequence[orf.nt_start : orf.nt_end]).reverse_complement()
                 )
 
-        # Render (expensive)
+        # Render (expensive) — we cache at TWO levels:
+        # 1. SeqRenderResult (Text + line_map + features) — keyed by render state
+        # 2. Textual Content (pre-converted from Text) — same key, avoids the
+        #    ~40-90ms _text_to_content call on cache hits
         if orf:
             hit_key = tuple((h.target_name, h.ali_from, h.ali_to) for h in hits)
             cache_key = (
@@ -3153,10 +3230,31 @@ class SequenceViewer(ScrollableContainer):
                 self._focus_range,
                 hit_key,
             )
-            render = self._seq_render_cache.get(cache_key)
-            if render is not None:
-                self._seq_render_cache.move_to_end(cache_key)
-            else:
+        elif t:
+            cache_key = ("plain", t.id, t.length, seq_width)
+        else:
+            cache_key = None
+
+        # Check for a cached Content first (fastest — zero work)
+        cached_content = self._content_cache.get(cache_key) if cache_key else None
+        cached_render = self._seq_render_cache.get(cache_key) if cache_key else None
+
+        if cached_content is not None and cached_render is not None:
+            # Full cache hit — skip both render and content conversion
+            render = cached_render if orf else None
+            content = cached_content
+            self._seq_render_cache.move_to_end(cache_key)
+            self._content_cache.move_to_end(cache_key)
+            _render_dt = (_time.monotonic() - _t0) * 1000
+            _log.debug(
+                "render_sequence_bg done id=%s total=%.0fms (CACHED) scanned=%s",
+                t.id, _render_dt, scanned,
+            )
+        else:
+            # Cache miss — do the work
+            render = None
+            plain_text = None
+            if orf:
                 render = colorize_sequence_annotated(
                     t.sequence,
                     orf=orf,
@@ -3166,38 +3264,50 @@ class SequenceViewer(ScrollableContainer):
                     aa_highlight_range=self._aa_highlight,
                     focus_range=self._focus_range,
                 )
-                if len(self._seq_render_cache) >= self._RENDER_CACHE_MAX:
-                    self._seq_render_cache.popitem(last=False)
-                self._seq_render_cache[cache_key] = render
-        else:
-            render = None
-
-        plain_text = None
-        if not orf:
-            # Cache plain renders in the same OrderedDict as annotated ones,
-            # keyed with a "plain:" prefix so they don't collide. Re-clicking
-            # a previously-seen unscanned transcript hits the cache instantly.
-            plain_key = ("plain", t.id, t.length, seq_width)
-            cached_plain = self._seq_render_cache.get(plain_key)
-            if cached_plain is not None:
-                self._seq_render_cache.move_to_end(plain_key)
-                plain_text = cached_plain  # type: ignore[assignment]
             else:
                 plain_text = colorize_sequence(t.sequence, width=seq_width)
-                if len(self._seq_render_cache) >= self._RENDER_CACHE_MAX:
-                    self._seq_render_cache.popitem(last=False)
-                self._seq_render_cache[plain_key] = plain_text  # type: ignore[assignment]
 
-        # Pre-convert the Rich Text to a Textual Content on this worker thread.
-        # Textual's body.update(text) normally runs Content.from_rich_text()
-        # on the main thread — ~33 ms per call for a ~5k-span annotated
-        # render, which blows the 33 ms/frame budget. Doing it here moves
-        # that cost off the main UI thread.
-        content: object
-        if render is not None:
-            content = _text_to_content(render.text)
-        else:
-            content = _text_to_content(plain_text)
+            _t_content_start = _time.monotonic()
+            content = _text_to_content(render.text if render else plain_text)
+            _t_content_ms = (_time.monotonic() - _t_content_start) * 1000
+
+            # Store in both caches
+            def _cache_put(k, r, c):
+                if len(self._seq_render_cache) >= self._RENDER_CACHE_MAX:
+                    evicted = self._seq_render_cache.popitem(last=False)
+                    self._content_cache.pop(evicted[0], None)
+                self._seq_render_cache[k] = r
+                self._content_cache[k] = c
+
+            if cache_key:
+                _cache_put(cache_key, render if render else plain_text, content)
+
+            _render_dt = (_time.monotonic() - _t0) * 1000
+            _log.debug(
+                "render_sequence_bg done id=%s total=%.0fms content=%.0fms scanned=%s",
+                t.id, _render_dt, _t_content_ms, scanned,
+            )
+
+            # Pre-warm: when we just produced the BASE annotated render
+            # (no focus, no highlight), also render the CDS-focused variant
+            # so the user's first click on the feature is a cache hit.
+            # This eliminates the 200-280ms cold-click cost on large ORFs.
+            if (orf and self._focus_range is None
+                    and self._highlight is None and self._aa_highlight is None):
+                cds_focus = (orf.nt_start, orf.nt_end)
+                focus_key = (t.id, seq_width, None, None, cds_focus, hit_key)
+                if focus_key not in self._content_cache:
+                    _log.debug("pre-warming focus cache for CDS %d-%d", orf.nt_start, orf.nt_end)
+                    focus_render = colorize_sequence_annotated(
+                        t.sequence, orf=orf, hits=hits, width=seq_width,
+                        focus_range=cds_focus,
+                    )
+                    focus_content = _text_to_content(focus_render.text)
+                    _cache_put(focus_key, focus_render, focus_content)
+                    _log.debug(
+                        "pre-warmed CDS focus cache for %s (%.0fms)",
+                        t.id, (_time.monotonic() - _t0) * 1000 - _render_dt,
+                    )
 
         # Preserve scroll position when the render is just a highlight
         # toggle (focus_range, aa_highlight) on the same transcript. We
@@ -3275,34 +3385,34 @@ class SequenceViewer(ScrollableContainer):
         nt_pos = line_info.chunk_start + (x - 1)
 
         if line_info.line_type in ("feat", "pfam"):
-            # Click on feature/pfam line → focus the ORF/domain it belongs to.
+            # Click on feature/pfam line → highlight DNA only.
+            # Clears any AA highlight so only one is active at a time.
             for feat in self._features:
                 if feat.nt_start <= nt_pos < feat.nt_end:
                     new_focus = (feat.nt_start, feat.nt_end)
-                    if self._focus_range == new_focus and self._aa_highlight is None:
-                        # Already focused on this feature — toggle off.
+                    if self._focus_range == new_focus:
                         self._clear_highlights()
                     else:
                         self._focus_range = new_focus
-                        self._highlight = None
                         self._aa_highlight = None
                         self._aa_highlight_seq = ""
+                        self._highlight = None
                         self.show_transcript(self.transcript)
                     return
             self._clear_highlights()
 
         elif line_info.line_type == "aa":
-            # Click on AA line → focus the feature AND highlight its aa run
-            # for clipboard copy on Ctrl+C.
+            # Click on AA line → highlight amino acids only.
+            # Clears any DNA focus so only one is active at a time.
             for feat in self._features:
                 if feat.nt_start <= nt_pos < feat.nt_end:
-                    new_focus = (feat.nt_start, feat.nt_end)
-                    if self._aa_highlight == new_focus:
+                    new_hl = (feat.nt_start, feat.nt_end)
+                    if self._aa_highlight == new_hl:
                         self._clear_highlights()
                     else:
-                        self._focus_range = new_focus
-                        self._aa_highlight = new_focus
+                        self._aa_highlight = new_hl
                         self._aa_highlight_seq = feat.aa_seq
+                        self._focus_range = None
                         self._highlight = None
                         self.show_transcript(self.transcript)
                     return
@@ -5109,21 +5219,24 @@ class HmmerPanel(Vertical):
 
     @work(exclusive=True, thread=False)
     async def _run_hmmer_worker(
-        self,
-        t: Transcript,
-        db: str,
-        evalue: float,
-        translate: bool,
-        use_gathering: bool = True,
+        self, t: Transcript, db: str, evalue: float, translate: bool,
+        use_gathering: bool = False,
     ) -> None:
+        import time as _time
         progress = self.query_one("#hmmer-progress", ProgressBar)
         progress.update(total=100, progress=0)
         progress.add_class("running")
-        self._set_status(f"Scanning {t.short_id} for Pfam domains…")
+        mode = "gathering" if use_gathering else f"E={evalue:g}"
+        self._set_status(f"Scanning {t.short_id} for Pfam domains ({mode})…")
+        _log.info(
+            "HMM scan start: id=%s length=%d mode=%s",
+            t.id, t.length, mode,
+        )
 
         def _on_progress(current: int, total: int) -> None:
             self.app.call_from_thread(self._show_progress, current, total)
 
+        scan_t0 = _time.monotonic()
         try:
             _hmm_cancel.clear()
             hits = await hmmscan(
@@ -5135,9 +5248,16 @@ class HmmerPanel(Vertical):
                 use_gathering=use_gathering,
                 progress_cb=_on_progress,
             )
+            scan_dt = _time.monotonic() - scan_t0
+            _log.info(
+                "HMM scan done: id=%s hits=%d time=%.1fs mode=%s",
+                t.id, len(hits), scan_dt, mode,
+            )
             self._scan_cache[t.id] = hits
             self._display_hits(t, hits)
-            self._set_status(f"[green]{len(hits)} Pfam domain hits found.[/]")
+            self._set_status(
+                f"[green]{len(hits)} Pfam domain hits found ({scan_dt:.1f}s).[/]"
+            )
             # Disable button after successful scan
             btn = self.query_one("#hmmer-run", Button)
             btn.label = "Scan Complete"
@@ -5733,13 +5853,12 @@ class ScriptoScopeApp(App):
             except Exception:
                 pass
             self._set_status(
-                f"[green]{len(transcripts):,} transcripts loaded from project[/]"
+                f"[green]{len(transcripts):,} transcripts loaded from project — ready[/]"
             )
+            self.clear_notifications()
             self.notify(
-                f"Project loaded: {len(transcripts):,} transcripts",
-                title="Project",
-                severity="information",
-                timeout=3,
+                f"Project loaded: {len(transcripts):,} transcripts — ready",
+                title="Ready", severity="information", timeout=3,
             )
             # Stats are no longer auto-computed — user triggers via button
             try:
@@ -6132,15 +6251,14 @@ class ScriptoScopeApp(App):
             self._refresh_transcriptome_select()
         except Exception:
             _log.exception("refresh_transcriptome_select raised during load apply")
-        status_msg = f"[green]{len(transcripts):,} transcripts loaded from {path}[/]"
+        status_msg = f"[green]{len(transcripts):,} transcripts loaded from {path} — ready[/]"
         if dup_shortfall:
             status_msg += f" [yellow](dedup anomaly: {dup_shortfall})[/]"
         self._set_status(status_msg)
+        self.clear_notifications()
         self.notify(
-            f"{len(transcripts):,} transcripts loaded",
-            title="Transcriptome",
-            severity="information",
-            timeout=3,
+            f"{len(transcripts):,} transcripts loaded — ready",
+            title="Ready", severity="information", timeout=3,
         )
         # Stats are no longer auto-computed — user triggers via the
         # "Compute Statistics" button in the Statistics tab.
