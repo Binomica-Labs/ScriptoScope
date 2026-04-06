@@ -1628,7 +1628,7 @@ async def hmmscan(
     hmm_db_path: str,
     evalue_threshold: float = 1e-5,
     translate: bool = True,
-    use_gathering: bool = True,
+    use_gathering: bool = False,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> list[HmmerHit]:
     import pyhmmer
@@ -4523,16 +4523,23 @@ class HmmerPanel(Vertical):
     @work(exclusive=True, thread=False)
     async def _run_hmmer_worker(
         self, t: Transcript, db: str, evalue: float, translate: bool,
-        use_gathering: bool = True,
+        use_gathering: bool = False,
     ) -> None:
+        import time as _time
         progress = self.query_one("#hmmer-progress", ProgressBar)
         progress.update(total=100, progress=0)
         progress.add_class("running")
-        self._set_status(f"Scanning {t.short_id} for Pfam domains…")
+        mode = "gathering" if use_gathering else f"E={evalue:g}"
+        self._set_status(f"Scanning {t.short_id} for Pfam domains ({mode})…")
+        _log.info(
+            "HMM scan start: id=%s length=%d mode=%s",
+            t.id, t.length, mode,
+        )
 
         def _on_progress(current: int, total: int) -> None:
             self.app.call_from_thread(self._show_progress, current, total)
 
+        scan_t0 = _time.monotonic()
         try:
             _hmm_cancel.clear()
             hits = await hmmscan(
@@ -4541,9 +4548,16 @@ class HmmerPanel(Vertical):
                 use_gathering=use_gathering,
                 progress_cb=_on_progress,
             )
+            scan_dt = _time.monotonic() - scan_t0
+            _log.info(
+                "HMM scan done: id=%s hits=%d time=%.1fs mode=%s",
+                t.id, len(hits), scan_dt, mode,
+            )
             self._scan_cache[t.id] = hits
             self._display_hits(t, hits)
-            self._set_status(f"[green]{len(hits)} Pfam domain hits found.[/]")
+            self._set_status(
+                f"[green]{len(hits)} Pfam domain hits found ({scan_dt:.1f}s).[/]"
+            )
             # Disable button after successful scan
             btn = self.query_one("#hmmer-run", Button)
             btn.label = "Scan Complete"
