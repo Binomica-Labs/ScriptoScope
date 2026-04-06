@@ -2564,9 +2564,19 @@ def colorize_sequence_annotated(
             line_map.append(SeqLineInfo("aa", i, chunk_len))
             cur_line += 1
 
-        _emit("\n")
-        line_map.append(SeqLineInfo("blank", i, chunk_len))
-        cur_line += 1
+        # Blank separator only between annotated chunks (feat/pfam/aa
+        # tracks visible). Plain DNA-only chunks don't need spacing —
+        # removing blanks cuts ~30% of lines in the annotated view,
+        # directly reducing scroll/paint cost.
+        has_tracks = (
+            (orf and chunk_idx in feat_chunks)
+            or (hits and orf and chunk_idx in pfam_chunks)
+            or (orf and chunk_idx in aa_chunks)
+        )
+        if has_tracks:
+            _emit("\n")
+            line_map.append(SeqLineInfo("blank", i, chunk_len))
+            cur_line += 1
 
     if truncated:
         _emit(
