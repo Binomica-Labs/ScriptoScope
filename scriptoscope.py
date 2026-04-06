@@ -2831,18 +2831,42 @@ class SequenceViewer(ScrollableContainer):
             _t_content_ms = (_time.monotonic() - _t_content_start) * 1000
 
             # Store in both caches
-            if cache_key:
+            def _cache_put(k, r, c):
                 if len(self._seq_render_cache) >= self._RENDER_CACHE_MAX:
                     evicted = self._seq_render_cache.popitem(last=False)
                     self._content_cache.pop(evicted[0], None)
-                self._seq_render_cache[cache_key] = render if render else plain_text
-                self._content_cache[cache_key] = content
+                self._seq_render_cache[k] = r
+                self._content_cache[k] = c
+
+            if cache_key:
+                _cache_put(cache_key, render if render else plain_text, content)
 
             _render_dt = (_time.monotonic() - _t0) * 1000
             _log.debug(
                 "render_sequence_bg done id=%s total=%.0fms content=%.0fms scanned=%s",
                 t.id, _render_dt, _t_content_ms, scanned,
             )
+
+            # Pre-warm: when we just produced the BASE annotated render
+            # (no focus, no highlight), also render the CDS-focused variant
+            # so the user's first click on the feature is a cache hit.
+            # This eliminates the 200-280ms cold-click cost on large ORFs.
+            if (orf and self._focus_range is None
+                    and self._highlight is None and self._aa_highlight is None):
+                cds_focus = (orf.nt_start, orf.nt_end)
+                focus_key = (t.id, seq_width, None, None, cds_focus, hit_key)
+                if focus_key not in self._content_cache:
+                    _log.debug("pre-warming focus cache for CDS %d-%d", orf.nt_start, orf.nt_end)
+                    focus_render = colorize_sequence_annotated(
+                        t.sequence, orf=orf, hits=hits, width=seq_width,
+                        focus_range=cds_focus,
+                    )
+                    focus_content = _text_to_content(focus_render.text)
+                    _cache_put(focus_key, focus_render, focus_content)
+                    _log.debug(
+                        "pre-warmed CDS focus cache for %s (%.0fms)",
+                        t.id, (_time.monotonic() - _t0) * 1000 - _render_dt,
+                    )
 
         # Preserve scroll position when the render is just a highlight
         # toggle (focus_range, aa_highlight) on the same transcript. We
