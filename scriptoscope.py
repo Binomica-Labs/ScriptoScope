@@ -926,7 +926,17 @@ def genbank_search_transcriptomes(query: str, max_results: int = 10) -> list[Gen
             break
 
     if not id_list:
-        return []
+        # Fallback: try RefSeq assemblies (for bacteria/model organisms)
+        _log.info("No TSA/mRNA results for '%s', trying RefSeq assemblies", q)
+        return refseq_search_genomes(q, max_results=max_results)
+
+    # Also check RefSeq assemblies and merge — even if we found some mRNA
+    # results, they may be individual clones (not a full transcriptome).
+    # RefSeq CDS from a reference genome is often more useful for microbes.
+    try:
+        refseq_results = refseq_search_genomes(q, max_results=3)
+    except Exception:
+        refseq_results = []
 
     # Fetch summaries
     handle = Entrez.esummary(db="nuccore", id=",".join(id_list), retmax=max_results)
@@ -945,6 +955,74 @@ def genbank_search_transcriptomes(query: str, max_results: int = 10) -> list[Gen
         results.append(GenBankResult(
             accession=acc, title=title, organism=organism,
             seq_count=length, update_date=update,
+        ))
+    # Prepend RefSeq genome results (more useful for microbes than
+    # individual mRNA clones). They appear first in the search results
+    # so the user sees "RefSeq CDS" as the top option.
+    if refseq_results:
+        return refseq_results + results
+    return results
+
+
+def refseq_search_genomes(query: str, max_results: int = 10) -> list[GenBankResult]:
+    """Search NCBI Assembly database for RefSeq bacterial/archaeal genomes.
+
+    Returns GenBankResult entries where:
+    - accession = RefSeq assembly accession (GCF_...)
+    - title = organism name + assembly info
+    - organism = species name
+    - seq_count = number of scaffolds (from assembly stats)
+    """
+    from Bio import Entrez
+    Entrez.email = "scriptoscope@example.com"
+
+    q = query.strip()
+    handle = Entrez.esearch(
+        db="assembly",
+        term=f'"{q}"[Organism] AND "latest refseq"[filter]',
+        retmax=max_results,
+        sort="relevance",
+    )
+    search_results = Entrez.read(handle)
+    handle.close()
+
+    id_list = search_results.get("IdList", [])
+    if not id_list:
+        return []
+
+    # Fetch assembly summaries
+    handle = Entrez.esummary(db="assembly", id=",".join(id_list), retmax=max_results)
+    doc_sums = Entrez.read(handle)
+    handle.close()
+
+    results: list[GenBankResult] = []
+    # Entrez assembly summaries come in a DocumentSummarySet wrapper
+    summaries = doc_sums.get("DocumentSummarySet", {}).get("DocumentSummary", [])
+    if not summaries:
+        return []
+
+    for doc in summaries:
+        acc = doc.get("AssemblyAccession", "")
+        organism = doc.get("Organism", doc.get("SpeciesName", ""))
+        asm_name = doc.get("AssemblyName", "")
+        ftp_refseq = doc.get("FtpPath_RefSeq", "")
+        # Scaffold count gives a rough idea of genome completeness
+        scaffold_n = 0
+        stat_val = doc.get("Meta", "")
+        if "<Stat category=\"scaffold_count\"" in str(stat_val):
+            import re as _re
+            m = _re.search(r'<Stat category="scaffold_count"[^>]*>(\d+)', str(stat_val))
+            if m:
+                scaffold_n = int(m.group(1))
+        title = f"{organism} — {asm_name}" if asm_name else organism
+        if ftp_refseq:
+            title += f"  [FTP: {ftp_refseq.split('/')[-1]}]"
+        results.append(GenBankResult(
+            accession=acc,
+            title=title,
+            organism=organism,
+            seq_count=scaffold_n,
+            update_date=doc.get("SubmissionDate", doc.get("SeqReleaseDate", "")),
         ))
     return results
 
@@ -1083,6 +1161,154 @@ async def genbank_download_fasta(
             for i in range(len(batches)):
                 fh.write(results[i])
 
+        return str(out_path)
+
+    return await asyncio.get_running_loop().run_in_executor(None, _download)
+
+
+def _get_refseq_ftp_path(assembly_accession: str) -> tuple[str, str, str]:
+    """Fetch the RefSeq FTP path and organism name for an assembly accession.
+
+    Returns (ftp_path, organism, assembly_name).
+    """
+    from Bio import Entrez
+    Entrez.email = "scriptoscope@example.com"
+
+    handle = Entrez.esearch(
+        db="assembly",
+        term=f'{assembly_accession}[Assembly Accession]',
+        retmax=1,
+    )
+    search_results = Entrez.read(handle)
+    handle.close()
+    id_list = search_results.get("IdList", [])
+    if not id_list:
+        raise RuntimeError(f"Assembly {assembly_accession} not found in NCBI")
+
+    handle = Entrez.esummary(db="assembly", id=id_list[0])
+    doc_sums = Entrez.read(handle)
+    handle.close()
+    summaries = doc_sums.get("DocumentSummarySet", {}).get("DocumentSummary", [])
+    if not summaries:
+        raise RuntimeError(f"No summary for assembly {assembly_accession}")
+
+    doc = summaries[0]
+    ftp_path = doc.get("FtpPath_RefSeq", "")
+    if not ftp_path:
+        raise RuntimeError(
+            f"No RefSeq FTP path for {assembly_accession} — "
+            "this assembly may not have a RefSeq annotation"
+        )
+    organism = doc.get("Organism", doc.get("SpeciesName", ""))
+    asm_name = doc.get("AssemblyName", "")
+    return ftp_path, organism, asm_name
+
+
+async def refseq_download_cds(
+    assembly_accession: str,
+    output_dir: str | Path,
+    progress_cb: Callable[[str], None] | None = None,
+) -> str:
+    """Download the CDS nucleotide FASTA from a RefSeq genome assembly.
+
+    Downloads _cds_from_genomic.fna.gz from the NCBI FTP via HTTPS,
+    decompresses with gzip, saves as a FASTA file.
+
+    Returns the path to the downloaded FASTA.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / f"{assembly_accession}_cds.fasta"
+
+    def _download() -> str:
+        if progress_cb:
+            progress_cb("Fetching assembly metadata from NCBI…")
+
+        ftp_path, organism, asm_name = _get_refseq_ftp_path(assembly_accession)
+
+        # Convert ftp:// to https://ftp.ncbi.nlm.nih.gov/...
+        # FTP path looks like: ftp://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/.../{acc}_{name}
+        basename = ftp_path.rstrip("/").rsplit("/", 1)[-1]
+        cds_filename = f"{basename}_cds_from_genomic.fna.gz"
+
+        if ftp_path.startswith("ftp://"):
+            https_path = ftp_path.replace("ftp://", "https://", 1)
+        else:
+            https_path = ftp_path
+        cds_url = f"{https_path}/{cds_filename}"
+
+        if progress_cb:
+            progress_cb(f"Downloading CDS FASTA for {organism}…")
+
+        _log.info("Downloading RefSeq CDS: %s", cds_url)
+
+        gz_path = output_dir / cds_filename
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                req = urllib.request.Request(
+                    cds_url,
+                    headers={"User-Agent": "ScriptoScope/0.6 (scriptoscope@example.com)"},
+                )
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = resp.read()
+                gz_path.write_bytes(data)
+                break
+            except Exception:
+                if attempt == max_retries - 1:
+                    raise
+                _log.warning("Retry %d for %s", attempt + 1, cds_url)
+                time.sleep(2)
+
+        if progress_cb:
+            progress_cb("Decompressing CDS FASTA…")
+
+        # Decompress gzip -> FASTA
+        with gzip.open(gz_path, "rt", encoding="utf-8", errors="replace") as gz_in:
+            with open(out_path, "w", encoding="utf-8") as fasta_out:
+                while True:
+                    chunk = gz_in.read(1024 * 1024)  # 1 MB chunks
+                    if not chunk:
+                        break
+                    fasta_out.write(chunk)
+
+        # Clean up .gz file
+        try:
+            gz_path.unlink()
+        except OSError:
+            pass
+
+        # Count sequences
+        seq_count = 0
+        with open(out_path, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith(">"):
+                    seq_count += 1
+
+        if seq_count == 0:
+            raise RuntimeError(
+                f"Downloaded CDS FASTA for {assembly_accession} is empty"
+            )
+
+        # Write metadata
+        meta_path = out_path.with_suffix(".meta.json")
+        meta_path.write_text(json.dumps({
+            "accession": assembly_accession,
+            "organism": organism,
+            "assembly_name": asm_name,
+            "source": "refseq_cds",
+            "cds_count": seq_count,
+        }), encoding="utf-8")
+
+        if progress_cb:
+            progress_cb(
+                f"Done — {seq_count:,} CDS sequences from {organism}"
+            )
+
+        _log.info(
+            "RefSeq CDS download complete: %s (%d CDS) -> %s",
+            assembly_accession, seq_count, out_path,
+        )
         return str(out_path)
 
     return await asyncio.get_running_loop().run_in_executor(None, _download)
@@ -5255,7 +5481,7 @@ class SaveProjectModal(ModalScreen[str | None]):
 
 
 class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
-    """Modal for searching and downloading GenBank transcriptomes."""
+    """Modal for searching and downloading GenBank transcriptomes and RefSeq CDS."""
     DEFAULT_CSS = """
     GenBankSearchModal { align: center middle; }
     GenBankSearchModal #gb-dialog {
@@ -5287,7 +5513,7 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="gb-dialog"):
-            yield Label(" GenBank Transcriptome Search", id="gb-title")
+            yield Label(" GenBank / RefSeq Sequence Search", id="gb-title")
             with Horizontal(id="gb-search-row"):
                 yield Label("Organism:", id="gb-search-label")
                 yield Input(placeholder="e.g. Epipremnum aureum", id="gb-search-input")
@@ -5326,7 +5552,7 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
                 table.clear()
                 if not results:
                     self.query_one("#gb-status", Static).update(
-                        "[yellow]No TSA transcriptome results found.[/]"
+                        "[yellow]No results found (TSA or RefSeq CDS).[/]"
                     )
                     return
                 for r in results:
@@ -5374,16 +5600,23 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
                     self.query_one("#gb-status", Static).update, msg,
                 )
 
-            fasta_path = asyncio.run(
-                genbank_download_fasta(result.accession, dl_dir, progress_cb=_progress)
-            )
-            # Save metadata for dropdown label
-            meta_path = Path(fasta_path).with_suffix(".meta.json")
-            meta_path.write_text(json.dumps({
-                "accession": result.accession,
-                "organism": result.organism,
-                "title": result.title,
-            }), encoding="utf-8")
+            if result.accession.startswith("GCF_"):
+                # RefSeq assembly -> download CDS FASTA
+                fasta_path = asyncio.run(
+                    refseq_download_cds(result.accession, dl_dir, progress_cb=_progress)
+                )
+            else:
+                # TSA / nuccore -> existing download
+                fasta_path = asyncio.run(
+                    genbank_download_fasta(result.accession, dl_dir, progress_cb=_progress)
+                )
+                # Save metadata for dropdown label (refseq_download_cds writes its own)
+                meta_path = Path(fasta_path).with_suffix(".meta.json")
+                meta_path.write_text(json.dumps({
+                    "accession": result.accession,
+                    "organism": result.organism,
+                    "title": result.title,
+                }), encoding="utf-8")
             def _done() -> None:
                 self.dismiss((result.accession, fasta_path))
             self.app.call_from_thread(_done)
