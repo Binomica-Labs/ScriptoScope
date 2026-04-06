@@ -27,6 +27,7 @@ import csv
 import gzip
 import json
 import logging
+import math
 import datetime
 import os
 import re
@@ -513,7 +514,7 @@ def load_project(path: str | Path) -> dict:
 # Annotation sidecar files
 # ══════════════════════════════════════════════════════════════════════════════
 
-_ANNOTATION_VERSION = 2
+_ANNOTATION_VERSION = 3
 
 
 def _annotation_path(fasta_path: str) -> Path:
@@ -528,6 +529,7 @@ def save_annotations(
     pfam_hits: dict,
     bookmarks: set,
     orf_cache: dict,
+    predictions: dict | None = None,
 ) -> None:
     """Save annotation sidecar file next to the FASTA. Atomic write."""
     data: dict = {"version": _ANNOTATION_VERSION}
@@ -571,6 +573,21 @@ def save_annotations(
         }
     else:
         data["orf_cache"] = {}
+
+    if predictions:
+        data["predictions"] = {
+            tid: {
+                "hexamer_score": pred.hexamer_score,
+                "kozak_score": pred.kozak_score,
+                "cai_score": pred.cai_score,
+                "completeness": pred.completeness,
+                "confidence": pred.confidence,
+                "combined_score": pred.combined_score,
+            }
+            for tid, pred in predictions.items()
+        }
+    else:
+        data["predictions"] = {}
 
     dest = _annotation_path(fasta_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -660,9 +677,29 @@ def load_annotations(fasta_path: str) -> dict | None:
     # orf_cache — stored as plain dicts, not ORFCoord (no sequence stored)
     result["orf_cache"] = raw.get("orf_cache") or {}
 
+    # predictions — CDSPrediction stored as plain dicts (no ORFCoord inside)
+    predictions: dict[str, CDSPrediction] = {}
+    for tid, pred in (raw.get("predictions") or {}).items():
+        if isinstance(pred, dict):
+            try:
+                predictions[str(tid)] = CDSPrediction(
+                    transcript_id=str(tid),
+                    orf=None,  # ORF is reconstructed lazily, not stored
+                    hexamer_score=float(pred.get("hexamer_score", 0.0)),
+                    kozak_score=float(pred.get("kozak_score", 0.0)),
+                    cai_score=float(pred.get("cai_score", 0.0)),
+                    completeness=str(pred.get("completeness", "no_orf")),
+                    confidence=str(pred.get("confidence", "NONE")),
+                    combined_score=float(pred.get("combined_score", 0.0)),
+                )
+            except (TypeError, ValueError) as exc:
+                _log.warning("Skipping malformed CDSPrediction for %s: %s", tid, exc)
+    result["predictions"] = predictions
+
     _log.info(
-        "Loaded annotations sidecar: %s (scan=%d, confirm=%d, pfam=%d, bookmarks=%d)",
-        dest, len(scan_cache), len(confirm_cache), len(pfam_hits), len(result["bookmarks"]),
+        "Loaded annotations sidecar: %s (scan=%d, confirm=%d, pfam=%d, bookmarks=%d, predictions=%d)",
+        dest, len(scan_cache), len(confirm_cache), len(pfam_hits),
+        len(result["bookmarks"]), len(predictions),
     )
     return result
 
@@ -1550,6 +1587,399 @@ _RC_TABLE = str.maketrans("ACGTN", "TGCAN")
 # aren't hidden — e.g. "TAATG" has a TAA at 0 and an ATG at 2 which
 # belong to different reading frames.
 _CODON_SCAN_RE = re.compile(r"(?=(ATG|TAA|TAG|TGA))")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Gene Prediction Scoring System
+# Pure-Python CDS confidence scoring: hexamer coding potential, Kozak-like
+# start codon context, Codon Adaptation Index, ORF completeness, and a
+# combined confidence classifier.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_HEXAMER_PSEUDO = 1e-8  # pseudocount to avoid log(0)
+
+
+def _count_hexamers(seq: str) -> dict[str, int]:
+    """Count all 6-mer frequencies in a DNA sequence."""
+    counts: dict[str, int] = {}
+    s = seq.upper()
+    n = len(s)
+    for i in range(n - 5):
+        kmer = s[i:i + 6]
+        # Skip hexamers containing ambiguous bases
+        if "N" not in kmer:
+            counts[kmer] = counts.get(kmer, 0) + 1
+    return counts
+
+
+def _normalize_hexamer_counts(counts: dict[str, int]) -> dict[str, float]:
+    """Normalize hexamer counts to frequencies (probabilities)."""
+    total = sum(counts.values())
+    if total == 0:
+        return {}
+    return {k: v / total for k, v in counts.items()}
+
+
+def _reverse_complement(seq: str) -> str:
+    """Return the reverse complement of a DNA sequence (uppercase)."""
+    return seq.upper().translate(_RC_TABLE)[::-1]
+
+
+def _build_hexamer_model(transcripts: list) -> tuple[dict, dict]:
+    """Self-training hexamer model from the transcriptome.
+
+    Positive set: CDS regions of the top 500 longest ORFs (>=100 aa).
+    Negative set: reverse complement of the CDS regions (preserves
+                  dinucleotide composition but is non-coding).
+
+    Returns (coding_freqs, noncoding_freqs) as normalized dicts.
+    """
+    # Collect ORFs from the transcriptome, keeping only those >= 100 aa.
+    orf_data: list[tuple[int, str, str]] = []  # (aa_length, orf_dna, seq_id)
+    for t in transcripts:
+        orf = _find_longest_orf(t.sequence, t.id)
+        if orf is not None and orf.aa_length >= 100:
+            upper = t.sequence.upper()
+            if orf.strand == "+":
+                orf_dna = upper[orf.nt_start:orf.nt_end]
+            else:
+                rc_full = _reverse_complement(upper)
+                # On minus strand, nt_start/nt_end are on the original sequence.
+                # The ORF DNA is the reverse complement of that region.
+                orf_dna = _reverse_complement(upper[orf.nt_start:orf.nt_end])
+            if len(orf_dna) >= 6:
+                orf_data.append((orf.aa_length, orf_dna, t.id))
+
+    # Sort by ORF length descending, take top 500.
+    orf_data.sort(key=lambda x: x[0], reverse=True)
+    top_orfs = orf_data[:500]
+
+    if not top_orfs:
+        # Fallback: return empty dicts (scoring will return 0.0)
+        return ({}, {})
+
+    # Positive set: CDS hexamers
+    coding_counts: dict[str, int] = {}
+    for _, orf_dna, _ in top_orfs:
+        for kmer, cnt in _count_hexamers(orf_dna).items():
+            coding_counts[kmer] = coding_counts.get(kmer, 0) + cnt
+
+    # Negative set: reverse complement of CDS
+    noncoding_counts: dict[str, int] = {}
+    for _, orf_dna, _ in top_orfs:
+        rc_seq = _reverse_complement(orf_dna)
+        for kmer, cnt in _count_hexamers(rc_seq).items():
+            noncoding_counts[kmer] = noncoding_counts.get(kmer, 0) + cnt
+
+    coding_freqs = _normalize_hexamer_counts(coding_counts)
+    noncoding_freqs = _normalize_hexamer_counts(noncoding_counts)
+    return (coding_freqs, noncoding_freqs)
+
+
+def _hexamer_score(seq: str, coding_freqs: dict, noncoding_freqs: dict) -> float:
+    """Log-likelihood ratio score for a DNA sequence being coding.
+
+    For each hexamer in the sequence:
+      score += log(P(hexamer|coding) / P(hexamer|noncoding))
+
+    Returns the average per-hexamer log-odds score.
+    Positive = likely coding, negative = likely non-coding.
+    """
+    if not coding_freqs or not noncoding_freqs:
+        return 0.0
+    s = seq.upper()
+    n = len(s)
+    if n < 6:
+        return 0.0
+    total_score = 0.0
+    count = 0
+    pseudo = _HEXAMER_PSEUDO
+    for i in range(n - 5):
+        kmer = s[i:i + 6]
+        if "N" in kmer:
+            continue
+        p_coding = coding_freqs.get(kmer, pseudo)
+        p_noncoding = noncoding_freqs.get(kmer, pseudo)
+        total_score += math.log(p_coding / p_noncoding)
+        count += 1
+    if count == 0:
+        return 0.0
+    return total_score / count
+
+
+# ── Start codon context scorer (Kozak-like) ─────────────────────────────────
+
+_KOZAK_WEIGHTS: dict[int, dict[str, float]] = {
+    -6: {"G": 0.2, "A": 0.15, "C": 0.1, "T": 0.05},
+    -5: {"C": 0.2, "A": 0.15, "G": 0.1, "T": 0.05},
+    -4: {"C": 0.2, "A": 0.15, "G": 0.1, "T": 0.05},
+    -3: {"A": 0.35, "G": 0.35, "C": 0.05, "T": 0.05},  # critical position
+    # -2, -1 are the CC of CCATG — not scored individually
+    +4: {"G": 0.3, "A": 0.1, "C": 0.1, "T": 0.1},  # +4 after ATG
+}
+
+# Maximum possible Kozak score (for normalization)
+_KOZAK_MAX = sum(max(w.values()) for w in _KOZAK_WEIGHTS.values())
+
+
+def _kozak_score(seq: str, atg_pos: int) -> float:
+    """Score the nucleotide context around an ATG start codon.
+    Returns 0.0-1.0 where 1.0 is a perfect Kozak consensus.
+
+    atg_pos is the 0-based position of the 'A' in ATG within seq.
+    """
+    if _KOZAK_MAX == 0:
+        return 0.0
+    s = seq.upper()
+    total = 0.0
+    for offset, weights in _KOZAK_WEIGHTS.items():
+        if offset < 0:
+            pos = atg_pos + offset
+        else:
+            # +4 means 4th position counting from the A in ATG (A=+1, T=+2, G=+3, next=+4)
+            pos = atg_pos + 2 + offset  # ATG occupies +1,+2,+3 so +4 is atg_pos+3
+        if 0 <= pos < len(s):
+            base = s[pos]
+            total += weights.get(base, 0.0)
+    return total / _KOZAK_MAX
+
+
+# ── Codon Adaptation Index (CAI) ────────────────────────────────────────────
+
+# Group codons by amino acid using the existing _ORF_CODON_TABLE.
+_AA_TO_CODONS: dict[str, list[str]] = {}
+for _codon, _aa in _ORF_CODON_TABLE.items():
+    if _aa != "*":
+        _AA_TO_CODONS.setdefault(_aa, []).append(_codon)
+
+
+def _compute_rscu(codon_counts: dict[str, int]) -> dict[str, float]:
+    """Relative Synonymous Codon Usage from observed codon counts.
+
+    RSCU = (observed count of codon) / (expected count if all synonymous
+    codons were used equally) = count * n_synonyms / total_for_aa.
+    """
+    rscu: dict[str, float] = {}
+    for aa, codons in _AA_TO_CODONS.items():
+        total = sum(codon_counts.get(c, 0) for c in codons)
+        n_syn = len(codons)
+        for c in codons:
+            if total > 0:
+                rscu[c] = (codon_counts.get(c, 0) * n_syn) / total
+            else:
+                rscu[c] = 1.0  # no data => assume uniform
+    return rscu
+
+
+def _build_cai_reference(transcripts: list) -> dict[str, float]:
+    """Build a CAI reference from the top 100 longest ORFs.
+    These are assumed to be highly expressed (codon-optimized).
+
+    Returns a dict mapping each codon to its relative adaptiveness w_i
+    (RSCU_i / RSCU_max for that amino acid), range 0.0-1.0.
+    """
+    # Collect ORFs from the transcriptome, keeping only those >= 100 aa.
+    orf_data: list[tuple[int, str]] = []  # (aa_length, orf_dna)
+    for t in transcripts:
+        orf = _find_longest_orf(t.sequence, t.id)
+        if orf is not None and orf.aa_length >= 100:
+            upper = t.sequence.upper()
+            if orf.strand == "+":
+                orf_dna = upper[orf.nt_start:orf.nt_end]
+            else:
+                orf_dna = _reverse_complement(upper[orf.nt_start:orf.nt_end])
+            if len(orf_dna) >= 3:
+                orf_data.append((orf.aa_length, orf_dna))
+
+    orf_data.sort(key=lambda x: x[0], reverse=True)
+    top_orfs = orf_data[:100]
+
+    if not top_orfs:
+        return {}
+
+    # Count codons across all reference ORFs.
+    codon_counts: dict[str, int] = {}
+    for _, orf_dna in top_orfs:
+        for i in range(0, len(orf_dna) - 2, 3):
+            codon = orf_dna[i:i + 3]
+            if len(codon) == 3 and "N" not in codon:
+                codon_counts[codon] = codon_counts.get(codon, 0) + 1
+
+    rscu = _compute_rscu(codon_counts)
+
+    # Compute relative adaptiveness: w_i = RSCU_i / RSCU_max for each aa.
+    w: dict[str, float] = {}
+    for aa, codons in _AA_TO_CODONS.items():
+        max_rscu = max(rscu.get(c, 0.0) for c in codons)
+        for c in codons:
+            if max_rscu > 0:
+                w[c] = rscu.get(c, 0.0) / max_rscu
+            else:
+                w[c] = 1.0  # no data
+    return w
+
+
+def _cai_score(orf_dna: str, reference: dict[str, float]) -> float:
+    """Codon Adaptation Index for an ORF. Returns 0.0-1.0.
+
+    CAI = geometric mean of w_i for each codon in the ORF.
+    """
+    if not reference:
+        return 0.0
+    s = orf_dna.upper()
+    log_sum = 0.0
+    count = 0
+    for i in range(0, len(s) - 2, 3):
+        codon = s[i:i + 3]
+        if len(codon) == 3 and "N" not in codon and codon in reference:
+            w = reference[codon]
+            if w > 0:
+                log_sum += math.log(w)
+                count += 1
+    if count == 0:
+        return 0.0
+    return math.exp(log_sum / count)
+
+
+# ── ORF completeness classifier ─────────────────────────────────────────────
+
+def _classify_orf_completeness(t, orf) -> str:
+    """Classify: 'complete', '5prime_partial', '3prime_partial', 'internal', 'no_orf'."""
+    if orf is None:
+        return "no_orf"
+
+    seq = t.sequence.upper()
+    seq_len = len(seq)
+
+    # Check if the ORF has a start codon (M at the beginning of aa sequence).
+    has_start = orf.sequence.startswith("M") if orf.sequence else False
+
+    # Check if the ORF ends with a stop codon: look at the 3 bases after the
+    # ORF coding region.
+    has_stop = False
+    if orf.strand == "+":
+        stop_start = orf.nt_start + orf.aa_length * 3
+        if stop_start + 3 <= seq_len:
+            codon = seq[stop_start:stop_start + 3]
+            has_stop = codon in ("TAA", "TAG", "TGA")
+    else:
+        # For minus strand, check in reverse complement space
+        rc = _reverse_complement(seq)
+        # On minus strand the ORF was found on the RC; nt_start/nt_end
+        # are original-sequence coordinates. The ORF DNA on the RC strand
+        # starts at (seq_len - nt_end).
+        rc_start = seq_len - orf.nt_end
+        stop_start = rc_start + orf.aa_length * 3
+        if stop_start + 3 <= seq_len:
+            codon = rc[stop_start:stop_start + 3]
+            has_stop = codon in ("TAA", "TAG", "TGA")
+
+    if has_start and has_stop:
+        return "complete"
+    elif has_start and not has_stop:
+        return "3prime_partial"
+    elif not has_start and has_stop:
+        return "5prime_partial"
+    else:
+        return "internal"
+
+
+# ── Combined CDS confidence scorer ──────────────────────────────────────────
+
+@dataclass
+class CDSPrediction:
+    transcript_id: str
+    orf: ORFCoord | None
+    hexamer_score: float      # log-odds, typically -2 to +2
+    kozak_score: float        # 0.0 to 1.0
+    cai_score: float          # 0.0 to 1.0
+    completeness: str         # 'complete', '5prime_partial', etc.
+    confidence: str           # 'HIGH', 'MEDIUM', 'LOW', 'NONE'
+    combined_score: float     # weighted combination, 0.0 to 1.0
+
+
+def predict_cds(t, hexamer_model: tuple, cai_ref: dict) -> CDSPrediction:
+    """Run all scorers on a single transcript and return a prediction."""
+    coding_freqs, noncoding_freqs = hexamer_model
+    orf = _find_longest_orf(t.sequence, t.id)
+
+    if orf is None or orf.aa_length < 30:
+        return CDSPrediction(
+            transcript_id=t.id,
+            orf=orf,
+            hexamer_score=0.0,
+            kozak_score=0.0,
+            cai_score=0.0,
+            completeness="no_orf",
+            confidence="NONE",
+            combined_score=0.0,
+        )
+
+    # Extract ORF DNA
+    upper = t.sequence.upper()
+    if orf.strand == "+":
+        orf_dna = upper[orf.nt_start:orf.nt_end]
+    else:
+        orf_dna = _reverse_complement(upper[orf.nt_start:orf.nt_end])
+
+    # Hexamer score
+    hex_score = _hexamer_score(orf_dna, coding_freqs, noncoding_freqs)
+
+    # Kozak score: find the ATG position in the ORF DNA context
+    # Use the original sequence context around the ORF start for Kozak scoring.
+    if orf.strand == "+":
+        # ATG is at orf.nt_start on the original sequence
+        kozak = _kozak_score(upper, orf.nt_start)
+    else:
+        # For minus strand, the ATG is at the start of the RC ORF.
+        # We need the context around it on the RC strand.
+        rc = _reverse_complement(upper)
+        rc_atg_pos = len(upper) - orf.nt_end
+        kozak = _kozak_score(rc, rc_atg_pos)
+
+    # CAI score
+    cai = _cai_score(orf_dna, cai_ref)
+
+    # Completeness
+    completeness = _classify_orf_completeness(t, orf)
+
+    # Combined score: weighted combination normalized to 0.0-1.0
+    # Hexamer score is typically -2 to +2; map to 0-1 via sigmoid-like transform
+    hex_norm = 1.0 / (1.0 + math.exp(-2.0 * hex_score))  # sigmoid, centered at 0
+    combined = (
+        0.40 * hex_norm
+        + 0.20 * kozak
+        + 0.20 * cai
+        + 0.20 * (1.0 if completeness == "complete" else 0.5 if "partial" in completeness else 0.0)
+    )
+
+    # Confidence classification
+    is_complete = completeness == "complete"
+    if hex_score > 0.5 and kozak > 0.5 and is_complete and orf.aa_length > 100:
+        confidence = "HIGH"
+    elif hex_score > 0.0 or (kozak > 0.3 and is_complete):
+        confidence = "MEDIUM"
+    else:
+        confidence = "LOW"
+
+    return CDSPrediction(
+        transcript_id=t.id,
+        orf=orf,
+        hexamer_score=hex_score,
+        kozak_score=kozak,
+        cai_score=cai,
+        completeness=completeness,
+        confidence=confidence,
+        combined_score=combined,
+    )
+
+
+def build_prediction_models(transcripts: list) -> tuple:
+    """Build the hexamer model + CAI reference from the transcriptome.
+    Returns (hexamer_model, cai_reference). ~2-5 seconds for 10k transcripts."""
+    hexamer_model = _build_hexamer_model(transcripts)
+    cai_reference = _build_cai_reference(transcripts)
+    return (hexamer_model, cai_reference)
 
 
 def _longest_orf_aa_length(nucleotide: str, min_aa: int = 30) -> int:
@@ -3015,6 +3445,25 @@ class SequenceViewer(ScrollableContainer):
                     f"[dim]N[/]:{counts['N']}"
                 ),
             )
+            # Show CDS prediction if available
+            preds = getattr(self.app, "_predictions", {})
+            pred = preds.get(t.id) if preds else None
+            if pred is not None:
+                conf_colors = {
+                    "HIGH": "green", "MEDIUM": "yellow",
+                    "LOW": "red", "NONE": "dim",
+                }
+                cc = conf_colors.get(pred.confidence, "dim")
+                grid.add_row(
+                    "CDS Prediction",
+                    f"[{cc}]{pred.confidence}[/{cc}] (score: {pred.combined_score:.2f})",
+                )
+                detail_parts = [f"Hexamer: {pred.hexamer_score:+.2f}"]
+                detail_parts.append(f"Kozak: {pred.kozak_score:.2f}")
+                detail_parts.append(f"CAI: {pred.cai_score:.2f}")
+                compl_label = pred.completeness.replace("_", " ").replace("prime", "'").title()
+                detail_parts.append(compl_label)
+                grid.add_row("", "  " + "  ".join(detail_parts))
             info.update(grid)
 
             cds_btn = self.query_one("#seq-cds-btn", Static)
@@ -3463,6 +3912,7 @@ class StatsPanel(ScrollableContainer):
     def compose(self) -> ComposeResult:
         with Horizontal(id="stats-buttons"):
             yield Button("Compute Statistics", id="stats-compute", variant="primary")
+            yield Button("Predict CDS", id="stats-predict-cds", variant="default")
             yield Button("Export Stats CSV", id="stats-export", variant="default", disabled=True)
         yield Static("No transcriptome loaded.", id="stats-content")
 
@@ -3480,6 +3930,8 @@ class StatsPanel(ScrollableContainer):
         try:
             self.query_one("#stats-compute", Button).disabled = False
             self.query_one("#stats-compute", Button).label = "Compute Statistics"
+            self.query_one("#stats-predict-cds", Button).disabled = False
+            self.query_one("#stats-predict-cds", Button).label = "Predict CDS"
             self.query_one("#stats-export", Button).disabled = True
         except Exception:
             pass
@@ -3497,6 +3949,18 @@ class StatsPanel(ScrollableContainer):
         btn.label = "Computing…"
         btn.disabled = True
         self.app._compute_stats_bg(transcripts, path)
+
+    @on(Button.Pressed, "#stats-predict-cds")
+    def _on_predict_cds_pressed(self) -> None:
+        """Build models and run CDS predictions on all transcripts."""
+        transcripts = getattr(self.app, "_transcripts", None)
+        if not transcripts:
+            self._update_display_message("[yellow]Load a transcriptome first.[/]")
+            return
+        btn = self.query_one("#stats-predict-cds", Button)
+        btn.label = "Predicting…"
+        btn.disabled = True
+        self.app._predict_cds_bg(transcripts)
 
     def _update_display_message(self, message: str) -> None:
         """Replace the panel body with a one-line status message."""
@@ -3588,6 +4052,26 @@ class StatsPanel(ScrollableContainer):
             orf_grid.add_row("Mean ORF length", f"{mean_orf:,.1f} aa")
             orf_grid.add_row("Median ORF length", f"{median_orf:,} aa")
             elements.append(orf_grid)
+
+        # CDS prediction summary
+        preds = getattr(self.app, "_predictions", {})
+        if preds:
+            elements.append(Text(""))
+            pred_grid = Table.grid(padding=(0, 3))
+            pred_grid.add_column(style="bold cyan", no_wrap=True)
+            pred_grid.add_column(no_wrap=True)
+            pred_grid.title = "CDS Prediction Summary"
+            pred_grid.title_style = "bold magenta"
+            counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0, "NONE": 0}
+            for pred in preds.values():
+                counts[pred.confidence] = counts.get(pred.confidence, 0) + 1
+            total_pred = len(preds)
+            pred_grid.add_row("Total predicted", f"{total_pred:,}")
+            pred_grid.add_row("HIGH confidence", f"[green]{counts['HIGH']:,}[/]")
+            pred_grid.add_row("MEDIUM confidence", f"[yellow]{counts['MEDIUM']:,}[/]")
+            pred_grid.add_row("LOW confidence", f"[red]{counts['LOW']:,}[/]")
+            pred_grid.add_row("No ORF", f"[dim]{counts['NONE']:,}[/]")
+            elements.append(pred_grid)
 
         return elements
 
@@ -5518,6 +6002,7 @@ class ScriptoScopeApp(App):
             self._by_id = by_id
             self._fasta_path = proj["fasta_path"] or path
             self._pfam_hits = proj.get("pfam_hits", {})
+            self._predictions = {}
             _longest_orf_cache.clear()
             _hmm_cancel.clear()
             _ncbi_blast_cancel.clear()
@@ -5578,6 +6063,7 @@ class ScriptoScopeApp(App):
         self._sort_column: str = ""   # "", "id", "length", "gc"
         self._sort_reverse: bool = False
         self._bookmarks: set[str] = set()  # transcript IDs
+        self._predictions: dict[str, CDSPrediction] = {}  # CDS predictions keyed by transcript ID
 
     # ── Annotation auto-save ─────────────────────────────────────────────
 
@@ -5611,6 +6097,7 @@ class ScriptoScopeApp(App):
                 pfam_hits=dict(self._pfam_hits),
                 bookmarks=set(self._bookmarks),
                 orf_cache=orf_cache,
+                predictions=dict(self._predictions) if self._predictions else None,
             )
             # Update library scanned_count
             scanned = len(scan_cache)
@@ -6023,6 +6510,7 @@ class ScriptoScopeApp(App):
         self._by_id = by_id
         self._fasta_path = path
         self._pfam_hits = {}
+        self._predictions = {}
         # Clear stale per-transcript caches from the previous dataset.
         try:
             hmmer = self.query_one("#hmmer-panel")
@@ -6089,6 +6577,11 @@ class ScriptoScopeApp(App):
                             _longest_orf_cache[key] = orf
                         except Exception:
                             _log.warning("Failed to restore ORF for %s", tid)
+                # Restore CDS predictions
+                pred_data = annotations.get("predictions") or {}
+                if pred_data:
+                    self._predictions = pred_data
+                    _log.info("Restored %d CDS predictions", len(pred_data))
                 ann_msg = (
                     f" ({len(annotations.get('scan_cache', {}))} scanned, "
                     f"{len(annotations.get('bookmarks', set()))} bookmarked)"
@@ -6158,6 +6651,52 @@ class ScriptoScopeApp(App):
             self.query_one("#stats-panel", StatsPanel).render_stats(merged, path)
 
         self.call_from_thread(_apply_orf)
+
+    @work(exclusive=True, thread=True, group="cds-predict")
+    def _predict_cds_bg(self, transcripts: list[Transcript]) -> None:
+        """Build prediction models and run CDS predictions on all transcripts."""
+        _log.info("Building CDS prediction models for %d transcripts…", len(transcripts))
+
+        # Phase 1: build models
+        hexamer_model, cai_reference = build_prediction_models(transcripts)
+
+        # Phase 2: predict each transcript
+        predictions: dict[str, CDSPrediction] = {}
+        for t in transcripts:
+            pred = predict_cds(t, hexamer_model, cai_reference)
+            predictions[t.id] = pred
+
+        # Summarize
+        counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0, "NONE": 0}
+        for pred in predictions.values():
+            counts[pred.confidence] = counts.get(pred.confidence, 0) + 1
+        _log.info(
+            "CDS predictions complete: HIGH=%d MEDIUM=%d LOW=%d NONE=%d",
+            counts["HIGH"], counts["MEDIUM"], counts["LOW"], counts["NONE"],
+        )
+
+        def _apply() -> None:
+            self._predictions = predictions
+            # Invalidate the stats panel cache so predictions show up
+            stats_panel = self.query_one("#stats-panel", StatsPanel)
+            stats_panel._global_renderables = None  # force rebuild
+            try:
+                btn = stats_panel.query_one("#stats-predict-cds", Button)
+                btn.label = "Rerun Predictions"
+                btn.disabled = False
+            except Exception:
+                pass
+            stats_panel._update_display()
+            self._auto_save_annotations()
+            self.notify(
+                f"CDS predictions: {counts['HIGH']} HIGH, {counts['MEDIUM']} MEDIUM, "
+                f"{counts['LOW']} LOW, {counts['NONE']} no ORF",
+                title="Gene Prediction",
+                severity="information",
+                timeout=6,
+            )
+
+        self.call_from_thread(_apply)
 
     def _populate_table_fast(
         self,

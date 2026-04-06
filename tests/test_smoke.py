@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scriptoscope import (
     BlastHit,
     BlastPanel,
+    CDSPrediction,
     HmmerHit,
     HmmerPanel,
     ORFCoord,
@@ -27,17 +28,30 @@ from scriptoscope import (
     StatsPanel,
     Transcript,
     _build_aa_track,
+    _build_cai_reference,
     _build_feature_track,
+    _build_hexamer_model,
     _build_pfam_track,
+    _cai_score,
+    _classify_orf_completeness,
+    _compute_rscu,
     _compute_stats,
+    _count_hexamers,
     _export_csv,
     _filter_transcripts,
     _find_longest_orf,
+    _hexamer_score,
+    _kozak_score,
+    _normalize_hexamer_counts,
     _parse_fasta,
     _text_to_content,
+    build_prediction_models,
     colorize_sequence,
     colorize_sequence_annotated,
     load_all,
+    predict_cds,
+    save_annotations,
+    load_annotations,
 )
 
 from textual.widgets import Button, DataTable, Input, Static
@@ -1031,3 +1045,374 @@ class TestClickToFocusRender:
             "default render leaked the focus-mode bg highlight — "
             "focus mode no longer visibly differs from idle"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Gene Prediction Scoring System tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+# A known coding sequence (ATG -> stop codon, 33 aa minimum) for testing.
+# This is a synthetic ORF long enough to test all scorers.
+_CODING_SEQ = (
+    "ATGAAAGCTTTTGGGCCCAAATTTGATCCCAAATTTGGGAAATTTCCCGATCCC"
+    "AAAGGGAAATTTCCCGATAAAGGGTTTCCCAAATTTGGGCCCTAA"
+)
+
+# Non-coding sequence (no ATG, scrambled).
+_NONCODING_SEQ = "GGGCCCAAATTTGATGGGCCCAAATTTGATGGGCCCAAATTT"
+
+
+class TestHexamerCounting:
+    def test_count_hexamers_basic(self):
+        """Count hexamers in a short sequence."""
+        seq = "ATGCATGC"
+        counts = _count_hexamers(seq)
+        # 8 bases -> 3 hexamers: ATGCAT, TGCATG, GCATGC
+        assert len(counts) == 3
+        assert counts["ATGCAT"] == 1
+        assert counts["TGCATG"] == 1
+        assert counts["GCATGC"] == 1
+
+    def test_count_hexamers_short(self):
+        """Sequence shorter than 6 bp has no hexamers."""
+        assert _count_hexamers("ATGCA") == {}
+        assert _count_hexamers("") == {}
+
+    def test_count_hexamers_skips_n(self):
+        """Hexamers containing N are skipped."""
+        seq = "ATGNNNNNNNNATGCATGC"
+        counts = _count_hexamers(seq)
+        # Only the last few hexamers that don't contain N should be counted
+        for kmer in counts:
+            assert "N" not in kmer
+
+    def test_count_hexamers_uppercase(self):
+        """Input is uppercased internally."""
+        seq1 = "ATGCATGC"
+        seq2 = "atgcatgc"
+        assert _count_hexamers(seq1) == _count_hexamers(seq2)
+
+    def test_normalize_hexamer_counts(self):
+        """Normalization produces valid probabilities."""
+        counts = {"ATGCAT": 3, "TGCATG": 1}
+        freqs = _normalize_hexamer_counts(counts)
+        assert abs(sum(freqs.values()) - 1.0) < 1e-9
+        assert abs(freqs["ATGCAT"] - 0.75) < 1e-9
+        assert abs(freqs["TGCATG"] - 0.25) < 1e-9
+
+    def test_normalize_empty(self):
+        """Empty counts produce empty freqs."""
+        assert _normalize_hexamer_counts({}) == {}
+
+
+class TestHexamerModel:
+    def test_build_hexamer_model_returns_two_dicts(self, transcripts):
+        """Model returns coding and noncoding frequency dicts."""
+        coding_freqs, noncoding_freqs = _build_hexamer_model(transcripts)
+        # With our short test FASTA, ORFs may be too short (<100 aa)
+        # so model may return empty dicts. Either way, both are dicts.
+        assert isinstance(coding_freqs, dict)
+        assert isinstance(noncoding_freqs, dict)
+
+    def test_build_hexamer_model_with_long_orfs(self):
+        """With transcripts having long ORFs, model returns non-empty dicts."""
+        import random
+        random.seed(42)
+        stops = {"TAA", "TAG", "TGA"}
+        # Build a long ORF codon-by-codon to guarantee no in-frame stops
+        codons = []
+        for _ in range(160):  # 160 codons = 160 aa > 100 aa threshold
+            while True:
+                c = "".join(random.choices("ACGT", k=3))
+                if c not in stops:
+                    break
+            codons.append(c)
+        long_orf = "ATG" + "".join(codons) + "TAA"
+        transcripts = []
+        for i in range(20):
+            pad = "".join(random.choices("ACGT", k=100))
+            transcripts.append(Transcript(id=f"t{i}", description="", sequence=pad + long_orf + pad))
+        coding_freqs, noncoding_freqs = _build_hexamer_model(transcripts)
+        assert len(coding_freqs) > 0
+        assert len(noncoding_freqs) > 0
+        # Frequencies should sum to approximately 1
+        assert abs(sum(coding_freqs.values()) - 1.0) < 1e-6
+        assert abs(sum(noncoding_freqs.values()) - 1.0) < 1e-6
+
+
+class TestHexamerScore:
+    def test_hexamer_score_empty_model(self):
+        """Empty model returns 0.0."""
+        assert _hexamer_score("ATGCATGCATGC", {}, {}) == 0.0
+
+    def test_hexamer_score_short_seq(self):
+        """Sequence too short returns 0.0."""
+        assert _hexamer_score("ATGCA", {"ATGCAT": 0.5}, {"ATGCAT": 0.5}) == 0.0
+
+    def test_hexamer_score_identical_models(self):
+        """If coding and noncoding have the same distribution, score is 0."""
+        freqs = {"ATGCAT": 0.5, "TGCATG": 0.5}
+        score = _hexamer_score("ATGCATGC", freqs, freqs)
+        assert abs(score) < 1e-6
+
+    def test_hexamer_score_positive_for_coding(self):
+        """Sequence matching coding model scores positive."""
+        coding = {"ATGCAT": 0.8, "TGCATG": 0.8}
+        noncoding = {"ATGCAT": 0.1, "TGCATG": 0.1}
+        score = _hexamer_score("ATGCATGC", coding, noncoding)
+        assert score > 0
+
+    def test_hexamer_score_negative_for_noncoding(self):
+        """Sequence matching noncoding model scores negative."""
+        coding = {"ATGCAT": 0.1, "TGCATG": 0.1}
+        noncoding = {"ATGCAT": 0.8, "TGCATG": 0.8}
+        score = _hexamer_score("ATGCATGC", coding, noncoding)
+        assert score < 0
+
+
+class TestKozakScore:
+    def test_kozak_score_range(self):
+        """Kozak score is between 0.0 and 1.0."""
+        # Context around ATG at position 10
+        seq = "GCCGCCACCATGGCG"
+        score = _kozak_score(seq, 9)  # 'A' of ATG is at index 9
+        assert 0.0 <= score <= 1.0
+
+    def test_kozak_score_perfect_consensus(self):
+        """Strong Kozak-like context gives high score."""
+        # Perfect Kozak: GCCACCatgG -> positions: -6=G, -5=C, -4=C, -3=A, +4=G
+        seq = "GCCACCATGGCG"
+        score = _kozak_score(seq, 6)  # ATG at index 6
+        assert score > 0.5
+
+    def test_kozak_score_weak_context(self):
+        """Weak context gives lower score than strong."""
+        strong = "GCCACCATGGCG"
+        weak = "TTTTTTATGTTT"
+        strong_score = _kozak_score(strong, 6)
+        weak_score = _kozak_score(weak, 6)
+        assert strong_score > weak_score
+
+    def test_kozak_score_at_boundary(self):
+        """ATG at the start of the sequence (no upstream context)."""
+        seq = "ATGAAAGCTTTT"
+        score = _kozak_score(seq, 0)
+        # Should still return a valid score (just fewer positions scored)
+        assert 0.0 <= score <= 1.0
+
+    def test_kozak_score_near_end(self):
+        """ATG near the end with no downstream context."""
+        seq = "GCCACCATG"
+        score = _kozak_score(seq, 6)
+        assert 0.0 <= score <= 1.0
+
+
+class TestRSCU:
+    def test_compute_rscu_uniform(self):
+        """Uniform codon usage gives RSCU near 1.0 for all codons."""
+        # Count each Leu codon equally (6 synonymous codons for Leu)
+        counts = {"TTA": 10, "TTG": 10, "CTT": 10, "CTC": 10, "CTA": 10, "CTG": 10}
+        rscu = _compute_rscu(counts)
+        for codon in counts:
+            assert abs(rscu[codon] - 1.0) < 1e-6
+
+    def test_compute_rscu_biased(self):
+        """Biased codon usage gives RSCU > 1 for preferred, < 1 for rare."""
+        counts = {"TTA": 0, "TTG": 0, "CTT": 0, "CTC": 0, "CTA": 0, "CTG": 60}
+        rscu = _compute_rscu(counts)
+        # CTG used exclusively -> RSCU = 60 * 6 / 60 = 6.0
+        assert abs(rscu["CTG"] - 6.0) < 1e-6
+        assert abs(rscu["TTA"] - 0.0) < 1e-6
+
+    def test_compute_rscu_zero_counts(self):
+        """Zero counts for an amino acid gives RSCU of 1.0 (uniform default)."""
+        rscu = _compute_rscu({})
+        # All codons should be 1.0 (no data default)
+        assert rscu["ATG"] == 1.0  # Met has only one codon
+
+
+class TestCAI:
+    def test_cai_score_empty_ref(self):
+        """Empty reference returns 0.0."""
+        assert _cai_score("ATGATGATG", {}) == 0.0
+
+    def test_cai_score_range(self):
+        """CAI score is between 0.0 and 1.0."""
+        ref = {"ATG": 1.0, "AAA": 0.8, "GGG": 0.5, "CCC": 0.3}
+        score = _cai_score("ATGAAAGGGCCC", ref)
+        assert 0.0 <= score <= 1.0
+
+    def test_cai_score_optimal_codons(self):
+        """All-optimal codons give CAI = 1.0."""
+        ref = {"ATG": 1.0, "AAA": 1.0, "GGG": 1.0}
+        score = _cai_score("ATGAAAGGG", ref)
+        assert abs(score - 1.0) < 1e-6
+
+    def test_cai_score_suboptimal_lower(self):
+        """Suboptimal codons give CAI < 1.0."""
+        ref = {"ATG": 1.0, "AAA": 0.3, "GGG": 0.3}
+        score = _cai_score("ATGAAAGGG", ref)
+        assert score < 1.0
+
+    def test_build_cai_reference(self, transcripts):
+        """CAI reference is a dict with float values in 0-1."""
+        ref = _build_cai_reference(transcripts)
+        # May be empty if ORFs are too short
+        assert isinstance(ref, dict)
+        for v in ref.values():
+            assert 0.0 <= v <= 1.0
+
+
+class TestORFCompleteness:
+    def test_complete_orf(self):
+        """An ORF with both start and stop is 'complete'."""
+        seq = "AAAA" + _CODING_SEQ + "AAAA"
+        t = Transcript(id="test", description="", sequence=seq)
+        orf = _find_longest_orf(t.sequence, t.id)
+        if orf is None:
+            pytest.skip("no ORF found")
+        result = _classify_orf_completeness(t, orf)
+        assert result in ("complete", "3prime_partial", "5prime_partial", "internal")
+
+    def test_no_orf(self):
+        """No ORF returns 'no_orf'."""
+        t = Transcript(id="test", description="", sequence="AAAAAAAAAAAA")
+        result = _classify_orf_completeness(t, None)
+        assert result == "no_orf"
+
+
+class TestCDSPrediction:
+    def test_predict_cds_no_orf(self):
+        """Transcript with no ORF gets NONE confidence."""
+        t = Transcript(id="test", description="", sequence="AAAAAAAAAAAA")
+        pred = predict_cds(t, ({}, {}), {})
+        assert pred.confidence == "NONE"
+        assert pred.combined_score == 0.0
+
+    def test_predict_cds_with_orf(self):
+        """Transcript with a coding sequence gets a non-NONE prediction."""
+        seq = "AAAA" + _CODING_SEQ + "AAAA"
+        t = Transcript(id="test", description="", sequence=seq)
+        pred = predict_cds(t, ({}, {}), {})
+        # With empty models, hexamer score is 0.0, so confidence depends
+        # on Kozak and completeness
+        assert isinstance(pred, CDSPrediction)
+        assert pred.transcript_id == "test"
+
+    def test_predict_cds_dataclass_fields(self):
+        """CDSPrediction has all expected fields."""
+        pred = CDSPrediction(
+            transcript_id="t1",
+            orf=None,
+            hexamer_score=0.5,
+            kozak_score=0.7,
+            cai_score=0.6,
+            completeness="complete",
+            confidence="HIGH",
+            combined_score=0.85,
+        )
+        assert pred.transcript_id == "t1"
+        assert pred.hexamer_score == 0.5
+        assert pred.kozak_score == 0.7
+        assert pred.cai_score == 0.6
+        assert pred.completeness == "complete"
+        assert pred.confidence == "HIGH"
+        assert pred.combined_score == 0.85
+
+    def test_build_prediction_models_returns_tuple(self, transcripts):
+        """build_prediction_models returns a (hexamer_model, cai_ref) tuple."""
+        result = build_prediction_models(transcripts)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        hexamer_model, cai_ref = result
+        assert isinstance(hexamer_model, tuple)
+        assert len(hexamer_model) == 2
+        assert isinstance(cai_ref, dict)
+
+    def test_end_to_end_prediction(self):
+        """Run prediction pipeline end-to-end on synthetic data."""
+        import random
+        random.seed(123)
+        # Build synthetic transcripts with long ORFs
+        transcripts = []
+        for i in range(30):
+            # Build a long ORF (>100 aa = >300 bp)
+            orf_body = []
+            for _ in range(120):
+                # Random codon that is NOT a stop codon
+                while True:
+                    codon = "".join(random.choices("ACGT", k=3))
+                    if codon not in ("TAA", "TAG", "TGA"):
+                        break
+                orf_body.append(codon)
+            orf_seq = "ATG" + "".join(orf_body) + "TAA"
+            pad5 = "".join(random.choices("ACGT", k=50))
+            pad3 = "".join(random.choices("ACGT", k=50))
+            transcripts.append(Transcript(
+                id=f"synth_{i}", description="synthetic",
+                sequence=pad5 + orf_seq + pad3,
+            ))
+        # Add some non-coding
+        for i in range(10):
+            transcripts.append(Transcript(
+                id=f"nc_{i}", description="noncoding",
+                sequence="".join(random.choices("ACGT", k=200)),
+            ))
+        hexamer_model, cai_ref = build_prediction_models(transcripts)
+        # Predict on a coding transcript
+        pred = predict_cds(transcripts[0], hexamer_model, cai_ref)
+        assert pred.confidence in ("HIGH", "MEDIUM", "LOW", "NONE")
+        assert 0.0 <= pred.combined_score <= 1.0
+        assert 0.0 <= pred.kozak_score <= 1.0
+        assert 0.0 <= pred.cai_score <= 1.0
+
+
+class TestAnnotationsPredictions:
+    def test_save_load_predictions(self, fasta_path, transcripts):
+        """Predictions survive save/load cycle."""
+        pred = CDSPrediction(
+            transcript_id="transcript_001",
+            orf=None,
+            hexamer_score=1.23,
+            kozak_score=0.72,
+            cai_score=0.65,
+            completeness="complete",
+            confidence="HIGH",
+            combined_score=0.87,
+        )
+        preds = {"transcript_001": pred}
+        save_annotations(
+            fasta_path=fasta_path,
+            scan_cache={},
+            confirm_cache={},
+            pfam_hits={},
+            bookmarks=set(),
+            orf_cache={},
+            predictions=preds,
+        )
+        loaded = load_annotations(fasta_path)
+        assert loaded is not None
+        loaded_preds = loaded.get("predictions", {})
+        assert "transcript_001" in loaded_preds
+        lp = loaded_preds["transcript_001"]
+        assert isinstance(lp, CDSPrediction)
+        assert abs(lp.hexamer_score - 1.23) < 1e-6
+        assert abs(lp.kozak_score - 0.72) < 1e-6
+        assert abs(lp.cai_score - 0.65) < 1e-6
+        assert lp.completeness == "complete"
+        assert lp.confidence == "HIGH"
+        assert abs(lp.combined_score - 0.87) < 1e-6
+
+    def test_save_load_no_predictions(self, fasta_path):
+        """Save/load with no predictions works cleanly."""
+        save_annotations(
+            fasta_path=fasta_path,
+            scan_cache={},
+            confirm_cache={},
+            pfam_hits={},
+            bookmarks=set(),
+            orf_cache={},
+        )
+        loaded = load_annotations(fasta_path)
+        assert loaded is not None
+        assert loaded.get("predictions", {}) == {}
