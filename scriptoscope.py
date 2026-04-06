@@ -865,6 +865,22 @@ def update_library_entry(fasta_path: str, **updates) -> None:
     _log.debug("update_library_entry: no entry found for %s", fasta_path)
 
 
+def remove_library_entry(fasta_path: str) -> bool:
+    """Remove a transcriptome from the library registry. Returns True if removed."""
+    entries = load_library()
+    resolved = str(Path(fasta_path).resolve())
+    before = len(entries)
+    entries = [
+        e for e in entries
+        if str(Path(e.get("fasta_path", "")).resolve()) != resolved
+    ]
+    if len(entries) < before:
+        save_library(entries)
+        _log.info("Removed library entry: %s", fasta_path)
+        return True
+    return False
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # GenBank transcriptome search
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5371,6 +5387,9 @@ class ConfirmModal(ModalScreen[bool]):
                 yield Button("Yes", id="confirm-yes", variant="error")
                 yield Button("No", id="confirm-no", variant="primary")
 
+    def on_mount(self) -> None:
+        self.query_one("#confirm-no", Button).focus()
+
     @on(Button.Pressed, "#confirm-yes")
     def _yes(self, event: Button.Pressed) -> None:
         self.dismiss(True)
@@ -5554,6 +5573,9 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
 
     @on(Button.Pressed, "#gb-search-btn")
     def _do_search(self, event: Button.Pressed) -> None:
+        btn = self.query_one("#gb-search-btn", Button)
+        if btn.disabled:
+            return
         query = self.query_one("#gb-search-input", Input).value.strip()
         if not query:
             self.query_one("#gb-status", Static).update("[yellow]Enter an organism name.[/]")
@@ -5563,6 +5585,8 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
                 "[red]BioPython Entrez not available — pip install biopython[/]"
             )
             return
+        btn.label = "Searching…"
+        btn.disabled = True
         self.query_one("#gb-status", Static).update(f"Searching NCBI for '{query}'…")
         self._run_search(query)
 
@@ -5597,9 +5621,18 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
                 self.query_one("#gb-status", Static).update,
                 f"[red]Search failed: {exc}[/]",
             )
+        finally:
+            def _restore():
+                btn = self.query_one("#gb-search-btn", Button)
+                btn.label = "Search"
+                btn.disabled = False
+            self.app.call_from_thread(_restore)
 
     @on(Button.Pressed, "#gb-download-btn")
     def _do_download(self, event: Button.Pressed) -> None:
+        btn = self.query_one("#gb-download-btn", Button)
+        if btn.disabled:
+            return
         table = self.query_one("#gb-table", DataTable)
         if not self._results or table.cursor_row is None:
             self.query_one("#gb-status", Static).update("[yellow]Select a result first.[/]")
@@ -5608,6 +5641,8 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
         if idx < 0 or idx >= len(self._results):
             return
         result = self._results[idx]
+        btn.label = "Downloading…"
+        btn.disabled = True
         self.query_one("#gb-status", Static).update(
             f"Downloading {result.accession}…"
         )
@@ -5649,6 +5684,12 @@ class GenBankSearchModal(ModalScreen[tuple[str, str] | None]):
                 self.query_one("#gb-status", Static).update,
                 f"[red]Download failed: {exc}[/]",
             )
+        finally:
+            def _restore():
+                btn = self.query_one("#gb-download-btn", Button)
+                btn.label = "Download"
+                btn.disabled = False
+            self.app.call_from_thread(_restore)
 
     @on(Button.Pressed, "#gb-cancel-btn")
     def _cancel_btn(self, event: Button.Pressed) -> None:
@@ -6776,6 +6817,9 @@ class HmmerPanel(Vertical):
     @on(Button.Pressed, "#hmmer-confirm-cds")
     def confirm_cds(self) -> None:
         _log.info("Confirm CDS button pressed")
+        btn = self.query_one("#hmmer-confirm-cds", Button)
+        if btn.disabled:
+            return
         t = self.transcript
         if t is None:
             self._set_status("[yellow]Select a transcript first.[/]")
@@ -6793,6 +6837,8 @@ class HmmerPanel(Vertical):
             self._set_status("[yellow]No ORF ≥ 30 aa found in this transcript.[/]")
             return
         _log.info("Launching NCBI blastp for %s (%d aa)", t.id, best_orf.aa_length)
+        btn.label = "Confirming…"
+        btn.disabled = True
         self._run_confirm_cds_worker(t, best_orf)
 
     @work(exclusive=True, thread=True, group="confirm-cds")
@@ -6874,9 +6920,21 @@ class HmmerPanel(Vertical):
             _log.exception("CDS confirmation failed: %s", exc)
         finally:
             _ui(loading.remove_class, "running")
+            def _restore_btn():
+                btn = self.query_one("#hmmer-confirm-cds", Button)
+                btn.label = "Confirm CDS (NCBI)"
+                btn.disabled = False
+            _ui(_restore_btn)
 
     @on(Button.Pressed, "#hmmer-scan-all")
     def run_scan_all(self) -> None:
+        btn = self.query_one("#hmmer-scan-all", Button)
+        if btn.has_class("scanning"):
+            _hmm_cancel.set()
+            self._set_status("[yellow]Cancelling collection scan…[/]")
+            btn.label = "Cancelling…"
+            btn.disabled = True
+            return
         if not self.app._transcripts:
             self._set_status("[yellow]No transcripts loaded.[/]")
             return
@@ -6917,11 +6975,14 @@ class HmmerPanel(Vertical):
             f"Scanning {n:,} transcripts against the HMM database.\n"
             f"Mode: {mode_note}\n"
             f"Estimated time: {est_label} (first run warms the HMM cache).\n"
-            f"Press Ctrl+C or quit to cancel.",
+            f"Press the button again or quit to cancel.",
             title="Collection Scan",
             severity="warning",
             timeout=10,
         )
+        btn.label = "Cancel Scan"
+        btn.variant = "error"
+        btn.add_class("scanning")
         self._run_scan_all_worker(
             self.app._transcripts, db, evalue, translate, use_gathering,
         )
@@ -7008,6 +7069,11 @@ class HmmerPanel(Vertical):
             _log.exception("HmmerPanel._run_scan_all_worker failed: %s", exc)
         finally:
             progress.remove_class("running")
+            btn = self.query_one("#hmmer-scan-all", Button)
+            btn.remove_class("scanning")
+            btn.label = "Scan Entire Collection"
+            btn.variant = "warning"
+            btn.disabled = False
 
     def _update_sequence_tab(self, t: Transcript, hits: list[HmmerHit]) -> None:
         """Directly update the Sequence tab body with CDS/Pfam annotations."""
@@ -7119,6 +7185,7 @@ class ScriptoScopeApp(App):
         Binding("ctrl+r", "copy_revcomp", "Copy RevComp", show=False),
         Binding("ctrl+d", "toggle_bookmark", "Bookmark", show=False),
         Binding("ctrl+e", "export_fasta", "Export FASTA", show=False),
+        Binding("delete", "delete_item", "Delete", show=False),
         Binding("question_mark", "show_help", "Help"),
         Binding("ctrl+q", "quit", "Quit"),
     ]
@@ -7396,6 +7463,7 @@ class ScriptoScopeApp(App):
         self._pfam_hits: dict[str, set[str]] = {}
         self._filter_timer: Timer | None = None
         self._navigating_to: str | None = None
+        self._loading_fasta: bool = False
         self._sort_column: str = ""   # "", "id", "length", "gc"
         self._sort_reverse: bool = False
         self._bookmarks: set[str] = set()  # transcript IDs
@@ -7636,7 +7704,7 @@ class ScriptoScopeApp(App):
     @on(DataTable.RowSelected, "#library-table")
     def _on_library_row_selected(self, event: DataTable.RowSelected) -> None:
         """User clicked a row in the library panel — load that transcriptome."""
-        if self._refreshing_library:
+        if self._refreshing_library or self._loading_fasta:
             return
         path = str(event.row_key.value)
         if not path or not isinstance(path, str):
@@ -7644,10 +7712,124 @@ class ScriptoScopeApp(App):
         _log.info("Library row selected -> path=%r", path)
         if path == self._fasta_path:
             return
+        self._loading_fasta = True
         if path.endswith(".scriptoscope.json"):
             self._load_project_file(path)
         else:
             self._load_fasta(path)
+
+    # ── Delete items ─────────────────────────────────────────────────────────
+
+    def action_delete_item(self) -> None:
+        """Delete key: remove a transcriptome from the library or a transcript from the collection."""
+        focused = self.focused
+        if focused is None:
+            return
+
+        # Walk up to find which DataTable is focused
+        node = focused
+        table_id = None
+        while node is not None:
+            if isinstance(node, DataTable):
+                table_id = node.id
+                break
+            node = node.parent
+
+        if table_id == "library-table":
+            self._delete_library_entry()
+        elif table_id == "transcript-table":
+            self._delete_transcript()
+
+    def _delete_library_entry(self) -> None:
+        """Prompt to remove the highlighted transcriptome from the library."""
+        lib_table = self.query_one("#library-table", DataTable)
+        row_key = lib_table.cursor_row
+        if row_key is None or lib_table.row_count == 0:
+            return
+        row = lib_table.get_row_at(row_key)
+        name = str(row[0]) if row else "this transcriptome"
+        fasta_path = str(lib_table.get_row_at(row_key, key=True) if hasattr(lib_table, 'get_row_at') else "")
+        # Get the actual key from the cursor
+        try:
+            cell_key = lib_table.coordinate_to_cell_key(lib_table.cursor_coordinate)
+            fasta_path = str(cell_key.row_key.value)
+        except Exception:
+            return
+
+        def _on_confirm(confirmed: bool) -> None:
+            if not confirmed:
+                return
+            remove_library_entry(fasta_path)
+            # If this was the currently loaded transcriptome, clear it
+            if fasta_path == self._fasta_path:
+                self._transcripts = []
+                self._filtered = []
+                self._by_id = {}
+                self._fasta_path = ""
+                table = self.query_one("#transcript-table", DataTable)
+                table.clear()
+                self.query_one("#transcript-count", Static).update("0 loaded")
+                self._set_status("Transcriptome removed.")
+            self._refresh_library_table()
+            self.notify(f"Removed '{name}' from library")
+
+        self.push_screen(
+            ConfirmModal(f"Remove '{name}' from library?"),
+            _on_confirm,
+        )
+
+    def _delete_transcript(self) -> None:
+        """Prompt to remove the highlighted transcript from the loaded collection."""
+        if not self._transcripts:
+            return
+        table = self.query_one("#transcript-table", DataTable)
+        if table.row_count == 0:
+            return
+        try:
+            cell_key = table.coordinate_to_cell_key(table.cursor_coordinate)
+            tid = str(cell_key.row_key.value)
+        except Exception:
+            return
+        t = self._by_id.get(tid)
+        if t is None:
+            return
+        short = t.short_id if hasattr(t, 'short_id') else tid[:30]
+
+        def _on_confirm(confirmed: bool) -> None:
+            if not confirmed:
+                return
+            # Remove from all data structures
+            self._transcripts = [x for x in self._transcripts if x.id != tid]
+            self._filtered = [x for x in self._filtered if x.id != tid]
+            self._by_id.pop(tid, None)
+            self._bookmarks.discard(tid)
+            self._pfam_hits.pop(tid, None)
+            self._predictions.pop(tid, None)
+            self._prodigal_cache.pop(tid, None)
+            # Remove from caches in HMM panel
+            try:
+                hmmer = self.query_one("#hmmer-panel", HmmerPanel)
+                hmmer._scan_cache.pop(tid, None)
+                hmmer._confirm_cache.pop(tid, None)
+            except Exception:
+                pass
+            # Remove from table and update count
+            try:
+                table.remove_row(tid)
+            except Exception:
+                pass
+            total = len(self._transcripts)
+            shown = table.row_count
+            count_text = f"{shown:,} of {total:,} shown" if shown < total else f"{total:,} shown"
+            self.query_one("#transcript-count", Static).update(count_text)
+            self.notify(f"Removed '{short}'")
+            # Auto-save to persist the deletion
+            self._auto_save_annotations()
+
+        self.push_screen(
+            ConfirmModal(f"Remove transcript '{short}'?"),
+            _on_confirm,
+        )
 
     # ── File loading ──────────────────────────────────────────────────────────
 
@@ -7671,6 +7853,7 @@ class ScriptoScopeApp(App):
         # the user a "File not found: Select.NULL" error.
         if not path or not isinstance(path, str) or path.startswith("Select."):
             _log.warning("_load_fasta: ignoring invalid path %r", path)
+            self._loading_fasta = False
             return
         # Cancel any in-flight HMM scans from a previous transcriptome so they
         # don't write stale results into the freshly loaded state.
@@ -7696,6 +7879,7 @@ class ScriptoScopeApp(App):
             )
             # Refresh the dropdown to drop any stale entries.
             self.call_from_thread(self._refresh_transcriptome_select)
+            self._loading_fasta = False
             return
         if not p.is_file():
             self.call_from_thread(self.clear_notifications)
@@ -7706,6 +7890,7 @@ class ScriptoScopeApp(App):
                 self.notify, f"Not a regular file: {path}",
                 title="Load error", severity="error",
             )
+            self._loading_fasta = False
             return
 
         self.call_from_thread(self._set_status, f"Loading {path}…")
@@ -7725,13 +7910,13 @@ class ScriptoScopeApp(App):
             )
             return
         except FileNotFoundError:
-            # Race: file existed at pre-flight but vanished before load.
             msg = f"File disappeared during load: {path}"
             self.call_from_thread(self.clear_notifications)
             self.call_from_thread(self._set_status, f"[red]{msg}[/]")
             self.call_from_thread(
                 self.notify, msg, title="File not found", severity="error",
             )
+            self._loading_fasta = False
             return
         except PermissionError as exc:
             self.call_from_thread(self.clear_notifications)
@@ -7740,6 +7925,7 @@ class ScriptoScopeApp(App):
                 self.notify, f"Permission denied: {path}",
                 title="Load error", severity="error",
             )
+            self._loading_fasta = False
             return
         except Exception as exc:
             _log.exception("Load fasta failed for %s", path)
@@ -7749,6 +7935,7 @@ class ScriptoScopeApp(App):
                 self.notify, f"Failed to load: {exc}",
                 title="Load error", severity="error",
             )
+            self._loading_fasta = False
             return
 
         if not transcripts:
@@ -7756,6 +7943,7 @@ class ScriptoScopeApp(App):
             self.call_from_thread(
                 self._set_status, "[yellow]No transcripts found in file.[/]",
             )
+            self._loading_fasta = False
             return
 
         by_id = {t.id: t for t in transcripts}
@@ -7777,6 +7965,8 @@ class ScriptoScopeApp(App):
             except Exception:
                 _log.exception("_apply_loaded_transcripts raised for %s", path)
                 self._set_status(f"[red]Load succeeded but UI update failed (see log)[/]")
+            finally:
+                self._loading_fasta = False
 
         self.call_from_thread(_apply)
 
