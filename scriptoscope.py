@@ -6928,10 +6928,22 @@ class ScriptoScopeApp(App):
         _log.info("Building CDS prediction models for %d transcripts…", n)
         t0 = time.monotonic()
 
+        # Helper to update both status bar and button label from the worker
+        def _update_progress(status_msg: str, btn_label: str) -> None:
+            self._set_status(f"[dim]{status_msg}[/]")
+            try:
+                btn = self.query_one("#stats-panel", StatsPanel).query_one(
+                    "#stats-predict-cds", Button
+                )
+                btn.label = btn_label
+            except Exception:
+                pass
+
         # Phase 1: build models
         self.call_from_thread(
-            self._set_status,
-            f"[dim]CDS prediction: building hexamer + CAI models from {n:,} transcripts…[/]",
+            _update_progress,
+            f"CDS prediction: building models from {n:,} transcripts…",
+            "Building models…",
         )
         hexamer_model, cai_reference = build_prediction_models(transcripts)
         model_dt = time.monotonic() - t0
@@ -6939,22 +6951,25 @@ class ScriptoScopeApp(App):
 
         # Phase 2: predict each transcript
         self.call_from_thread(
-            self._set_status,
-            f"[dim]CDS prediction: scoring {n:,} transcripts (models built in {model_dt:.1f}s)…[/]",
+            _update_progress,
+            f"CDS prediction: scoring {n:,} transcripts…",
+            f"0% — scoring…",
         )
         predictions: dict[str, CDSPrediction] = {}
         for i, t in enumerate(transcripts):
             pred = predict_cds(t, hexamer_model, cai_reference)
             predictions[t.id] = pred
-            # Update status every 500 transcripts so the user sees progress
             if (i + 1) % 500 == 0 or i + 1 == n:
                 elapsed = time.monotonic() - t0
                 rate = (i + 1) / elapsed if elapsed > 0 else 0
                 eta = (n - i - 1) / rate if rate > 0 else 0
+                pct = (i + 1) * 100 // n
+                eta_str = f"{int(eta)}s" if eta < 120 else f"{eta / 60:.1f}m"
                 self.call_from_thread(
-                    self._set_status,
-                    f"[dim]CDS prediction: {i+1:,}/{n:,} "
-                    f"({elapsed:.1f}s elapsed, ~{eta:.0f}s remaining)…[/]",
+                    _update_progress,
+                    f"CDS prediction: {i+1:,}/{n:,} "
+                    f"({elapsed:.1f}s elapsed, ~{eta_str} remaining)",
+                    f"{pct}% — ~{eta_str} left",
                 )
 
         total_dt = time.monotonic() - t0
