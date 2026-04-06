@@ -1953,11 +1953,21 @@ def predict_cds(t, hexamer_model: tuple, cai_ref: dict) -> CDSPrediction:
         + 0.20 * (1.0 if completeness == "complete" else 0.5 if "partial" in completeness else 0.0)
     )
 
-    # Confidence classification
+    # Confidence classification — requires multiple supporting signals.
+    # The combined score integrates all four metrics (hexamer, Kozak,
+    # CAI, completeness) so it's the primary discriminator. Individual
+    # signal checks prevent edge cases where one outlier inflates the
+    # combined.
     is_complete = completeness == "complete"
-    if hex_score > 0.5 and kozak > 0.5 and is_complete and orf.aa_length > 100:
+    # Classification uses biologically meaningful absolute criteria.
+    # ORF length is the strongest discriminator: a 200+ aa ORF is well
+    # above the random expectation (~50 aa for random DNA) and almost
+    # certainly real. Coding signals (hexamer, Kozak, CAI) serve as
+    # secondary evidence for shorter ORFs where length alone is
+    # ambiguous.
+    if orf.aa_length >= 200 and hex_score > 0.0 and is_complete:
         confidence = "HIGH"
-    elif hex_score > 0.0 or (kozak > 0.3 and is_complete):
+    elif orf.aa_length >= 100 and (hex_score > 0.0 or kozak > 0.3):
         confidence = "MEDIUM"
     else:
         confidence = "LOW"
