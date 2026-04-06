@@ -6655,31 +6655,54 @@ class ScriptoScopeApp(App):
     @work(exclusive=True, thread=True, group="cds-predict")
     def _predict_cds_bg(self, transcripts: list[Transcript]) -> None:
         """Build prediction models and run CDS predictions on all transcripts."""
-        _log.info("Building CDS prediction models for %d transcripts…", len(transcripts))
+        n = len(transcripts)
+        _log.info("Building CDS prediction models for %d transcripts…", n)
+        t0 = time.monotonic()
 
         # Phase 1: build models
+        self.call_from_thread(
+            self._set_status,
+            f"[dim]CDS prediction: building hexamer + CAI models from {n:,} transcripts…[/]",
+        )
         hexamer_model, cai_reference = build_prediction_models(transcripts)
+        model_dt = time.monotonic() - t0
+        _log.info("Models built in %.1fs", model_dt)
 
         # Phase 2: predict each transcript
+        self.call_from_thread(
+            self._set_status,
+            f"[dim]CDS prediction: scoring {n:,} transcripts (models built in {model_dt:.1f}s)…[/]",
+        )
         predictions: dict[str, CDSPrediction] = {}
-        for t in transcripts:
+        for i, t in enumerate(transcripts):
             pred = predict_cds(t, hexamer_model, cai_reference)
             predictions[t.id] = pred
+            # Update status every 500 transcripts so the user sees progress
+            if (i + 1) % 500 == 0 or i + 1 == n:
+                elapsed = time.monotonic() - t0
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                eta = (n - i - 1) / rate if rate > 0 else 0
+                self.call_from_thread(
+                    self._set_status,
+                    f"[dim]CDS prediction: {i+1:,}/{n:,} "
+                    f"({elapsed:.1f}s elapsed, ~{eta:.0f}s remaining)…[/]",
+                )
+
+        total_dt = time.monotonic() - t0
 
         # Summarize
         counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0, "NONE": 0}
         for pred in predictions.values():
             counts[pred.confidence] = counts.get(pred.confidence, 0) + 1
         _log.info(
-            "CDS predictions complete: HIGH=%d MEDIUM=%d LOW=%d NONE=%d",
-            counts["HIGH"], counts["MEDIUM"], counts["LOW"], counts["NONE"],
+            "CDS predictions complete in %.1fs: HIGH=%d MEDIUM=%d LOW=%d NONE=%d",
+            total_dt, counts["HIGH"], counts["MEDIUM"], counts["LOW"], counts["NONE"],
         )
 
         def _apply() -> None:
             self._predictions = predictions
-            # Invalidate the stats panel cache so predictions show up
             stats_panel = self.query_one("#stats-panel", StatsPanel)
-            stats_panel._global_renderables = None  # force rebuild
+            stats_panel._global_renderables = None
             try:
                 btn = stats_panel.query_one("#stats-predict-cds", Button)
                 btn.label = "Rerun Predictions"
@@ -6688,8 +6711,14 @@ class ScriptoScopeApp(App):
                 pass
             stats_panel._update_display()
             self._auto_save_annotations()
+            self._set_status(
+                f"[green]CDS predictions complete ({total_dt:.1f}s): "
+                f"{counts['HIGH']} HIGH, {counts['MEDIUM']} MEDIUM, "
+                f"{counts['LOW']} LOW, {counts['NONE']} no ORF[/]"
+            )
             self.notify(
-                f"CDS predictions: {counts['HIGH']} HIGH, {counts['MEDIUM']} MEDIUM, "
+                f"CDS predictions done in {total_dt:.1f}s: "
+                f"{counts['HIGH']} HIGH, {counts['MEDIUM']} MEDIUM, "
                 f"{counts['LOW']} LOW, {counts['NONE']} no ORF",
                 title="Gene Prediction",
                 severity="information",
