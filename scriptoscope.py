@@ -1590,6 +1590,141 @@ _CODON_SCAN_RE = re.compile(r"(?=(ATG|TAA|TAG|TGA))")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PolyA/polyT strand detection and strand-aware ORF selection
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def detect_mrna_strand(sequence: str) -> str | None:
+    """Detect mRNA strand direction from polyA/polyT signals.
+
+    Returns '+' if polyA tail detected (3' end has A-rich region),
+    '-' if polyT head detected (5' end has T-rich region suggesting
+    the transcript is reverse-complemented),
+    None if no clear signal.
+
+    Detection:
+    - Check last 30 bases: if >=20 are A -> polyA tail -> '+' strand
+    - Check first 30 bases: if >=20 are T -> polyT head -> '-' strand
+    - Also check for a clean run of >=8 consecutive A's at the end
+      or >=8 consecutive T's at the start
+    - If both signals present, use the stronger one
+    """
+    upper = sequence.upper()
+    n = len(upper)
+    if n < 8:
+        return None
+
+    # Score the polyA signal at the 3' end
+    polya_score = 0.0
+    tail_window = min(30, n)
+    tail = upper[-tail_window:]
+    a_count_tail = tail.count("A")
+    if a_count_tail >= 20 and tail_window >= 30:
+        polya_score = a_count_tail / tail_window
+    # Check for a clean run of consecutive A's at the end
+    run_a = 0
+    for i in range(n - 1, -1, -1):
+        if upper[i] == "A":
+            run_a += 1
+        else:
+            break
+    if run_a >= 8:
+        polya_score = max(polya_score, run_a / tail_window if tail_window > 0 else 0.0)
+
+    # Score the polyT signal at the 5' end
+    polyt_score = 0.0
+    head_window = min(30, n)
+    head = upper[:head_window]
+    t_count_head = head.count("T")
+    if t_count_head >= 20 and head_window >= 30:
+        polyt_score = t_count_head / head_window
+    # Check for a clean run of consecutive T's at the start
+    run_t = 0
+    for i in range(n):
+        if upper[i] == "T":
+            run_t += 1
+        else:
+            break
+    if run_t >= 8:
+        polyt_score = max(polyt_score, run_t / head_window if head_window > 0 else 0.0)
+
+    if polya_score == 0.0 and polyt_score == 0.0:
+        return None
+    if polya_score > polyt_score:
+        return "+"
+    if polyt_score > polya_score:
+        return "-"
+    # Both equal and non-zero: polyA wins by convention (more common in mRNA)
+    return "+"
+
+
+def _is_tsa_transcript(description: str) -> bool:
+    """Check if a transcript is from a TSA (Transcriptome Shotgun Assembly).
+
+    TSA transcripts are assembled mRNA — the assembler (Trinity, etc.)
+    outputs sequences in the mRNA orientation, so the + strand is the
+    coding strand. This is true even when polyA/polyT detection fails
+    (e.g. short transcripts, trimmed adapters, or internal priming).
+    """
+    desc_lower = description.lower()
+    return "tsa:" in desc_lower or "transcribed rna sequence" in desc_lower
+
+
+def find_best_orf(
+    sequence: str, seq_id: str, description: str = "",
+) -> tuple[ORFCoord | None, str | None, list[ORFCoord]]:
+    """Find the best ORF considering mRNA strand direction.
+
+    Returns (best_orf, detected_strand, all_orfs) where:
+    - best_orf: the predicted CDS (strand-aware selection)
+    - detected_strand: '+', '-', or None
+    - all_orfs: ALL ORFs >= 30 aa across all 6 frames (for display)
+
+    Selection logic:
+    1. Detect mRNA strand from polyA/polyT signals
+    2. If TSA transcript (description contains "TSA:"), assume + strand
+       (assembler preserves mRNA orientation)
+    3. If strand is known, pick the longest ORF on that strand
+    4. If no strand signal, fall back to longest across all frames
+    5. If the best same-strand ORF is >= 70% the length of the longest
+       opposite-strand ORF, prefer same-strand
+    """
+    all_orfs = _six_frame_orf_coords(sequence, seq_id)
+    detected_strand = detect_mrna_strand(sequence)
+    # TSA transcripts are assembled mRNA → + strand is the coding strand.
+    # This catches cases where polyA was trimmed or the tail is too short
+    # for the polyA detector to fire (like GBYB01000003.1).
+    if detected_strand is None and _is_tsa_transcript(description):
+        detected_strand = "+"
+
+    if not all_orfs:
+        return None, detected_strand, all_orfs
+
+    # Find the globally longest ORF
+    longest_overall = max(all_orfs, key=lambda o: o.aa_length)
+
+    if detected_strand is None:
+        # No strand signal: fall back to longest across all frames
+        return longest_overall, None, all_orfs
+
+    # Filter ORFs by the detected strand
+    same_strand = [o for o in all_orfs if o.strand == detected_strand]
+    if not same_strand:
+        # No ORFs on the detected strand: use the global longest
+        return longest_overall, detected_strand, all_orfs
+
+    best_same = max(same_strand, key=lambda o: o.aa_length)
+
+    # If the strand-consistent ORF is at least 70% the length of the
+    # longest on the opposite strand, prefer same-strand
+    if best_same.aa_length >= longest_overall.aa_length * 0.7:
+        return best_same, detected_strand, all_orfs
+
+    # The opposite-strand ORF is much longer: use that instead
+    return longest_overall, detected_strand, all_orfs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Gene Prediction Scoring System
 # Pure-Python CDS confidence scoring: hexamer coding potential, Kozak-like
 # start codon context, Codon Adaptation Index, ORF completeness, and a
@@ -2998,6 +3133,8 @@ def colorize_sequence_annotated(
     highlight_range: tuple[int, int] | None = None,
     aa_highlight_range: tuple[int, int] | None = None,
     focus_range: tuple[int, int] | None = None,
+    all_orfs: list[ORFCoord] | None = None,
+    detected_strand: str | None = None,
 ) -> SeqRenderResult:
     """Render DNA with CDS amino-acid translation and Pfam domain tracks.
 
@@ -3009,6 +3146,8 @@ def colorize_sequence_annotated(
       Used when the user clicks the CDS arrow or AA translation line to
       "focus" on an ORF without losing the per-base color information
       inside the feature.
+    all_orfs: if provided, renders a 6-frame overview showing all ORFs.
+    detected_strand: '+', '-', or None — the polyA/T strand detection result.
     """
     truncated = len(seq) > _MAX_DISPLAY_BASES
     display_seq = seq[:_MAX_DISPLAY_BASES] if truncated else seq
@@ -3121,6 +3260,90 @@ def colorize_sequence_annotated(
         line_map.append(SeqLineInfo("header", 0, 0))
         cur_line += 2
         features.append(SeqFeatureRegion("CDS", orf.nt_start, orf.nt_end, aa_seq=orf.sequence))
+
+    # ── 6-frame overview ────────────────────────────────────────────────
+    if all_orfs is not None and orf:
+        seq_len = len(seq)
+        overview_w = min(width, 72)  # cap width for compact display
+
+        def _ov_col(pos: int) -> int:
+            return min(int(pos / seq_len * overview_w), overview_w) if seq_len else 0
+
+        # Strand direction line
+        _emit("  ", "")
+        if detected_strand == "+":
+            _emit("mRNA direction: ", "dim")
+            _emit("\u2192 (polyA detected at 3' end)", "bold bright_green")
+        elif detected_strand == "-":
+            _emit("mRNA direction: ", "dim")
+            _emit("\u2190 (polyT detected at 5' end)", "bold bright_yellow")
+        else:
+            _emit("mRNA direction: ", "dim")
+            _emit("unknown", "dim italic")
+        _emit("\n")
+        line_map.append(SeqLineInfo("header", 0, 0))
+        cur_line += 1
+
+        # Render each of the 6 frames
+        frame_labels = [
+            ("+", 1), ("+", 2), ("+", 3),
+            ("-", 1), ("-", 2), ("-", 3),
+        ]
+        for strand_label, frame_num in frame_labels:
+            tag = f"{strand_label}f{frame_num}"
+            color = _FRAME_COLORS.get((strand_label, frame_num), "bright_cyan")
+            _emit(f"  {tag:<4} ", f"bold {color}")
+            # Build the track line
+            track_chars = list("\u2500" * overview_w)  # ─
+            # Find ORFs for this frame
+            frame_orfs = [o for o in all_orfs if o.strand == strand_label and o.frame == frame_num]
+            for fo in frame_orfs:
+                # Map ORF nt coordinates to overview columns
+                if fo.strand == "+":
+                    c_s = _ov_col(fo.nt_start)
+                    c_e = _ov_col(fo.nt_end)
+                else:
+                    c_s = _ov_col(fo.nt_start)
+                    c_e = _ov_col(fo.nt_end)
+                c_e = max(c_e, c_s + 1)
+                c_e = min(c_e, overview_w)
+                # Build label like "67aa"
+                aa_label = f"{fo.aa_length}aa"
+                block_w = c_e - c_s
+                for ci in range(c_s, c_e):
+                    track_chars[ci] = "\u2593"  # ▓
+                # Place the aa label inside the block if it fits
+                if block_w >= len(aa_label) + 2:
+                    lbl_start = c_s + (block_w - len(aa_label)) // 2
+                    for li, lch in enumerate(aa_label):
+                        if lbl_start + li < overview_w:
+                            track_chars[lbl_start + li] = lch
+            # Emit the track with RLE for efficiency
+            ci = 0
+            while ci < overview_w:
+                ch = track_chars[ci]
+                run_end = ci + 1
+                while run_end < overview_w and track_chars[run_end] == ch:
+                    run_end += 1
+                segment = "".join(track_chars[ci:run_end])
+                if ch == "\u2500":  # ─
+                    _emit(segment, "bright_black")
+                elif ch == "\u2593":  # ▓
+                    _emit(segment, color)
+                else:
+                    # label character
+                    _emit(segment, f"bold reverse {color}")
+                ci = run_end
+            # CDS marker
+            if orf.strand == strand_label and orf.frame == frame_num:
+                _emit(" \u2190 CDS", f"bold {color}")
+            _emit("\n")
+            line_map.append(SeqLineInfo("header", 0, 0))
+            cur_line += 1
+
+        _emit("\n")
+        line_map.append(SeqLineInfo("header", 0, 0))
+        cur_line += 1
 
     if orf and hits:
         for h in sorted_hits:
@@ -3329,6 +3552,8 @@ class SequenceViewer(ScrollableContainer):
     _last_orf: ORFCoord | None = None
     _last_hits: list[HmmerHit] = []
     _last_width: int = 60
+    _detected_strand: str | None = None
+    _all_orfs: list[ORFCoord] | None = None
     _RENDER_CACHE_MAX: int = 64
     _last_shown_id: str = ""
 
@@ -3455,6 +3680,31 @@ class SequenceViewer(ScrollableContainer):
                     f"[dim]N[/]:{counts['N']}"
                 ),
             )
+            # Show strand detection and CDS info if available
+            if self._detected_strand is not None or self._last_orf is not None:
+                strand_parts: list[str] = []
+                if self._detected_strand == "+":
+                    strand_parts.append("[bold bright_green]\u2192 (polyA detected)[/]")
+                elif self._detected_strand == "-":
+                    strand_parts.append("[bold bright_yellow]\u2190 (polyT detected)[/]")
+                else:
+                    strand_parts.append("[dim]unknown[/]")
+                if self._last_orf:
+                    o = self._last_orf
+                    orf_frame_tag = f"{o.strand}f{o.frame}"
+                    strand_parts.append(
+                        f"    CDS: {orf_frame_tag} {o.aa_length} aa ({o.nt_start+1}-{o.nt_end})"
+                    )
+                grid.add_row("Strand", " ".join(strand_parts))
+                # Warn if ORF is on the opposite strand from polyA/T detection
+                if (self._detected_strand and self._last_orf
+                        and self._last_orf.strand != self._detected_strand):
+                    grid.add_row(
+                        "",
+                        "[bold bright_yellow]\u26a0 Longest ORF is on opposite strand "
+                        "\u2014 using best same-strand ORF[/]",
+                    )
+
             # Show CDS prediction if available
             preds = getattr(self.app, "_predictions", {})
             pred = preds.get(t.id) if preds else None
@@ -3533,11 +3783,13 @@ class SequenceViewer(ScrollableContainer):
         # Gather inputs
         orf = None
         hits: list[HmmerHit] = []
+        best_orf_all: list[ORFCoord] | None = None
+        best_orf_strand: str | None = None
         try:
             if scanned:
                 all_hits = scan_cache[t.id]
                 hits = sorted(all_hits, key=lambda h: h.evalue)[:5]
-                orf = _find_longest_orf(t.sequence, t.id)
+                orf, best_orf_strand, best_orf_all = find_best_orf(t.sequence, t.id, t.description)
         except Exception:
             pass
 
@@ -3556,9 +3808,10 @@ class SequenceViewer(ScrollableContainer):
         #    ~40-90ms _text_to_content call on cache hits
         if orf:
             hit_key = tuple((h.target_name, h.ali_from, h.ali_to) for h in hits)
+            has_all_orfs = best_orf_all is not None and len(best_orf_all) > 0
             cache_key = (
                 t.id, seq_width, self._highlight, self._aa_highlight,
-                self._focus_range, hit_key,
+                self._focus_range, hit_key, best_orf_strand, has_all_orfs,
             )
         elif t:
             cache_key = ("plain", t.id, t.length, seq_width)
@@ -3590,6 +3843,8 @@ class SequenceViewer(ScrollableContainer):
                     highlight_range=self._highlight,
                     aa_highlight_range=self._aa_highlight,
                     focus_range=self._focus_range,
+                    all_orfs=best_orf_all,
+                    detected_strand=best_orf_strand,
                 )
             else:
                 plain_text = colorize_sequence(t.sequence, width=seq_width)
@@ -3622,12 +3877,14 @@ class SequenceViewer(ScrollableContainer):
             if (orf and self._focus_range is None
                     and self._highlight is None and self._aa_highlight is None):
                 cds_focus = (orf.nt_start, orf.nt_end)
-                focus_key = (t.id, seq_width, None, None, cds_focus, hit_key)
+                focus_key = (t.id, seq_width, None, None, cds_focus, hit_key, best_orf_strand, has_all_orfs)
                 if focus_key not in self._content_cache:
                     _log.debug("pre-warming focus cache for CDS %d-%d", orf.nt_start, orf.nt_end)
                     focus_render = colorize_sequence_annotated(
                         t.sequence, orf=orf, hits=hits, width=seq_width,
                         focus_range=cds_focus,
+                        all_orfs=best_orf_all,
+                        detected_strand=best_orf_strand,
                     )
                     focus_content = _text_to_content(focus_render.text)
                     _cache_put(focus_key, focus_render, focus_content)
@@ -3655,6 +3912,8 @@ class SequenceViewer(ScrollableContainer):
             self._last_orf = orf
             self._last_hits = hits
             self._last_width = seq_width
+            self._detected_strand = best_orf_strand
+            self._all_orfs = best_orf_all
             body = self.query_one("#seq-body", Static)
             if render is not None:
                 self._line_map = render.line_map
