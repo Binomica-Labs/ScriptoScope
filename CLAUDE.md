@@ -10,7 +10,7 @@ This file is the **agent handoff document** for ScriptoScope. Any AI agent (Clau
 
 **ScriptoScope** is a terminal-based (TUI) transcriptome browser for exploring, annotating, and analyzing transcript sequences. It is built with Python 3.12+, [Textual](https://textual.textualize.io/) for the TUI framework, and [Rich](https://rich.readthedocs.io/) for terminal rendering.
 
-- **Single-file architecture**: the entire app is `scriptoscope.py` (~8,500 lines). This is intentional — it avoids import complexity and makes the codebase greppable.
+- **Single-file architecture**: the entire app is `scriptoscope.py` (~8,400 lines). This is intentional — it avoids import complexity and makes the codebase greppable.
 - **Test suite**: 196 tests across 4 files in `tests/`. Tests cover DNA parsing correctness (sacred territory), UI smoke tests, performance budgets, strand detection, and Prodigal integration.
 - **Rust port**: a parallel Rust/Ratatui implementation exists at `/home/seb/scriptoscope-rs/` (7,490 lines across 26 source files, 122 tests) for performance-critical use cases.
 
@@ -37,9 +37,9 @@ FASTA file → parse_fasta() → list[Transcript] → sidebar table
 | `HmmerHit` | dataclass ~line 1590 | Pfam domain hit with alignment coordinates |
 | `ORFCoord` | dataclass ~line 1615 | orf_id, strand, frame, nt_start, nt_end, aa_length, sequence, stop_count |
 | `ProdigalGene` | dataclass ~line 2023 | gene predicted by Prodigal (bacterial mode) |
-| `CDSPrediction` | dataclass ~line 2522 | hexamer/kozak/cai scores + confidence level |
-| `BlastConfirmation` | dataclass ~line 3221 | CDS confirmation via NCBI blastp |
-| `SeqRenderResult` | dataclass ~line 3505 | cached rendered sequence (Text + Content + metadata) |
+| `CDSPrediction` | dataclass ~line 2523 | hexamer/kozak/cai scores + confidence level |
+| `BlastConfirmation` | dataclass ~line 3222 | CDS confirmation via NCBI blastp |
+| `SeqRenderResult` | dataclass ~line 3506 | cached rendered sequence (Text + Content + metadata) |
 
 ### Module sections (all in scriptoscope.py)
 
@@ -67,7 +67,7 @@ The file is organized into sections separated by `# ══════` comment 
 20. **HMMER panel widget** (~line 6203): scan form, ORF diagram, results table
 21. **Make BLAST DB modal** (~line 7030): `makeblastdb` wrapper
 22. **Main application** (~line 7069): `ScriptoScopeApp` — compose, key handling, workers
-23. **Entry point** (~line 8449): `__main__` guard, argument parsing
+23. **Entry point** (~line 8366): `__main__` guard, argument parsing
 
 ### Rendering pipeline
 
@@ -154,6 +154,10 @@ These are non-obvious issues encountered during development that future agents s
 
 8. **HMM scan speed**: Dominated by HMMER3 C code. Cap to top 6 longest ORFs per transcript (one per frame) — scanning all 24+ ORFs from a 5kb transcript takes ~50s vs ~18s for the same significant hits.
 
+9. **Kozak position arithmetic**: Kozak positions use 1-based numbering where +1 = A of ATG. Converting to 0-based: `pos = atg_pos + offset - 1` for positive offsets, `pos = atg_pos + offset` for negative. A previous bug used `atg_pos + 2 + offset`, scoring the wrong base — fixed in `36c855f`.
+
+10. **Thread-safe dict iteration**: `_longest_orf_cache` (global `OrderedDict`) is accessed from multiple worker threads. Always snapshot with `list(cache.items())` before iterating to avoid `RuntimeError: dictionary changed size during iteration`.
+
 ## How to extend
 
 ### Adding a new panel/tab
@@ -204,19 +208,19 @@ Optional: BLAST+ CLI, HMMER3 CLI (`hmmsearch`), Prodigal
 
 | Function | Line | Purpose |
 |----------|------|---------|
-| `parse_fasta()` | ~280 | FASTA/gzip loader → list[Transcript] |
-| `save_annotations()` | ~520 | Sidecar write (atomic via tempfile+fsync+replace) |
-| `load_annotations()` | ~590 | Sidecar read + ORF re-translation |
+| `_parse_fasta()` / `load_all()` | ~296 / ~332 | FASTA/gzip loader → list[Transcript] |
+| `save_annotations()` | ~525 | Sidecar write (atomic via tempfile+fsync+replace) |
+| `load_annotations()` | ~635 | Sidecar read + ORF re-translation |
 | `local_blast()` | ~1360 | Async subprocess blast runner |
-| `hmmscan()` | ~2996 | pyhmmer single-transcript scan |
-| `hmmsearch_all()` | ~3087 | pyhmmer collection-wide scan |
+| `hmmscan()` | ~2997 | pyhmmer single-transcript scan |
+| `hmmsearch_all()` | ~3088 | pyhmmer collection-wide scan |
 | `_six_frame_orf_coords()` | ~1661 | Biopython 6-frame ORF finder |
 | `_find_longest_orf()` | ~1767 | Fast regex-based ORF finder |
 | `find_best_orf()` | ~1952 | Strand-aware ORF selection (polyA/TSA) |
-| `predict_cds()` | ~2530 | Gene prediction (hexamer+Kozak+CAI) |
-| `colorize_sequence()` | ~3393 | Plain per-base ACGT coloring |
-| `colorize_sequence_annotated()` | ~3938 | Full annotated render with features |
-| `_text_to_content()` | ~3448 | Thread-safe Rich Text → Textual Content |
+| `predict_cds()` | ~2534 | Gene prediction (hexamer+Kozak+CAI) |
+| `colorize_sequence()` | ~3394 | Plain per-base ACGT coloring |
+| `colorize_sequence_annotated()` | ~3939 | Full annotated render with features |
+| `_text_to_content()` | ~3449 | Thread-safe Rich Text → Textual Content |
 
 ## Rust port
 
@@ -231,7 +235,7 @@ The Rust port shares the same visual design, keybindings, and annotation sidecar
 
 ## Commit history
 
-The project has 67+ commits documenting every design decision, performance optimization, and bug fix. Key commits:
+The project has 69+ commits documenting every design decision, performance optimization, and bug fix. Key commits:
 
 - `055d93e` — Pure-Python gene prediction scoring (hexamer, Kozak, CAI)
 - `e9548a8` — TSA-aware strand detection, multi-frame ORF display
@@ -239,12 +243,13 @@ The project has 67+ commits documenting every design decision, performance optim
 - `22e138b` — Library panel + sidecar annotations + auto-save/load
 - `577c7af` — RefSeq CDS download for bacterial genomes
 - `1823e24` — Collection scan populates scan_cache for annotated views
+- `36c855f` — Fix Kozak scoring bug, race condition, dead code removal (full codebase audit)
 
 ## For future agents
 
 If you are an AI agent picking up this project:
 
-1. **Read this file first.** It gives you the architecture without reading 8,500 lines.
+1. **Read this file first.** It gives you the architecture without reading 8,400 lines.
 2. **Run `python -m pytest tests/ -q`** before and after any change. The test suite is the safety net.
 3. **Check `/tmp/scriptoscope.log`** when debugging runtime issues. Every operation is logged with timing.
 4. **The annotation sidecar is the source of truth** for persistent data, not the FASTA file.
